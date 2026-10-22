@@ -411,12 +411,17 @@ static void KITTY_UpdateMouseCoordSpace(SDL_VideoData *data)
     }
 }
 
-/* Optional cap so a single-chunk texture fits hosts that drop huge
+/* Optional size policy so a single-chunk texture fits hosts that drop huge
  * multi-chunk direct RGB (observed blank on Rex at ~2800×2000).
  * With place_cells, c/r stretch fills the pane; without it the image is
- * native 1:1 at the capped size. SDL_KITTY_FB_MAX=W[xH] e.g. 800 or 800x600. */
+ * native 1:1 at the chosen size.
+ *
+ * SDL_KITTY_FB_FIXED=WxH — exact FB size (resize keeps pixels; a=p re-stretch).
+ * SDL_KITTY_FB_MAX=W[xH] — aspect-fit into a max box (e.g. 800 or 800x600).
+ * Unset on Rex → default max 1280x720 aspect-fit. */
 static void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
 {
+    const char *fixed;
     const char *env;
     int max_w = 0, max_h = 0;
     int w, h;
@@ -424,6 +429,23 @@ static void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
     if (!data) {
         return;
     }
+
+    fixed = SDL_getenv("SDL_KITTY_FB_FIXED");
+    if (fixed && *fixed &&
+        !(fixed[0] == '0' || SDL_strcasecmp(fixed, "off") == 0 ||
+          SDL_strcasecmp(fixed, "none") == 0)) {
+        int fw = 0, fh = 0;
+        if (SDL_sscanf(fixed, "%dx%d", &fw, &fh) != 2) {
+            fw = (int)SDL_strtol(fixed, NULL, 10);
+            fh = fw;
+        }
+        if (fw >= 16 && fh >= 16) {
+            data->pixel_w = fw;
+            data->pixel_h = fh;
+            return;
+        }
+    }
+
     env = SDL_getenv("SDL_KITTY_FB_MAX");
     if (env && (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
                 SDL_strcasecmp(env, "none") == 0)) {
