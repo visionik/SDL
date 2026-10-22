@@ -375,6 +375,7 @@ set_option(SDL_OPENVR              "Use OpenVR video driver" OFF)
 dep_option(SDL_KMSDRM              "Use KMS DRM video driver" ${UNIX_SYS} "SDL_VIDEO" OFF)
 dep_option(SDL_KMSDRM_SHARED       "Dynamically load KMS DRM support" ON "SDL_KMSDRM;SDL_DEPS_SHARED" OFF)
 set_option(SDL_OFFSCREEN           "Use offscreen video driver" ON)
+set_option(SDL_KITTY               "Use Kitty graphics protocol video driver" ON)
 dep_option(SDL_DUMMYCAMERA         "Support the dummy camera driver" ON SDL_CAMERA OFF)
 option_string(SDL_BACKGROUNDING_SIGNAL "number to use for magic backgrounding signal or 'OFF'" OFF)
 option_string(SDL_FOREGROUNDING_SIGNAL "number to use for magic foregrounding signal or 'OFF'" OFF)
@@ -3544,6 +3545,15 @@ if(SDL_VIDEO)
       "${SDL3_SOURCE_DIR}/src/video/offscreen/*.h"
     )
     set(HAVE_OFFSCREEN TRUE)
+    set(HAVE_SDL_VIDEO TRUE)
+  endif()
+  if(SDL_KITTY AND (UNIX OR APPLE) AND NOT ANDROID AND NOT IOS AND NOT TVOS AND NOT VISIONOS)
+    set(SDL_VIDEO_DRIVER_KITTY 1)
+    sdl_glob_sources(
+      "${SDL3_SOURCE_DIR}/src/video/kitty/*.c"
+      "${SDL3_SOURCE_DIR}/src/video/kitty/*.h"
+    )
+    set(HAVE_KITTY TRUE)
     set(HAVE_SDL_VIDEO TRUE)
   endif()
 endif()
