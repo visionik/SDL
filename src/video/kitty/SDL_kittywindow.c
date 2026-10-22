@@ -39,6 +39,9 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
         return false;
     }
 
+    // Keep terminal metrics fresh; some hosts omit TIOCGWINSZ pixels until later.
+    (void)KITTY_QueryTerminalSize(vdata);
+
     if (window->x == SDL_WINDOWPOS_UNDEFINED) {
         window->x = 0;
     }
@@ -46,10 +49,18 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
         window->y = 0;
     }
 
+    // SDL clamps a requested 0x0 create to 1x1 before the driver sees it. Treat
+    // that as "fill the terminal", and always keep windowed/floating in sync —
+    // otherwise FinishWindowCreation restores the 1x1 stubs and mouse coords
+    // clamp to (0,0).
     if (window->w <= 1 || window->h <= 1) {
         window->w = vdata->pixel_w;
         window->h = vdata->pixel_h;
     }
+    window->windowed.w = window->floating.w = window->w;
+    window->windowed.h = window->floating.h = window->h;
+    window->windowed.x = window->floating.x = window->x;
+    window->windowed.y = window->floating.y = window->y;
 
     data->sdl_window = window;
     data->image_ids[0] = 1;
@@ -61,6 +72,7 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
     vdata->focus_window = window;
     SDL_SetKeyboardFocus(window);
     SDL_SetMouseFocus(window);
+    SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
     SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_SHOWN, 0, 0);
     SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_GAINED, 0, 0);
     return true;
