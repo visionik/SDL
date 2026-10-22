@@ -62,9 +62,6 @@ KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
 /* XRGB8888 (or compatible 32-bit) surface rect → RGB24 scratch (full w*h*3 buffer). */
 bool KITTY_ConvertSurfaceRectToRGB(SDL_Surface *surface, const SDL_Rect *rect, Uint8 *rgb_scratch);
 
-/* SDL_KITTY_DIRTY_BW=1 enables bandwidth partial (a=f). Default off. */
-bool KITTY_DirtyBWEnabled(void);
-
 /*
  * Pack a rect from a full-frame RGB24 scratch into a tightly packed buffer
  * (rw*rh*3). out must be large enough.

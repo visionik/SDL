@@ -50,6 +50,7 @@ typedef struct SDL_VideoData
     bool mouse_sgr_pixels; /* true: DECSET 1016 (pixel coords); false: 1006 (cells) */
     bool place_cells;      /* true: Kitty c/r stretch to grid; scale mouse into FB */
     bool shm_failed;
+    bool frame_edit_ok; /* a=f root-frame edit probe; gates dirty BW default */
     KITTY_TransmitMode transmit_mode;
     int cell_w;
     int cell_h;

@@ -127,6 +127,18 @@ KITTY_ResizeAction KITTY_ClassifyResize(bool place_cells, bool has_live_image,
     return KITTY_RESIZE_FULL;
 }
 
+bool KITTY_SelectDirtyBW(const char *env, bool frame_edit_ok)
+{
+    if (env && *env) {
+        if (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
+            SDL_strcasecmp(env, "false") == 0 || SDL_strcasecmp(env, "no") == 0) {
+            return false;
+        }
+        return true; /* explicit enable */
+    }
+    return frame_edit_ok;
+}
+
 KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
                                             const char *term_program,
                                             bool shm_ok,
@@ -302,18 +314,89 @@ done:
     return ok;
 }
 
+static void KITTY_DrainTty(int fd)
+{
+    unsigned char junk[256];
+    for (;;) {
+        fd_set fds;
+        struct timeval tv;
+        FD_ZERO(&fds);
+        FD_SET(fd, &fds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+        if (select(fd + 1, &fds, NULL, NULL, &tv) <= 0) {
+            break;
+        }
+        if (read(fd, junk, sizeof(junk)) <= 0) {
+            break;
+        }
+    }
+}
+
+/* Transmit-only 2x2 image, then a=f edit one pixel; delete. No on-screen place.
+ * Rex may apply a=f successfully without an APC OK reply — treat ERROR as fail,
+ * OK or silent (NONE) as success when the write succeeded. */
+static bool KITTY_ProbeFrameEdit(SDL_VideoData *data, Uint32 id)
+{
+    const Uint8 rgb2x2[12] = { 0 };
+    char rgb_b64[32];
+    size_t enc;
+    char cmd[192];
+    int n;
+    KITTY_GraphicsQueryStatus st;
+    bool ok = false;
+
+    enc = KITTY_B64EncodeLocal(rgb2x2, sizeof(rgb2x2), rgb_b64, sizeof(rgb_b64));
+    if (enc == 0) {
+        return false;
+    }
+
+    /* a=t stores pixels without placing (avoids a visible probe flash). */
+    n = SDL_snprintf(cmd, sizeof(cmd),
+                     "\033_Ga=t,f=24,t=d,i=%u,s=2,v=2;%s\033\\",
+                     (unsigned)id, rgb_b64);
+    if (n <= 0 || !KITTY_WriteAllProbe(data->tty_fd, cmd, (size_t)n)) {
+        return false;
+    }
+    (void)KITTY_AwaitGraphicsQuery(data->tty_fd, id, 20);
+    KITTY_DrainTty(data->tty_fd);
+
+    /* Edit root frame (r=1) — this is what dirty BW needs. */
+    n = SDL_snprintf(cmd, sizeof(cmd),
+                     "\033_Ga=f,i=%u,r=1,X=1,x=0,y=0,s=1,v=1,f=24,t=d;AAAA\033\\\033[c",
+                     (unsigned)id);
+    if (n <= 0 || !KITTY_WriteAllProbe(data->tty_fd, cmd, (size_t)n)) {
+        goto cleanup;
+    }
+    st = KITTY_AwaitGraphicsQuery(data->tty_fd, id, 40);
+    /* OK = explicit support; NONE = silent host (Rex); ERROR = unsupported. */
+    ok = (st != KITTY_GQ_ERROR);
+
+cleanup:
+    n = SDL_snprintf(cmd, sizeof(cmd), "\033_Ga=d,d=I,i=%u,q=2\033\\", (unsigned)id);
+    if (n > 0) {
+        (void)KITTY_WriteAllProbe(data->tty_fd, cmd, (size_t)n);
+    }
+    KITTY_DrainTty(data->tty_fd);
+    return ok;
+}
+
 bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
 {
     const char *force = SDL_getenv("SDL_KITTY_TRANSMIT");
     const char *tp = SDL_getenv("TERM_PROGRAM");
+    const char *bw_env = SDL_getenv("SDL_KITTY_DIRTY_BW");
     bool direct_ok = false;
     bool shm_ok = false;
+    bool frame_ok = false;
     const Uint32 id_direct = 98;
     const Uint32 id_shm = 99;
+    const Uint32 id_frame = 97;
 
     if (!data) {
         return false;
     }
+    data->frame_edit_ok = false;
 
     /* Drain any prior CSI noise. */
     {
@@ -347,12 +430,17 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
         data->transmit_mode = KITTY_SelectTransmitMode(force, tp, shm_ok, direct_ok);
         data->shm_failed = !shm_ok;
 
+        /* Frame-edit probe only if graphics direct works (or we still try). */
+        frame_ok = KITTY_ProbeFrameEdit(data, id_frame);
+        data->frame_edit_ok = frame_ok;
+
         {
             const char *dbg = SDL_getenv("SDL_KITTY_DEBUG");
             if (dbg && dbg[0] && dbg[0] != '0') {
                 FILE *log = fopen("/tmp/sdl_kitty_debug.log", "a");
                 if (log) {
                     const char *mode = "direct";
+                    const bool bw = KITTY_SelectDirtyBW(bw_env, frame_ok);
                     if (data->transmit_mode == KITTY_TRANSMIT_SHM) {
                         mode = "shm";
                     } else if (data->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
@@ -364,6 +452,10 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
                             force ? force : "(none)",
                             tp ? tp : "(none)",
                             mode);
+                    fprintf(log, "frame_edit_probe %s -> dirty_bw=%s (env=%s)\n",
+                            frame_ok ? "ok" : "fail",
+                            bw ? "on" : "off",
+                            bw_env ? bw_env : "(none)");
                     fclose(log);
                 }
             }

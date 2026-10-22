@@ -26,6 +26,7 @@
 #include "../../SDL_properties_c.h"
 #include "SDL_kittyframebuffer_c.h"
 #include "SDL_kittygraphics.h"
+#include "SDL_kittyprobe.h"
 #include "SDL_kittyrect.h"
 
 #define KITTY_SURFACE "SDL.internal.window.surface"
@@ -144,7 +145,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
 
     /* Step 1b: optional bandwidth path — edit live image root frame. */
     if (convert_mode == KITTY_CONVERT_DIRTY &&
-        KITTY_DirtyBWEnabled() &&
+        KITTY_SelectDirtyBW(SDL_getenv("SDL_KITTY_DIRTY_BW"), vdata->frame_edit_ok) &&
         wdata->placed &&
         wdata->live_image_id != 0) {
         size_t packed_len = 0;

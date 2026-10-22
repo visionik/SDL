@@ -92,6 +92,7 @@ static SDL_VideoDevice *KITTY_CreateDevice(void)
      * apps can still force via SDL_KITTY_TRANSMIT=shm|zlib. */
     data->transmit_mode = KITTY_TRANSMIT_DIRECT;
     data->shm_failed = false;
+    data->frame_edit_ok = false;
     /* Stretch FB to the cell grid by default; SDL_KITTY_PLACE_CELLS=0 for 1:1. */
     {
         const char *place = SDL_getenv("SDL_KITTY_PLACE_CELLS");

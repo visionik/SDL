@@ -139,19 +139,6 @@ KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
     return KITTY_CONVERT_DIRTY;
 }
 
-bool KITTY_DirtyBWEnabled(void)
-{
-    const char *env = SDL_getenv("SDL_KITTY_DIRTY_BW");
-    if (!env || !*env) {
-        return false;
-    }
-    if (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
-        SDL_strcasecmp(env, "false") == 0 || SDL_strcasecmp(env, "no") == 0) {
-        return false;
-    }
-    return true;
-}
-
 bool KITTY_PackRGBRect(const Uint8 *rgb_scratch, int fb_w, int fb_h,
                        const SDL_Rect *rect, Uint8 *out, size_t out_cap, size_t *out_len)
 {

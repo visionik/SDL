@@ -47,6 +47,12 @@ KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
                                             bool shm_ok,
                                             bool direct_ok);
 
+/*
+ * Dirty-BW policy: env SDL_KITTY_DIRTY_BW forces on/off; if unset, follow
+ * frame_edit_ok from the a=f probe.
+ */
+bool KITTY_SelectDirtyBW(const char *env, bool frame_edit_ok);
+
 /* Step 3: no cursor advance, transient image, stable placement id. */
 #define KITTY_AT_PLACE_KEYS "C=1,N=1,p=1"
 
@@ -73,7 +79,7 @@ KITTY_ResizeAction KITTY_ClassifyResize(bool place_cells, bool has_live_image,
                                         int old_cols, int old_rows, int new_cols, int new_rows);
 
 #ifndef KITTY_PROBE_STANDALONE
-/* Run a=q probes on the tty and set data->transmit_mode / shm_failed. */
+/* Run a=q (+ a=f) probes; set transmit_mode, shm_failed, frame_edit_ok. */
 bool KITTY_ProbeTransmitModes(SDL_VideoData *data);
 #endif
 
