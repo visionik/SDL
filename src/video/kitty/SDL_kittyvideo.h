@@ -27,25 +27,40 @@
 
 #include "../SDL_sysvideo.h"
 
+#include <signal.h>
+
 #define KITTYVID_DRIVER_NAME "kitty"
+
+typedef enum KITTY_TransmitMode
+{
+    KITTY_TRANSMIT_SHM = 0,
+    KITTY_TRANSMIT_DIRECT_ZLIB,
+    KITTY_TRANSMIT_DIRECT
+} KITTY_TransmitMode;
 
 typedef struct SDL_VideoData
 {
     int tty_fd;
     bool terminal_owned;
     bool keyboard_enabled;
+    bool mouse_enabled;
+    bool shm_failed;
+    KITTY_TransmitMode transmit_mode;
     int cell_w;
     int cell_h;
     int cols;
     int rows;
     int pixel_w;
     int pixel_h;
+    SDL_Window *focus_window;
+    volatile sig_atomic_t got_winch;
 } SDL_VideoData;
 
 typedef struct SDL_WindowData
 {
     SDL_Window *sdl_window;
-    Uint32 image_id;
+    Uint32 image_ids[2];
+    int image_index;
     bool placed;
 } SDL_WindowData;
 

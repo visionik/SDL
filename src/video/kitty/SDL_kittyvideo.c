@@ -32,10 +32,22 @@
 #include "SDL_kittywindow.h"
 #include "SDL_kittygraphics.h"
 
+#include <signal.h>
 #include <unistd.h>
 
 static bool KITTY_VideoInit(SDL_VideoDevice *_this);
 static void KITTY_VideoQuit(SDL_VideoDevice *_this);
+
+static SDL_VideoData *KITTY_winch_data = NULL;
+static void (*KITTY_prev_winch)(int) = SIG_DFL;
+
+static void KITTY_HandleSIGWINCH(int sig)
+{
+    (void)sig;
+    if (KITTY_winch_data) {
+        KITTY_winch_data->got_winch = 1;
+    }
+}
 
 static bool KITTY_Available(void)
 {
@@ -75,6 +87,8 @@ static SDL_VideoDevice *KITTY_CreateDevice(void)
         return NULL;
     }
     data->tty_fd = STDOUT_FILENO;
+    data->transmit_mode = KITTY_TRANSMIT_SHM;
+    data->shm_failed = false;
     device->internal = data;
 
     device->VideoInit = KITTY_VideoInit;
@@ -102,6 +116,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
 {
     SDL_VideoData *data = (SDL_VideoData *)_this->internal;
     SDL_DisplayMode mode;
+    struct sigaction sa, old_sa;
 
     if (!KITTY_EnterRawMode(data)) {
         return false;
@@ -129,12 +144,33 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
         return false;
     }
 
+    KITTY_winch_data = data;
+    data->got_winch = 0;
+    SDL_zero(sa);
+    sa.sa_handler = KITTY_HandleSIGWINCH;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGWINCH, &sa, &old_sa) == 0) {
+        KITTY_prev_winch = old_sa.sa_handler;
+    }
+
     return true;
 }
 
 static void KITTY_VideoQuit(SDL_VideoDevice *_this)
 {
     SDL_VideoData *data = (SDL_VideoData *)_this->internal;
+    struct sigaction sa;
+
+    if (KITTY_winch_data == data) {
+        SDL_zero(sa);
+        sa.sa_handler = KITTY_prev_winch;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGWINCH, &sa, NULL);
+        KITTY_winch_data = NULL;
+        KITTY_prev_winch = SIG_DFL;
+    }
+
     if (data && data->terminal_owned) {
         KITTY_RestoreTerminal(data);
         data->terminal_owned = false;

@@ -3553,6 +3553,12 @@ if(SDL_VIDEO)
       "${SDL3_SOURCE_DIR}/src/video/kitty/*.c"
       "${SDL3_SOURCE_DIR}/src/video/kitty/*.h"
     )
+    find_package(ZLIB)
+    if(ZLIB_FOUND)
+      sdl_link_dependency(kitty_zlib LIBS ZLIB::ZLIB PKG_CONFIG_SPECS zlib)
+    else()
+      sdl_link_dependency(kitty_zlib LIBS z)
+    endif()
     set(HAVE_KITTY TRUE)
     set(HAVE_SDL_VIDEO TRUE)
   endif()

@@ -37,6 +37,9 @@ bool SDL_KITTY_CreateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
     (void)_this;
 
     SDL_GetWindowSizeInPixels(window, &w, &h);
+    if (w <= 0 || h <= 0) {
+        return SDL_SetError("invalid kitty framebuffer size");
+    }
     surface = SDL_CreateSurface(w, h, surface_format);
     if (!surface) {
         return false;
@@ -57,6 +60,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
     Uint8 *rgb = NULL;
     int x, y;
     bool ok;
+    Uint32 image_id;
     (void)rects;
     (void)numrects;
 
@@ -73,7 +77,6 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         return false;
     }
 
-    // Convert XRGB8888 -> tightly packed RGB24.
     for (y = 0; y < surface->h; ++y) {
         const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + y * surface->pitch);
         Uint8 *dst = rgb + (size_t)y * (size_t)surface->w * 3u;
@@ -85,8 +88,17 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         }
     }
 
-    ok = KITTY_TransmitRGB(vdata->tty_fd, wdata->image_id, rgb, surface->w, surface->h);
-    wdata->placed = ok;
+    wdata->image_index ^= 1;
+    image_id = wdata->image_ids[wdata->image_index];
+    ok = KITTY_TransmitRGB(vdata, image_id, rgb, surface->w, surface->h);
+    if (ok) {
+        // Drop the previous buffer's image to limit terminal VRAM use.
+        const Uint32 prev = wdata->image_ids[wdata->image_index ^ 1];
+        if (wdata->placed) {
+            KITTY_DeleteImage(vdata->tty_fd, prev);
+        }
+        wdata->placed = true;
+    }
     SDL_free(rgb);
     return ok;
 }

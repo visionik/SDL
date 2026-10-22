@@ -23,6 +23,8 @@
 #ifdef SDL_VIDEO_DRIVER_KITTY
 
 #include "../SDL_sysvideo.h"
+#include "../../events/SDL_keyboard_c.h"
+#include "../../events/SDL_mouse_c.h"
 #include "../../events/SDL_windowevents_c.h"
 #include "SDL_kittywindow.h"
 #include "SDL_kittygraphics.h"
@@ -44,16 +46,23 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
         window->y = 0;
     }
 
-    // Default window to the full terminal pixel size.
     if (window->w <= 1 || window->h <= 1) {
         window->w = vdata->pixel_w;
         window->h = vdata->pixel_h;
     }
 
     data->sdl_window = window;
-    data->image_id = 1;
+    data->image_ids[0] = 1;
+    data->image_ids[1] = 2;
+    data->image_index = 0;
     data->placed = false;
     window->internal = data;
+
+    vdata->focus_window = window;
+    SDL_SetKeyboardFocus(window);
+    SDL_SetMouseFocus(window);
+    SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_SHOWN, 0, 0);
+    SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_GAINED, 0, 0);
     return true;
 }
 
@@ -63,6 +72,9 @@ void KITTY_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
     SDL_WindowData *data = (SDL_WindowData *)window->internal;
 
     if (vdata) {
+        if (vdata->focus_window == window) {
+            vdata->focus_window = NULL;
+        }
         KITTY_DeleteAllImages(vdata->tty_fd);
     }
     if (data) {

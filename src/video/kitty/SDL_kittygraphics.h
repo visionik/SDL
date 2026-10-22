@@ -33,8 +33,9 @@ bool KITTY_EnterRawMode(SDL_VideoData *data);
 void KITTY_LeaveRawMode(SDL_VideoData *data);
 bool KITTY_SetupTerminal(SDL_VideoData *data);
 void KITTY_RestoreTerminal(SDL_VideoData *data);
-bool KITTY_TransmitRGB(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h);
+bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, int w, int h);
 bool KITTY_DeleteAllImages(int fd);
+bool KITTY_DeleteImage(int fd, Uint32 image_id);
 
 #endif // SDL_kittygraphics_h_
 
