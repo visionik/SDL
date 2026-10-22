@@ -34,10 +34,11 @@ void KITTY_LeaveRawMode(SDL_VideoData *data);
 bool KITTY_SetupTerminal(SDL_VideoData *data);
 bool KITTY_EnableMouse(SDL_VideoData *data);
 void KITTY_RestoreTerminal(SDL_VideoData *data);
-bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, int w, int h);
-/* Edit root frame (r=1) with packed RGB for rectangle x,y,s,v (Kitty a=f). */
+/* kitty_f: 24 (RGB bytes) or 32 (RGBA bytes). */
+bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, int w, int h, int kitty_f);
+/* Edit root frame (r=1) with packed pixels for rectangle x,y,s,v (Kitty a=f). */
 bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
-                               const Uint8 *packed_rgb, int x, int y, int rw, int rh);
+                               const Uint8 *packed_rgb, int x, int y, int rw, int rh, int kitty_f);
 /* Re-place existing image with new c/r (no pixel upload). */
 bool KITTY_PlaceExistingImage(SDL_VideoData *vdata, Uint32 image_id,
                               int place_cols, int place_rows);

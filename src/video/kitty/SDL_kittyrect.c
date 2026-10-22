@@ -105,7 +105,6 @@ KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
 {
     const char *env;
     SDL_Rect union_rect;
-    float coverage;
 
     if (dirty_out) {
         dirty_out->x = 0;
@@ -120,6 +119,7 @@ KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
         return KITTY_CONVERT_FULL;
     }
 
+    /* First present / resize (scratch rebuilt) → full convert + a=T. */
     if (!scratch_valid || fb_w <= 0 || fb_h <= 0) {
         return KITTY_CONVERT_FULL;
     }
@@ -128,11 +128,8 @@ KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
         return KITTY_CONVERT_FULL;
     }
 
-    coverage = KITTY_CoverageRatio(fb_w, fb_h, &union_rect);
-    if (coverage >= KITTY_DIRTY_COVERAGE_THRESHOLD) {
-        return KITTY_CONVERT_FULL;
-    }
-
+    /* Stay dirty for any union (including large / full-frame) so a=f can
+     * edit in place. Full a=T only when scratch invalid or a=f fails. */
     if (dirty_out) {
         *dirty_out = union_rect;
     }
@@ -202,6 +199,75 @@ bool KITTY_ConvertSurfaceRectToRGB(SDL_Surface *surface, const SDL_Rect *rect, U
             *dst++ = (Uint8)((p >> 8) & 0xFF);
             *dst++ = (Uint8)(p & 0xFF);
         }
+    }
+    return true;
+}
+
+bool KITTY_ConvertSurfaceRectToRGBA(SDL_Surface *surface, const SDL_Rect *rect, Uint8 *rgba_scratch)
+{
+    SDL_Rect area;
+    SDL_Rect fb;
+    int x, y;
+
+    if (!surface || !rgba_scratch || !rect) {
+        return false;
+    }
+    if (surface->w <= 0 || surface->h <= 0) {
+        return false;
+    }
+
+    fb.x = 0;
+    fb.y = 0;
+    fb.w = surface->w;
+    fb.h = surface->h;
+    if (!SDL_GetRectIntersection(rect, &fb, &area) || area.w <= 0 || area.h <= 0) {
+        return false;
+    }
+
+    /* ARGB8888 packed: A in top byte, then R,G,B. Kitty f=32 wants R,G,B,A bytes. */
+    for (y = area.y; y < area.y + area.h; ++y) {
+        const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + (size_t)y * (size_t)surface->pitch);
+        Uint8 *dst = rgba_scratch + ((size_t)y * (size_t)surface->w + (size_t)area.x) * 4u;
+        for (x = area.x; x < area.x + area.w; ++x) {
+            const Uint32 p = src[x];
+            *dst++ = (Uint8)((p >> 16) & 0xFF); /* R */
+            *dst++ = (Uint8)((p >> 8) & 0xFF);  /* G */
+            *dst++ = (Uint8)(p & 0xFF);         /* B */
+            *dst++ = (Uint8)((p >> 24) & 0xFF); /* A */
+        }
+    }
+    return true;
+}
+
+bool KITTY_PackRGBARect(const Uint8 *rgba_scratch, int fb_w, int fb_h,
+                        const SDL_Rect *rect, Uint8 *out, size_t out_cap, size_t *out_len)
+{
+    SDL_Rect fb, area;
+    int y;
+    size_t need;
+    size_t off = 0;
+
+    if (!rgba_scratch || !rect || !out || fb_w <= 0 || fb_h <= 0) {
+        return false;
+    }
+    fb.x = 0;
+    fb.y = 0;
+    fb.w = fb_w;
+    fb.h = fb_h;
+    if (!SDL_GetRectIntersection(rect, &fb, &area) || area.w <= 0 || area.h <= 0) {
+        return false;
+    }
+    need = (size_t)area.w * (size_t)area.h * 4u;
+    if (need > out_cap) {
+        return false;
+    }
+    for (y = area.y; y < area.y + area.h; ++y) {
+        const Uint8 *src = rgba_scratch + ((size_t)y * (size_t)fb_w + (size_t)area.x) * 4u;
+        SDL_memcpy(out + off, src, (size_t)area.w * 4u);
+        off += (size_t)area.w * 4u;
+    }
+    if (out_len) {
+        *out_len = off;
     }
     return true;
 }

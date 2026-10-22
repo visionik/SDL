@@ -197,7 +197,9 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
     }
 
     SDL_zero(mode);
-    mode.format = SDL_PIXELFORMAT_XRGB8888;
+    mode.format = KITTY_SelectFbAlpha(SDL_getenv("SDL_KITTY_FB_ALPHA"))
+                      ? SDL_PIXELFORMAT_ARGB8888
+                      : SDL_PIXELFORMAT_XRGB8888;
     mode.w = data->pixel_w;
     mode.h = data->pixel_h;
     if (SDL_AddBasicVideoDisplay(&mode) == 0) {

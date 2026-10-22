@@ -53,17 +53,36 @@ KITTY_GraphicsQueryStatus KITTY_ParseGraphicsQueryReply(const char *buf, size_t 
     return KITTY_GQ_NONE;
 }
 
+bool KITTY_SelectFbAlpha(const char *env)
+{
+    if (!env || !env[0]) {
+        return false;
+    }
+    if (SDL_strcasecmp(env, "1") == 0 ||
+        SDL_strcasecmp(env, "true") == 0 ||
+        SDL_strcasecmp(env, "yes") == 0 ||
+        SDL_strcasecmp(env, "on") == 0) {
+        return true;
+    }
+    return false;
+}
+
 int KITTY_FormatTransmitHeader(char *buf, size_t cap,
                                char medium, Uint32 image_id,
                                int w, int h, int place_cols, int place_rows,
                                bool more, const char *extra,
-                               size_t shm_bytes)
+                               size_t shm_bytes,
+                               int kitty_f)
 {
     const bool use_cr = place_cols > 0 && place_rows > 0;
     char extra_part[64];
     extra_part[0] = '\0';
     if (extra && *extra) {
         SDL_snprintf(extra_part, sizeof(extra_part), ",%s", extra);
+    }
+
+    if (kitty_f != 24 && kitty_f != 32) {
+        kitty_f = 24;
     }
 
     if (!buf || cap < 32 || (medium != 'd' && medium != 's') || w <= 0 || h <= 0) {
@@ -73,15 +92,15 @@ int KITTY_FormatTransmitHeader(char *buf, size_t cap,
     if (medium == 's') {
         if (use_cr) {
             return SDL_snprintf(buf, cap,
-                                "a=T,f=24,t=s,i=%u,s=%d,v=%d,c=%d,r=%d,S=%zu,%s%s%s",
-                                (unsigned)image_id, w, h, place_cols, place_rows, shm_bytes,
+                                "a=T,f=%d,t=s,i=%u,s=%d,v=%d,c=%d,r=%d,S=%zu,%s%s%s",
+                                kitty_f, (unsigned)image_id, w, h, place_cols, place_rows, shm_bytes,
                                 KITTY_AT_PLACE_KEYS,
                                 extra_part,
                                 more ? ",m=1" : "");
         }
         return SDL_snprintf(buf, cap,
-                            "a=T,f=24,t=s,i=%u,s=%d,v=%d,S=%zu,%s%s%s",
-                            (unsigned)image_id, w, h, shm_bytes,
+                            "a=T,f=%d,t=s,i=%u,s=%d,v=%d,S=%zu,%s%s%s",
+                            kitty_f, (unsigned)image_id, w, h, shm_bytes,
                             KITTY_AT_PLACE_KEYS,
                             extra_part,
                             more ? ",m=1" : "");
@@ -89,15 +108,15 @@ int KITTY_FormatTransmitHeader(char *buf, size_t cap,
 
     if (use_cr) {
         return SDL_snprintf(buf, cap,
-                            "a=T,f=24,t=d,i=%u,s=%d,v=%d,c=%d,r=%d,%s%s%s",
-                            (unsigned)image_id, w, h, place_cols, place_rows,
+                            "a=T,f=%d,t=d,i=%u,s=%d,v=%d,c=%d,r=%d,%s%s%s",
+                            kitty_f, (unsigned)image_id, w, h, place_cols, place_rows,
                             KITTY_AT_PLACE_KEYS,
                             extra_part,
                             more ? ",m=1" : "");
     }
     return SDL_snprintf(buf, cap,
-                        "a=T,f=24,t=d,i=%u,s=%d,v=%d,%s%s%s",
-                        (unsigned)image_id, w, h,
+                        "a=T,f=%d,t=d,i=%u,s=%d,v=%d,%s%s%s",
+                        kitty_f, (unsigned)image_id, w, h,
                         KITTY_AT_PLACE_KEYS,
                         extra_part,
                         more ? ",m=1" : "");

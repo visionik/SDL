@@ -77,10 +77,11 @@ typedef struct SDL_WindowData
     Uint32 image_ids[2];
     int image_index;
     bool placed;
-    /* Retained RGB24 scratch for dirty CPU converts (Step 1a). */
+    /* Retained RGB24/RGBA32 scratch for dirty CPU converts (Step 1a / RGBA). */
     Uint8 *rgb_scratch;
     int rgb_w;
     int rgb_h;
+    int scratch_bpp; /* 3 (f=24) or 4 (f=32) */
     bool rgb_valid;
     /* Image id of the last successful full place (Step 1b a=f target). */
     Uint32 live_image_id;

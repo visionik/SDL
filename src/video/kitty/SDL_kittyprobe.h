@@ -59,16 +59,21 @@ bool KITTY_SelectPingPong(const char *env);
 /* Step 3: no cursor advance, transient image, stable placement id. */
 #define KITTY_AT_PLACE_KEYS "C=1,N=1,p=1"
 
+/* SDL_KITTY_FB_ALPHA=1/true/yes/on → ARGB8888 window FB + Kitty f=32. */
+bool KITTY_SelectFbAlpha(const char *env);
+
 /*
  * Format first-chunk a=T APC header (without ESC_G prefix or trailing payload).
- * medium: 'd' or 's'. extra: e.g. "o=z" or NULL (no leading comma).
+ * medium: 'd' or 's'. kitty_f: 24 (RGB) or 32 (RGBA).
+ * extra: e.g. "o=z" or NULL (no leading comma).
  * more: true → include m=1. Returns bytes written (excl NUL) or -1.
  */
 int KITTY_FormatTransmitHeader(char *buf, size_t cap,
                                char medium, Uint32 image_id,
                                int w, int h, int place_cols, int place_rows,
                                bool more, const char *extra,
-                               size_t shm_bytes /* 0 if not t=s */);
+                               size_t shm_bytes /* 0 if not t=s */,
+                               int kitty_f /* 24 or 32 */);
 
 typedef enum KITTY_ResizeAction
 {

@@ -341,7 +341,9 @@ static void KITTY_HandleWinch(SDL_VideoDevice *_this)
     display = SDL_GetVideoDisplay(SDL_GetPrimaryDisplay());
     if (display) {
         SDL_zero(mode);
-        mode.format = SDL_PIXELFORMAT_XRGB8888;
+        mode.format = KITTY_SelectFbAlpha(SDL_getenv("SDL_KITTY_FB_ALPHA"))
+                          ? SDL_PIXELFORMAT_ARGB8888
+                          : SDL_PIXELFORMAT_XRGB8888;
         mode.w = data->pixel_w;
         mode.h = data->pixel_h;
         SDL_SetDesktopDisplayMode(display, &mode);

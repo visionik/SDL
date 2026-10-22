@@ -104,7 +104,8 @@ static bool KITTY_WriteAll(int fd, const void *buf, size_t len)
 static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
                                         int place_cols, int place_rows,
                                         const char *extra_keys,
-                                        const Uint8 *payload, size_t payload_len)
+                                        const Uint8 *payload, size_t payload_len,
+                                        int kitty_f)
 {
     const size_t b64_len = ((payload_len + 2) / 3) * 4;
     char *b64 = (char *)SDL_malloc(b64_len + 1);
@@ -138,7 +139,7 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
             char ctrl[192];
             const int ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 'd', image_id,
                                                             w, h, place_cols, place_rows,
-                                                            more != 0, extra_keys, 0);
+                                                            more != 0, extra_keys, 0, kitty_f);
             if (ctrl_len <= 0) {
                 SDL_free(b64);
                 return SDL_SetError("transmit header format failed");
@@ -166,9 +167,10 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
 }
 
 static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
-                                     int place_cols, int place_rows)
+                                     int place_cols, int place_rows, int kitty_f)
 {
-    const uLong raw_len = (uLong)w * (uLong)h * 3u;
+    const int bpp = (kitty_f == 32) ? 4 : 3;
+    const uLong raw_len = (uLong)w * (uLong)h * (uLong)bpp;
     uLongf bound = compressBound(raw_len);
     Uint8 *compressed = (Uint8 *)SDL_malloc((size_t)bound);
     if (!compressed) {
@@ -181,23 +183,25 @@ static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, 
         return SDL_SetError("zlib compress2 failed (%d)", zerr);
     }
     const bool ok = KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows,
-                                                "o=z", compressed, (size_t)out_len);
+                                                "o=z", compressed, (size_t)out_len, kitty_f);
     SDL_free(compressed);
     return ok;
 }
 
 static bool KITTY_TransmitDirectRaw(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
-                                    int place_cols, int place_rows)
+                                    int place_cols, int place_rows, int kitty_f)
 {
-    const size_t raw_len = (size_t)w * (size_t)h * 3u;
-    return KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows, "", rgb, raw_len);
+    const int bpp = (kitty_f == 32) ? 4 : 3;
+    const size_t raw_len = (size_t)w * (size_t)h * (size_t)bpp;
+    return KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows, "", rgb, raw_len, kitty_f);
 }
 
 static bool KITTY_TransmitShm(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
-                              int place_cols, int place_rows)
+                              int place_cols, int place_rows, int kitty_f)
 {
     char name[64];
-    const size_t raw_len = (size_t)w * (size_t)h * 3u;
+    const int bpp = (kitty_f == 32) ? 4 : 3;
+    const size_t raw_len = (size_t)w * (size_t)h * (size_t)bpp;
     int shm_fd = -1;
     void *map = MAP_FAILED;
     bool ok = false;
@@ -238,7 +242,7 @@ static bool KITTY_TransmitShm(int fd, Uint32 image_id, const Uint8 *rgb, int w, 
             char ctrl[192];
             const int ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 's', image_id,
                                                             w, h, place_cols, place_rows,
-                                                            false, NULL, raw_len);
+                                                            false, NULL, raw_len, kitty_f);
             if (ctrl_len <= 0) {
                 SDL_SetError("shm header format failed");
                 goto done;
@@ -738,15 +742,19 @@ bool KITTY_DeleteImage(int fd, Uint32 image_id)
 }
 
 bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
-                               const Uint8 *packed_rgb, int x, int y, int rw, int rh)
+                               const Uint8 *packed_rgb, int x, int y, int rw, int rh, int kitty_f)
 {
-    const size_t payload_len = (size_t)rw * (size_t)rh * 3u;
+    const int bpp = (kitty_f == 32) ? 4 : 3;
+    const size_t payload_len = (size_t)rw * (size_t)rh * (size_t)bpp;
     size_t b64_len;
     char *b64;
     size_t encoded;
     size_t offset = 0;
     bool first = true;
 
+    if (kitty_f != 24 && kitty_f != 32) {
+        kitty_f = 24;
+    }
     if (!vdata || !packed_rgb || image_id == 0 || rw <= 0 || rh <= 0 || x < 0 || y < 0) {
         return SDL_SetError("invalid RGB rect edit");
     }
@@ -776,12 +784,12 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
             /* r=1 edits root; X=1 overwrite; x,y,s,v = dirty bbox in image pixels. */
             if (more) {
                 header_len = SDL_snprintf(header, sizeof(header),
-                                          "\033_Ga=f,f=24,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,m=1;",
-                                          (unsigned)image_id, x, y, rw, rh);
+                                          "\033_Ga=f,f=%d,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,m=1;",
+                                          kitty_f, (unsigned)image_id, x, y, rw, rh);
             } else {
                 header_len = SDL_snprintf(header, sizeof(header),
-                                          "\033_Ga=f,f=24,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d;",
-                                          (unsigned)image_id, x, y, rw, rh);
+                                          "\033_Ga=f,f=%d,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d;",
+                                          kitty_f, (unsigned)image_id, x, y, rw, rh);
             }
             first = false;
         } else {
@@ -836,10 +844,13 @@ bool KITTY_PlaceExistingImage(SDL_VideoData *vdata, Uint32 image_id,
     return true;
 }
 
-bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, int w, int h)
+bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, int w, int h, int kitty_f)
 {
     if (!vdata || !rgb || w <= 0 || h <= 0) {
         return SDL_SetError("invalid RGB buffer");
+    }
+    if (kitty_f != 24 && kitty_f != 32) {
+        kitty_f = 24;
     }
 
     const char *force = SDL_getenv("SDL_KITTY_TRANSMIT");
@@ -860,7 +871,7 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
         bool ok = false;
 
         if (vdata->transmit_mode == KITTY_TRANSMIT_SHM && !vdata->shm_failed) {
-            if (KITTY_TransmitShm(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows)) {
+            if (KITTY_TransmitShm(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows, kitty_f)) {
                 ok = true;
             } else {
                 // Fall back for the rest of the session.
@@ -871,7 +882,7 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
         }
 
         if (!ok && vdata->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
-            if (KITTY_TransmitDirectZlib(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows)) {
+            if (KITTY_TransmitDirectZlib(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows, kitty_f)) {
                 ok = true;
             } else {
                 vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
@@ -880,7 +891,7 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
         }
 
         if (!ok) {
-            ok = KITTY_TransmitDirectRaw(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows);
+            ok = KITTY_TransmitDirectRaw(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows, kitty_f);
         }
         if (ok) {
             vdata->placed_cols = place_cols;

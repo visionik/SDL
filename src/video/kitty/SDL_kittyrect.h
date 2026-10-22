@@ -29,9 +29,6 @@
 #ifndef SDL_kittyrect_h_
 #define SDL_kittyrect_h_
 
-/* Coverage at or above this uses a full-surface convert. */
-#define KITTY_DIRTY_COVERAGE_THRESHOLD 0.5f
-
 typedef enum KITTY_PresentConvertMode
 {
     KITTY_CONVERT_FULL = 0,
@@ -52,8 +49,9 @@ bool KITTY_UnionRects(int fb_w, int fb_h, const SDL_Rect *rects, int numrects, S
 float KITTY_CoverageRatio(int fb_w, int fb_h, const SDL_Rect *union_rect);
 
 /*
- * Decide full vs dirty convert. dirty_out set when mode is DIRTY.
+ * Decide full vs dirty convert. dirty_out set when mode is DIRTY (union of rects).
  * SDL_KITTY_DIRTY=0 forces FULL. First present / invalid scratch → FULL.
+ * No coverage threshold: stay dirty for any non-empty union so a=f can stay sparse.
  */
 KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
                                                  const SDL_Rect *rects, int numrects,
@@ -62,12 +60,19 @@ KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
 /* XRGB8888 (or compatible 32-bit) surface rect → RGB24 scratch (full w*h*3 buffer). */
 bool KITTY_ConvertSurfaceRectToRGB(SDL_Surface *surface, const SDL_Rect *rect, Uint8 *rgb_scratch);
 
+/* ARGB8888 (or compatible) surface rect → RGBA32 scratch (full w*h*4, R,G,B,A). */
+bool KITTY_ConvertSurfaceRectToRGBA(SDL_Surface *surface, const SDL_Rect *rect, Uint8 *rgba_scratch);
+
 /*
  * Pack a rect from a full-frame RGB24 scratch into a tightly packed buffer
  * (rw*rh*3). out must be large enough.
  */
 bool KITTY_PackRGBRect(const Uint8 *rgb_scratch, int fb_w, int fb_h,
                        const SDL_Rect *rect, Uint8 *out, size_t out_cap, size_t *out_len);
+
+/* Pack from full-frame RGBA32 scratch into tightly packed rw*rh*4. */
+bool KITTY_PackRGBARect(const Uint8 *rgba_scratch, int fb_w, int fb_h,
+                        const SDL_Rect *rect, Uint8 *out, size_t out_cap, size_t *out_len);
 
 #endif /* SDL_kittyrect_h_ */
 
