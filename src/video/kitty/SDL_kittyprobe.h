@@ -53,6 +53,9 @@ KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
  */
 bool KITTY_SelectDirtyBW(const char *env, bool frame_edit_ok);
 
+/* SDL_KITTY_PINGPONG=1 restores delete+swap presents; default is same-(i,p) replace. */
+bool KITTY_SelectPingPong(const char *env);
+
 /* Step 3: no cursor advance, transient image, stable placement id. */
 #define KITTY_AT_PLACE_KEYS "C=1,N=1,p=1"
 

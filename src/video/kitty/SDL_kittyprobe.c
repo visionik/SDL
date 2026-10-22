@@ -139,6 +139,18 @@ bool KITTY_SelectDirtyBW(const char *env, bool frame_edit_ok)
     return frame_edit_ok;
 }
 
+bool KITTY_SelectPingPong(const char *env)
+{
+    if (!env || !*env) {
+        return false; /* default: same-(i,p) replace */
+    }
+    if (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
+        SDL_strcasecmp(env, "false") == 0 || SDL_strcasecmp(env, "no") == 0) {
+        return false;
+    }
+    return true;
+}
+
 KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
                                             const char *term_program,
                                             bool shm_ok,

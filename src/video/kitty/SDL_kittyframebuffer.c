@@ -169,12 +169,21 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
     }
 
     if (!ok) {
-        wdata->image_index ^= 1;
-        image_id = wdata->image_ids[wdata->image_index];
+        const bool pingpong = KITTY_SelectPingPong(SDL_getenv("SDL_KITTY_PINGPONG"));
+        Uint32 prev = 0;
+
+        if (pingpong) {
+            wdata->image_index ^= 1;
+            image_id = wdata->image_ids[wdata->image_index];
+            prev = wdata->image_ids[wdata->image_index ^ 1];
+        } else {
+            /* Same (i,p=1) replace: re-a=T the live id; no per-frame delete. */
+            image_id = wdata->live_image_id ? wdata->live_image_id : wdata->image_ids[0];
+        }
+
         ok = KITTY_TransmitRGB(vdata, image_id, wdata->rgb_scratch, surface->w, surface->h);
         if (ok) {
-            const Uint32 prev = wdata->image_ids[wdata->image_index ^ 1];
-            if (wdata->placed) {
+            if (pingpong && wdata->placed && prev != 0 && prev != image_id) {
                 KITTY_DeleteImage(vdata->tty_fd, prev);
             }
             wdata->placed = true;
@@ -201,13 +210,14 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                         mode_str = "dirty_cpu";
                     }
                     fprintf(log,
-                            "present #%d %dx%d place=%d mode=%s rects=%d union=%dx%d coverage=%.2f convert_px=%zu upload_px=%zu live=%u -> %s%s\n",
+                            "present #%d %dx%d place=%d mode=%s rects=%d union=%dx%d coverage=%.2f convert_px=%zu upload_px=%zu live=%u pingpong=%d -> %s%s\n",
                             frames, surface->w, surface->h,
                             vdata->place_cells ? 1 : 0,
                             mode_str,
                             numrects, dirty.w, dirty.h, (double)cov,
                             convert_px, upload_px,
                             (unsigned)wdata->live_image_id,
+                            KITTY_SelectPingPong(SDL_getenv("SDL_KITTY_PINGPONG")) ? 1 : 0,
                             ok ? "ok" : "FAIL ",
                             ok ? "" : SDL_GetError());
                     fclose(log);
