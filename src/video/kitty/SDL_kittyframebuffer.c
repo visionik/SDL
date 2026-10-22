@@ -22,8 +22,8 @@
 
 #ifdef SDL_VIDEO_DRIVER_KITTY
 
-#include "../SDL_sysvideo.h"
 #include "../../SDL_properties_c.h"
+#include "../SDL_sysvideo.h"
 #include "SDL_kittyframebuffer_c.h"
 #include "SDL_kittygraphics.h"
 #include "SDL_kittyprobe.h"
@@ -137,16 +137,16 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
 
         if (convert_mode == KITTY_CONVERT_DIRTY) {
             const bool conv_ok = use_rgba
-                ? KITTY_ConvertSurfaceRectToRGBA(surface, &dirty, wdata->rgb_scratch)
-                : KITTY_ConvertSurfaceRectToRGB(surface, &dirty, wdata->rgb_scratch);
+                                     ? KITTY_ConvertSurfaceRectToRGBA(surface, &dirty, wdata->rgb_scratch)
+                                     : KITTY_ConvertSurfaceRectToRGB(surface, &dirty, wdata->rgb_scratch);
             if (!conv_ok) {
                 convert_mode = KITTY_CONVERT_FULL;
             }
         }
         if (convert_mode == KITTY_CONVERT_FULL) {
             const bool conv_ok = use_rgba
-                ? KITTY_ConvertSurfaceRectToRGBA(surface, &full, wdata->rgb_scratch)
-                : KITTY_ConvertSurfaceRectToRGB(surface, &full, wdata->rgb_scratch);
+                                     ? KITTY_ConvertSurfaceRectToRGBA(surface, &full, wdata->rgb_scratch)
+                                     : KITTY_ConvertSurfaceRectToRGB(surface, &full, wdata->rgb_scratch);
             if (!conv_ok) {
                 return SDL_SetError("kitty RGB convert failed");
             }
@@ -169,10 +169,10 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             packed = (Uint8 *)SDL_malloc(pack_cap);
             if (packed) {
                 pack_ok = use_rgba
-                    ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h, &dirty,
-                                         packed, pack_cap, &packed_len)
-                    : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h, &dirty,
-                                        packed, pack_cap, &packed_len);
+                              ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h, &dirty,
+                                                   packed, pack_cap, &packed_len)
+                              : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h, &dirty,
+                                                  packed, pack_cap, &packed_len);
             }
             if (pack_ok &&
                 KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed,
@@ -217,42 +217,33 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         }
     }
 
-    {
-        const char *dbg = SDL_getenv("SDL_KITTY_DEBUG");
-        if (dbg && dbg[0] && dbg[0] != '0') {
-            static int frames;
-            {
-                const float cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
-                /* Log startup, failures, full presents, high-coverage sparse, or every 60th. */
-                const bool log_it = frames < 8 || !ok || wire_mode == KITTY_WIRE_FULL ||
-                                    (wire_mode == KITTY_WIRE_DIRTY_BW && cov >= 0.5f) ||
-                                    (frames % 60) == 0;
-                if (log_it) {
-                    FILE *log = fopen("/tmp/sdl_kitty_debug.log", "a");
-                    if (log) {
-                        const char *mode_str = "full";
-                        if (wire_mode == KITTY_WIRE_DIRTY_BW) {
-                            mode_str = "dirty_bw";
-                        } else if (wire_mode == KITTY_WIRE_DIRTY_CPU) {
-                            mode_str = "dirty_cpu";
-                        }
-                        fprintf(log,
-                                "present #%d %dx%d place=%d mode=%s rects=%d union=%dx%d coverage=%.2f convert_px=%zu upload_px=%zu live=%u pingpong=%d -> %s%s\n",
-                                frames, surface->w, surface->h,
-                                vdata->place_cells ? 1 : 0,
-                                mode_str,
-                                numrects, dirty.w, dirty.h, (double)cov,
-                                convert_px, upload_px,
-                                (unsigned)wdata->live_image_id,
-                                KITTY_SelectPingPong(SDL_getenv("SDL_KITTY_PINGPONG")) ? 1 : 0,
-                                ok ? "ok" : "FAIL ",
-                                ok ? "" : SDL_GetError());
-                        fclose(log);
-                    }
-                }
+    if (KITTY_DebugEnabled()) {
+        static int frames;
+        const float cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
+        /* Log startup, failures, full presents, high-coverage sparse, or every 60th. */
+        const bool log_it = frames < 8 || !ok || wire_mode == KITTY_WIRE_FULL ||
+                            (wire_mode == KITTY_WIRE_DIRTY_BW && cov >= 0.5f) ||
+                            (frames % 60) == 0;
+        if (log_it) {
+            const char *mode_str = "full";
+            if (wire_mode == KITTY_WIRE_DIRTY_BW) {
+                mode_str = "dirty_bw";
+            } else if (wire_mode == KITTY_WIRE_DIRTY_CPU) {
+                mode_str = "dirty_cpu";
             }
-            frames++;
+            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                         "kitty: present #%d %dx%d place=%d mode=%s rects=%d union=%dx%d coverage=%.2f convert_px=%zu upload_px=%zu live=%u pingpong=%d -> %s%s",
+                         frames, surface->w, surface->h,
+                         vdata->place_cells ? 1 : 0,
+                         mode_str,
+                         numrects, dirty.w, dirty.h, (double)cov,
+                         convert_px, upload_px,
+                         (unsigned)wdata->live_image_id,
+                         KITTY_SelectPingPong(SDL_getenv("SDL_KITTY_PINGPONG")) ? 1 : 0,
+                         ok ? "ok" : "FAIL ",
+                         ok ? "" : SDL_GetError());
         }
+        frames++;
     }
     return ok;
 }

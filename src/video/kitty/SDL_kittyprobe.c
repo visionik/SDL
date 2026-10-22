@@ -170,6 +170,19 @@ bool KITTY_SelectPingPong(const char *env)
     return true;
 }
 
+bool KITTY_DebugEnabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *dbg = SDL_getenv("SDL_KITTY_DEBUG");
+        cached = (dbg && dbg[0] && dbg[0] != '0') ? 1 : 0;
+        if (cached) {
+            SDL_SetLogPriority(SDL_LOG_CATEGORY_VIDEO, SDL_LOG_PRIORITY_DEBUG);
+        }
+    }
+    return cached != 0;
+}
+
 KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
                                             const char *term_program,
                                             bool shm_ok,
@@ -465,31 +478,26 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
         frame_ok = KITTY_ProbeFrameEdit(data, id_frame);
         data->frame_edit_ok = frame_ok;
 
-        {
-            const char *dbg = SDL_getenv("SDL_KITTY_DEBUG");
-            if (dbg && dbg[0] && dbg[0] != '0') {
-                FILE *log = fopen("/tmp/sdl_kitty_debug.log", "a");
-                if (log) {
-                    const char *mode = "direct";
-                    const bool bw = KITTY_SelectDirtyBW(bw_env, frame_ok);
-                    if (data->transmit_mode == KITTY_TRANSMIT_SHM) {
-                        mode = "shm";
-                    } else if (data->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
-                        mode = "zlib";
-                    }
-                    fprintf(log, "transmit_probe direct=%s shm=%s force=%s term=%s -> %s\n",
-                            direct_ok ? "ok" : "fail",
-                            probe_shm ? (shm_ok ? "ok" : "fail") : "skip",
-                            force ? force : "(none)",
-                            tp ? tp : "(none)",
-                            mode);
-                    fprintf(log, "frame_edit_probe %s -> dirty_bw=%s (env=%s)\n",
-                            frame_ok ? "ok" : "fail",
-                            bw ? "on" : "off",
-                            bw_env ? bw_env : "(none)");
-                    fclose(log);
-                }
+        if (KITTY_DebugEnabled()) {
+            const char *mode = "direct";
+            const bool bw = KITTY_SelectDirtyBW(bw_env, frame_ok);
+            if (data->transmit_mode == KITTY_TRANSMIT_SHM) {
+                mode = "shm";
+            } else if (data->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
+                mode = "zlib";
             }
+            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                         "kitty: transmit_probe direct=%s shm=%s force=%s term=%s -> %s",
+                         direct_ok ? "ok" : "fail",
+                         probe_shm ? (shm_ok ? "ok" : "fail") : "skip",
+                         force ? force : "(none)",
+                         tp ? tp : "(none)",
+                         mode);
+            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                         "kitty: frame_edit_probe %s -> dirty_bw=%s (env=%s)",
+                         frame_ok ? "ok" : "fail",
+                         bw ? "on" : "off",
+                         bw_env ? bw_env : "(none)");
         }
     }
 

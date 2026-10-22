@@ -63,6 +63,12 @@ bool KITTY_SelectPingPong(const char *env);
 bool KITTY_SelectFbAlpha(const char *env);
 
 /*
+ * SDL_KITTY_DEBUG=1 → enable VIDEO debug logs (raises category priority once).
+ * Prefer SDL_LogDebug over writing /tmp files.
+ */
+bool KITTY_DebugEnabled(void);
+
+/*
  * Format first-chunk a=T APC header (without ESC_G prefix or trailing payload).
  * medium: 'd' or 's'. kitty_f: 24 (RGB) or 32 (RGBA).
  * extra: e.g. "o=z" or NULL (no leading comma).
@@ -77,9 +83,9 @@ int KITTY_FormatTransmitHeader(char *buf, size_t cap,
 
 typedef enum KITTY_ResizeAction
 {
-    KITTY_RESIZE_NONE = 0,   /* grid and FB unchanged */
-    KITTY_RESIZE_REPLACE,    /* stretch: FB same, cols/rows changed → a=p only */
-    KITTY_RESIZE_FULL        /* FB size changed or no live image → recreate */
+    KITTY_RESIZE_NONE = 0, /* grid and FB unchanged */
+    KITTY_RESIZE_REPLACE,  /* stretch: FB same, cols/rows changed → a=p only */
+    KITTY_RESIZE_FULL      /* FB size changed or no live image → recreate */
 } KITTY_ResizeAction;
 
 KITTY_ResizeAction KITTY_ClassifyResize(bool place_cells, bool has_live_image,

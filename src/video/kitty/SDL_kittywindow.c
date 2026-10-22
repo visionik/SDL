@@ -22,12 +22,12 @@
 
 #ifdef SDL_VIDEO_DRIVER_KITTY
 
-#include "../SDL_sysvideo.h"
 #include "../../events/SDL_keyboard_c.h"
 #include "../../events/SDL_mouse_c.h"
 #include "../../events/SDL_windowevents_c.h"
-#include "SDL_kittywindow.h"
+#include "../SDL_sysvideo.h"
 #include "SDL_kittygraphics.h"
+#include "SDL_kittywindow.h"
 
 bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_PropertiesID create_props)
 {

@@ -21,8 +21,8 @@
 #ifdef KITTY_RECT_STANDALONE
 #include <SDL3/SDL.h>
 #else
-#include "SDL_internal.h"
 #include "../SDL_surface_c.h"
+#include "SDL_internal.h"
 #endif
 
 #if defined(SDL_VIDEO_DRIVER_KITTY) || defined(KITTY_RECT_STANDALONE)

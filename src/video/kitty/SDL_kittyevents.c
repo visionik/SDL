@@ -31,7 +31,6 @@
 #include "SDL_kittyprobe.h"
 
 #include <errno.h>
-#include <stdio.h>
 #include <unistd.h>
 
 static void KITTY_HandleWinch(SDL_VideoDevice *_this);
@@ -304,25 +303,18 @@ static void KITTY_HandleWinch(SDL_VideoDevice *_this)
                                   old_pw, old_ph, data->pixel_w, data->pixel_h,
                                   old_cols, old_rows, data->cols, data->rows);
 
-    {
-        const char *dbg = SDL_getenv("SDL_KITTY_DEBUG");
-        if (dbg && dbg[0] && dbg[0] != '0') {
-            FILE *log = fopen("/tmp/sdl_kitty_debug.log", "a");
-            if (log) {
-                const char *an = "full";
-                if (action == KITTY_RESIZE_REPLACE) {
-                    an = "replace";
-                } else if (action == KITTY_RESIZE_NONE) {
-                    an = "none";
-                }
-                fprintf(log,
-                        "resize action=%s fb %dx%d->%dx%d grid %dx%d->%dx%d live=%u\n",
-                        an, old_pw, old_ph, data->pixel_w, data->pixel_h,
-                        old_cols, old_rows, data->cols, data->rows,
-                        wdata ? (unsigned)wdata->live_image_id : 0u);
-                fclose(log);
-            }
+    if (KITTY_DebugEnabled()) {
+        const char *an = "full";
+        if (action == KITTY_RESIZE_REPLACE) {
+            an = "replace";
+        } else if (action == KITTY_RESIZE_NONE) {
+            an = "none";
         }
+        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                     "kitty: resize action=%s fb %dx%d->%dx%d grid %dx%d->%dx%d live=%u",
+                     an, old_pw, old_ph, data->pixel_w, data->pixel_h,
+                     old_cols, old_rows, data->cols, data->rows,
+                     wdata ? (unsigned)wdata->live_image_id : 0u);
     }
 
     if (action == KITTY_RESIZE_NONE) {

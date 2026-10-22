@@ -37,9 +37,9 @@ typedef enum KITTY_PresentConvertMode
 
 typedef enum KITTY_PresentWireMode
 {
-    KITTY_WIRE_FULL = 0,     /* full-frame a=T */
-    KITTY_WIRE_DIRTY_CPU,    /* dirty convert, full a=T (Step 1a) */
-    KITTY_WIRE_DIRTY_BW      /* dirty convert + a=f rect edit (Step 1b) */
+    KITTY_WIRE_FULL = 0,  /* full-frame a=T */
+    KITTY_WIRE_DIRTY_CPU, /* dirty convert, full a=T (Step 1a) */
+    KITTY_WIRE_DIRTY_BW   /* dirty convert + a=f rect edit (Step 1b) */
 } KITTY_PresentWireMode;
 
 /* Clamp and union rects into the FB. Returns false if nothing remains. */

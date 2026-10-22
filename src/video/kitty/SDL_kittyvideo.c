@@ -22,16 +22,16 @@
 
 #ifdef SDL_VIDEO_DRIVER_KITTY
 
-#include "../SDL_sysvideo.h"
-#include "../SDL_pixels_c.h"
 #include "../../events/SDL_events_c.h"
+#include "../SDL_pixels_c.h"
+#include "../SDL_sysvideo.h"
 
-#include "SDL_kittyvideo.h"
 #include "SDL_kittyevents_c.h"
 #include "SDL_kittyframebuffer_c.h"
-#include "SDL_kittywindow.h"
 #include "SDL_kittygraphics.h"
 #include "SDL_kittyprobe.h"
+#include "SDL_kittyvideo.h"
+#include "SDL_kittywindow.h"
 
 #include <signal.h>
 #include <unistd.h>
@@ -208,19 +208,12 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
         return false;
     }
 
-    {
-        const char *dbg = SDL_getenv("SDL_KITTY_DEBUG");
-        if (dbg && dbg[0] && dbg[0] != '0') {
-            FILE *log = fopen("/tmp/sdl_kitty_debug.log", "a");
-            if (log) {
-                fprintf(log,
-                        "init cols=%d rows=%d fb=%dx%d cell=%dx%d place=%d mouse1016=%d\n",
-                        data->cols, data->rows, data->pixel_w, data->pixel_h,
-                        data->cell_w, data->cell_h, data->place_cells ? 1 : 0,
-                        data->mouse_sgr_pixels ? 1 : 0);
-                fclose(log);
-            }
-        }
+    if (KITTY_DebugEnabled()) {
+        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                     "kitty: init cols=%d rows=%d fb=%dx%d cell=%dx%d place=%d mouse1016=%d",
+                     data->cols, data->rows, data->pixel_w, data->pixel_h,
+                     data->cell_w, data->cell_h, data->place_cells ? 1 : 0,
+                     data->mouse_sgr_pixels ? 1 : 0);
     }
 
     return true;
