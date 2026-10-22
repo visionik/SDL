@@ -30,6 +30,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -98,6 +99,7 @@ static bool KITTY_WriteAll(int fd, const void *buf, size_t len)
 }
 
 static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
+                                        int place_cols, int place_rows,
                                         const char *extra_keys,
                                         const Uint8 *payload, size_t payload_len)
 {
@@ -125,12 +127,14 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
             chunk = KITTY_CHUNK;
         }
         const int more = (offset + chunk < encoded) ? 1 : 0;
-        char header[192];
+        char header[256];
         int header_len;
         if (first) {
+            // c/r force the image to occupy the full terminal cell grid so
+            // cell-based mouse coordinates line up with what the user sees.
             header_len = SDL_snprintf(header, sizeof(header),
-                                      "\033_Ga=T,f=24,t=d,i=%u,s=%d,v=%d,q=2,m=%d%s;",
-                                      (unsigned)image_id, w, h, more,
+                                      "\033_Ga=T,f=24,t=d,i=%u,s=%d,v=%d,c=%d,r=%d,q=2,m=%d%s;",
+                                      (unsigned)image_id, w, h, place_cols, place_rows, more,
                                       extra_keys ? extra_keys : "");
             first = false;
         } else {
@@ -153,7 +157,8 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
     return true;
 }
 
-static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h)
+static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
+                                     int place_cols, int place_rows)
 {
     const uLong raw_len = (uLong)w * (uLong)h * 3u;
     uLongf bound = compressBound(raw_len);
@@ -167,18 +172,21 @@ static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, 
         SDL_free(compressed);
         return SDL_SetError("zlib compress2 failed (%d)", zerr);
     }
-    const bool ok = KITTY_TransmitDirectPayload(fd, image_id, w, h, ",o=z", compressed, (size_t)out_len);
+    const bool ok = KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows,
+                                                ",o=z", compressed, (size_t)out_len);
     SDL_free(compressed);
     return ok;
 }
 
-static bool KITTY_TransmitDirectRaw(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h)
+static bool KITTY_TransmitDirectRaw(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
+                                    int place_cols, int place_rows)
 {
     const size_t raw_len = (size_t)w * (size_t)h * 3u;
-    return KITTY_TransmitDirectPayload(fd, image_id, w, h, "", rgb, raw_len);
+    return KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows, "", rgb, raw_len);
 }
 
-static bool KITTY_TransmitShm(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h)
+static bool KITTY_TransmitShm(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
+                              int place_cols, int place_rows)
 {
     char name[64];
     const size_t raw_len = (size_t)w * (size_t)h * 3u;
@@ -208,7 +216,7 @@ static bool KITTY_TransmitShm(int fd, Uint32 image_id, const Uint8 *rgb, int w, 
         char name_b64[128];
         const size_t nlen = SDL_strlen(name);
         const size_t encoded = KITTY_Base64Encode((const Uint8 *)name, nlen, name_b64, sizeof(name_b64));
-        char header[192];
+        char header[256];
         int header_len;
 
         if (encoded == 0) {
@@ -219,8 +227,8 @@ static bool KITTY_TransmitShm(int fd, Uint32 image_id, const Uint8 *rgb, int w, 
             goto done;
         }
         header_len = SDL_snprintf(header, sizeof(header),
-                                  "\033_Ga=T,f=24,t=s,i=%u,s=%d,v=%d,S=%zu,q=2;",
-                                  (unsigned)image_id, w, h, raw_len);
+                                  "\033_Ga=T,f=24,t=s,i=%u,s=%d,v=%d,c=%d,r=%d,S=%zu,q=2;",
+                                  (unsigned)image_id, w, h, place_cols, place_rows, raw_len);
         if (header_len <= 0) {
             SDL_SetError("shm header snprintf failed");
             goto done;
@@ -277,6 +285,84 @@ bool KITTY_ProbeSupport(void)
     return false;
 }
 
+static bool KITTY_QueryPixelSizeCSI(SDL_VideoData *data)
+{
+    // CSI 16 t → cell size report CSI 6 ; height ; width t
+    // CSI 14 t → text-area pixels  CSI 4 ; height ; width t
+    static const char query[] = "\033[16t\033[14t";
+    unsigned char buf[128];
+    size_t total = 0;
+    int cell_w = 0, cell_h = 0, area_w = 0, area_h = 0;
+    int got_cell = 0, got_area = 0;
+
+    if (!KITTY_WriteAll(data->tty_fd, query, sizeof(query) - 1)) {
+        return false;
+    }
+
+    for (int attempt = 0; attempt < 40 && !(got_cell && got_area); ++attempt) {
+        fd_set fds;
+        struct timeval tv;
+        FD_ZERO(&fds);
+        FD_SET(data->tty_fd, &fds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 25000;
+        if (select(data->tty_fd + 1, &fds, NULL, NULL, &tv) <= 0) {
+            if (total > 0 && attempt > 8) {
+                break;
+            }
+            continue;
+        }
+        {
+            const ssize_t n = read(data->tty_fd, buf + total, sizeof(buf) - 1 - total);
+            if (n <= 0) {
+                continue;
+            }
+            total += (size_t)n;
+            buf[total] = '\0';
+        }
+
+        for (size_t i = 0; i + 3 < total; ++i) {
+            int a = 0, b = 0, c = 0;
+            char term = 0;
+            if (buf[i] != 0x1b || buf[i + 1] != '[') {
+                continue;
+            }
+            if (SDL_sscanf((const char *)buf + i + 2, "%d;%d;%d%c", &a, &b, &c, &term) == 4 && term == 't') {
+                if (a == 6 && b > 0 && c > 0) {
+                    cell_h = b;
+                    cell_w = c;
+                    got_cell = 1;
+                } else if (a == 4 && b > 0 && c > 0) {
+                    area_h = b;
+                    area_w = c;
+                    got_area = 1;
+                }
+            } else if (SDL_sscanf((const char *)buf + i + 2, "%d;%d%c", &a, &b, &term) == 3 && term == 't') {
+                // some terminals omit one field; ignore
+                (void)a;
+                (void)b;
+            }
+        }
+    }
+
+    if (got_area) {
+        data->pixel_w = area_w;
+        data->pixel_h = area_h;
+        data->cell_w = data->cols > 0 ? (area_w / data->cols) : cell_w;
+        data->cell_h = data->rows > 0 ? (area_h / data->rows) : cell_h;
+    }
+    if (got_cell) {
+        data->cell_w = cell_w;
+        data->cell_h = cell_h;
+        if (!got_area) {
+            data->pixel_w = data->cols * cell_w;
+            data->pixel_h = data->rows * cell_h;
+        }
+    }
+    return (got_cell || got_area) && data->pixel_w > 0 && data->pixel_h > 0 &&
+           data->cell_w > 0 && data->cell_h > 0;
+}
+
 bool KITTY_QueryTerminalSize(SDL_VideoData *data)
 {
     struct winsize ws;
@@ -290,12 +376,7 @@ bool KITTY_QueryTerminalSize(SDL_VideoData *data)
     data->pixel_w = ws.ws_xpixel;
     data->pixel_h = ws.ws_ypixel;
 
-    if (data->pixel_w <= 0 || data->pixel_h <= 0) {
-        data->cell_w = 10;
-        data->cell_h = 20;
-        data->pixel_w = data->cols * data->cell_w;
-        data->pixel_h = data->rows * data->cell_h;
-    } else {
+    if (data->pixel_w > 0 && data->pixel_h > 0) {
         data->cell_w = data->pixel_w / data->cols;
         data->cell_h = data->pixel_h / data->rows;
         if (data->cell_w <= 0) {
@@ -304,7 +385,25 @@ bool KITTY_QueryTerminalSize(SDL_VideoData *data)
         if (data->cell_h <= 0) {
             data->cell_h = 1;
         }
+        return true;
     }
+
+    // Reuse a prior CSI/cell measurement on resize (avoid eating mouse input).
+    if (data->cell_w > 0 && data->cell_h > 0) {
+        data->pixel_w = data->cols * data->cell_w;
+        data->pixel_h = data->rows * data->cell_h;
+        return true;
+    }
+
+    // Rex and some hosts leave TIOCGWINSZ pixels at 0; ask via CSI once.
+    if (KITTY_QueryPixelSizeCSI(data)) {
+        return true;
+    }
+
+    data->cell_w = 8;
+    data->cell_h = 16;
+    data->pixel_w = data->cols * data->cell_w;
+    data->pixel_h = data->rows * data->cell_h;
     return true;
 }
 
@@ -336,7 +435,7 @@ void KITTY_LeaveRawMode(SDL_VideoData *data)
 
 bool KITTY_SetupTerminal(SDL_VideoData *data)
 {
-    // Alt screen, hide cursor, Kitty keyboard, SGR mouse (click+drag).
+    // Alt screen, hide cursor, Kitty keyboard, SGR mouse (click+drag+motion).
     static const char setup[] =
         "\033[?1049h"
         "\033[?25l"
@@ -345,6 +444,7 @@ bool KITTY_SetupTerminal(SDL_VideoData *data)
         "\033[>1u"
         "\033[?1000h"
         "\033[?1002h"
+        "\033[?1003h"
         "\033[?1006h";
     data->mouse_enabled = true;
     return KITTY_WriteAll(data->tty_fd, setup, sizeof(setup) - 1);
@@ -354,6 +454,7 @@ void KITTY_RestoreTerminal(SDL_VideoData *data)
 {
     static const char restore[] =
         "\033[?1006l"
+        "\033[?1003l"
         "\033[?1002l"
         "\033[?1000l"
         "\033[<u"
@@ -397,25 +498,30 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
         }
     }
 
-    if (vdata->transmit_mode == KITTY_TRANSMIT_SHM && !vdata->shm_failed) {
-        if (KITTY_TransmitShm(vdata->tty_fd, image_id, rgb, w, h)) {
-            return true;
-        }
-        // Fall back for the rest of the session.
-        vdata->shm_failed = true;
-        vdata->transmit_mode = KITTY_TRANSMIT_DIRECT_ZLIB;
-        SDL_ClearError();
-    }
+    {
+        const int place_cols = vdata->cols > 0 ? vdata->cols : w;
+        const int place_rows = vdata->rows > 0 ? vdata->rows : h;
 
-    if (vdata->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
-        if (KITTY_TransmitDirectZlib(vdata->tty_fd, image_id, rgb, w, h)) {
-            return true;
+        if (vdata->transmit_mode == KITTY_TRANSMIT_SHM && !vdata->shm_failed) {
+            if (KITTY_TransmitShm(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows)) {
+                return true;
+            }
+            // Fall back for the rest of the session.
+            vdata->shm_failed = true;
+            vdata->transmit_mode = KITTY_TRANSMIT_DIRECT_ZLIB;
+            SDL_ClearError();
         }
-        vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
-        SDL_ClearError();
-    }
 
-    return KITTY_TransmitDirectRaw(vdata->tty_fd, image_id, rgb, w, h);
+        if (vdata->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
+            if (KITTY_TransmitDirectZlib(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows)) {
+                return true;
+            }
+            vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
+            SDL_ClearError();
+        }
+
+        return KITTY_TransmitDirectRaw(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows);
+    }
 }
 
 #endif // SDL_VIDEO_DRIVER_KITTY

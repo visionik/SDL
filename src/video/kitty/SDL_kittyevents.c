@@ -139,7 +139,8 @@ static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t 
     py = (float)((cell_y - 1) * data->cell_h + data->cell_h / 2);
     SDL_SendMouseMotion(0, window, SDL_GLOBAL_MOUSE_ID, false, px, py);
 
-    // button: 0=left,1=middle,2=right, 32+ = motion with button, 64+ = wheel
+    // button: 0=left,1=middle,2=right, 32+ = drag, 64+ = wheel;
+    // with mode 1003, button 35 (32+3) is motion with no buttons.
     if (button >= 64) {
         const float wy = (button == 64) ? 1.0f : ((button == 65) ? -1.0f : 0.0f);
         if (wy != 0.0f) {
@@ -149,7 +150,7 @@ static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t 
     }
 
     if (button >= 32) {
-        // drag motion already sent
+        // Motion (with or without buttons) — position already sent above.
         return true;
     }
 
