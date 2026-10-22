@@ -49,13 +49,17 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
         window->y = 0;
     }
 
-    // SDL clamps a requested 0x0 create to 1x1 before the driver sees it. Treat
-    // that as "fill the terminal", and always keep windowed/floating in sync —
-    // otherwise FinishWindowCreation restores the 1x1 stubs and mouse coords
-    // clamp to (0,0).
-    if (window->w <= 1 || window->h <= 1) {
+    /* Kitty is a terminal-filling framebuffer: always match CSI/text-area
+     * pixels. SDL may pass 1x1 (from 0x0) or an app size like 640x480; neither
+     * should letterbox inside the pane or mouse/graphics disagree with the
+     * host cursor. Keep windowed/floating in sync so FinishWindowCreation
+     * cannot restore stubs. */
+    if (vdata->pixel_w > 0 && vdata->pixel_h > 0) {
         window->w = vdata->pixel_w;
         window->h = vdata->pixel_h;
+    } else if (window->w <= 1 || window->h <= 1) {
+        window->w = 640;
+        window->h = 480;
     }
     window->windowed.w = window->floating.w = window->w;
     window->windowed.h = window->floating.h = window->h;
@@ -67,6 +71,11 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
     data->image_ids[1] = 2;
     data->image_index = 0;
     data->placed = false;
+    data->rgb_scratch = NULL;
+    data->rgb_w = 0;
+    data->rgb_h = 0;
+    data->rgb_valid = false;
+    data->live_image_id = 0;
     window->internal = data;
 
     vdata->focus_window = window;
@@ -90,6 +99,8 @@ void KITTY_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
         KITTY_DeleteAllImages(vdata->tty_fd);
     }
     if (data) {
+        SDL_free(data->rgb_scratch);
+        data->rgb_scratch = NULL;
         SDL_free(data);
     }
     window->internal = NULL;

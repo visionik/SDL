@@ -31,6 +31,9 @@
 
 #define KITTYVID_DRIVER_NAME "kitty"
 
+/* Carry incomplete CSI/APC across read() calls in KITTY_PumpEvents. */
+#define KITTY_TTY_PENDING_MAX 4096
+
 typedef enum KITTY_TransmitMode
 {
     KITTY_TRANSMIT_SHM = 0,
@@ -44,6 +47,8 @@ typedef struct SDL_VideoData
     bool terminal_owned;
     bool keyboard_enabled;
     bool mouse_enabled;
+    bool mouse_sgr_pixels; /* true: DECSET 1016 (pixel coords); false: 1006 (cells) */
+    bool place_cells;      /* true: Kitty c/r stretch to grid; scale mouse into FB */
     bool shm_failed;
     KITTY_TransmitMode transmit_mode;
     int cell_w;
@@ -52,8 +57,17 @@ typedef struct SDL_VideoData
     int rows;
     int pixel_w;
     int pixel_h;
+    /* 1016 coordinate space (often cols*cell_w on Rex); 0 = treat as FB pixels. */
+    int mouse_coord_w;
+    int mouse_coord_h;
+    int mouse_raw_x; /* last 1016/1006 report, 0-based */
+    int mouse_raw_y;
+    int placed_cols; /* last c/r sent with stretch place; 0 = none */
+    int placed_rows;
     SDL_Window *focus_window;
     volatile sig_atomic_t got_winch;
+    unsigned char tty_pending[KITTY_TTY_PENDING_MAX];
+    size_t tty_pending_len;
 } SDL_VideoData;
 
 typedef struct SDL_WindowData
@@ -62,6 +76,13 @@ typedef struct SDL_WindowData
     Uint32 image_ids[2];
     int image_index;
     bool placed;
+    /* Retained RGB24 scratch for dirty CPU converts (Step 1a). */
+    Uint8 *rgb_scratch;
+    int rgb_w;
+    int rgb_h;
+    bool rgb_valid;
+    /* Image id of the last successful full place (Step 1b a=f target). */
+    Uint32 live_image_id;
 } SDL_WindowData;
 
 #endif // SDL_kittyvideo_h_

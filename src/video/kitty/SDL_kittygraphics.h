@@ -32,8 +32,15 @@ bool KITTY_QueryTerminalSize(SDL_VideoData *data);
 bool KITTY_EnterRawMode(SDL_VideoData *data);
 void KITTY_LeaveRawMode(SDL_VideoData *data);
 bool KITTY_SetupTerminal(SDL_VideoData *data);
+bool KITTY_EnableMouse(SDL_VideoData *data);
 void KITTY_RestoreTerminal(SDL_VideoData *data);
 bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, int w, int h);
+/* Edit root frame (r=1) with packed RGB for rectangle x,y,s,v (Kitty a=f). */
+bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
+                               const Uint8 *packed_rgb, int x, int y, int rw, int rh);
+/* Re-place existing image with new c/r (no pixel upload). */
+bool KITTY_PlaceExistingImage(SDL_VideoData *vdata, Uint32 image_id,
+                              int place_cols, int place_rows);
 bool KITTY_DeleteAllImages(int fd);
 bool KITTY_DeleteImage(int fd, Uint32 image_id);
 

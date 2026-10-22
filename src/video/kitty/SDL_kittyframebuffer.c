@@ -26,11 +26,47 @@
 #include "../../SDL_properties_c.h"
 #include "SDL_kittyframebuffer_c.h"
 #include "SDL_kittygraphics.h"
+#include "SDL_kittyrect.h"
 
 #define KITTY_SURFACE "SDL.internal.window.surface"
 
+static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
+{
+    if (!wdata) {
+        return;
+    }
+    SDL_free(wdata->rgb_scratch);
+    wdata->rgb_scratch = NULL;
+    wdata->rgb_w = 0;
+    wdata->rgb_h = 0;
+    wdata->rgb_valid = false;
+    wdata->live_image_id = 0;
+}
+
+static bool KITTY_EnsureRGBScratch(SDL_WindowData *wdata, int w, int h)
+{
+    const size_t need = (size_t)w * (size_t)h * 3u;
+    if (!wdata || w <= 0 || h <= 0) {
+        return false;
+    }
+    if (wdata->rgb_scratch && wdata->rgb_w == w && wdata->rgb_h == h) {
+        return true;
+    }
+    KITTY_FreeRGBScratch(wdata);
+    wdata->rgb_scratch = (Uint8 *)SDL_malloc(need);
+    if (!wdata->rgb_scratch) {
+        return false;
+    }
+    wdata->rgb_w = w;
+    wdata->rgb_h = h;
+    wdata->rgb_valid = false;
+    wdata->live_image_id = 0;
+    return true;
+}
+
 bool SDL_KITTY_CreateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window, SDL_PixelFormat *format, void **pixels, int *pitch)
 {
+    SDL_WindowData *wdata = window ? (SDL_WindowData *)window->internal : NULL;
     SDL_Surface *surface;
     const SDL_PixelFormat surface_format = SDL_PIXELFORMAT_XRGB8888;
     int w, h;
@@ -45,6 +81,10 @@ bool SDL_KITTY_CreateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         return false;
     }
 
+    if (wdata) {
+        KITTY_FreeRGBScratch(wdata);
+    }
+
     SDL_SetSurfaceProperty(SDL_GetWindowProperties(window), KITTY_SURFACE, surface);
     *format = surface_format;
     *pixels = surface->pixels;
@@ -57,12 +97,15 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
     SDL_VideoData *vdata = (SDL_VideoData *)_this->internal;
     SDL_WindowData *wdata = (SDL_WindowData *)window->internal;
     SDL_Surface *surface;
-    Uint8 *rgb = NULL;
-    int x, y;
-    bool ok;
+    bool ok = false;
     Uint32 image_id;
-    (void)rects;
-    (void)numrects;
+    SDL_Rect dirty;
+    KITTY_PresentConvertMode convert_mode;
+    KITTY_PresentWireMode wire_mode = KITTY_WIRE_FULL;
+    SDL_Rect full;
+    size_t convert_px;
+    size_t upload_px;
+    Uint8 *packed = NULL;
 
     surface = (SDL_Surface *)SDL_GetPointerProperty(SDL_GetWindowProperties(window), KITTY_SURFACE, NULL);
     if (!surface) {
@@ -72,40 +115,116 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         return SDL_SetError("kitty video/window data missing");
     }
 
-    rgb = (Uint8 *)SDL_malloc((size_t)surface->w * (size_t)surface->h * 3u);
-    if (!rgb) {
+    if (!KITTY_EnsureRGBScratch(wdata, surface->w, surface->h)) {
         return false;
     }
 
-    for (y = 0; y < surface->h; ++y) {
-        const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + y * surface->pitch);
-        Uint8 *dst = rgb + (size_t)y * (size_t)surface->w * 3u;
-        for (x = 0; x < surface->w; ++x) {
-            const Uint32 p = src[x];
-            dst[x * 3 + 0] = (Uint8)((p >> 16) & 0xFF);
-            dst[x * 3 + 1] = (Uint8)((p >> 8) & 0xFF);
-            dst[x * 3 + 2] = (Uint8)(p & 0xFF);
+    convert_mode = KITTY_ChooseConvertMode(surface->w, surface->h, rects, numrects,
+                                           wdata->rgb_valid, &dirty);
+    full.x = 0;
+    full.y = 0;
+    full.w = surface->w;
+    full.h = surface->h;
+
+    if (convert_mode == KITTY_CONVERT_DIRTY) {
+        if (!KITTY_ConvertSurfaceRectToRGB(surface, &dirty, wdata->rgb_scratch)) {
+            convert_mode = KITTY_CONVERT_FULL;
+        }
+    }
+    if (convert_mode == KITTY_CONVERT_FULL) {
+        if (!KITTY_ConvertSurfaceRectToRGB(surface, &full, wdata->rgb_scratch)) {
+            return SDL_SetError("kitty RGB convert failed");
+        }
+        dirty = full;
+    }
+
+    convert_px = (size_t)dirty.w * (size_t)dirty.h;
+    upload_px = (size_t)surface->w * (size_t)surface->h;
+    wire_mode = (convert_mode == KITTY_CONVERT_DIRTY) ? KITTY_WIRE_DIRTY_CPU : KITTY_WIRE_FULL;
+
+    /* Step 1b: optional bandwidth path — edit live image root frame. */
+    if (convert_mode == KITTY_CONVERT_DIRTY &&
+        KITTY_DirtyBWEnabled() &&
+        wdata->placed &&
+        wdata->live_image_id != 0) {
+        size_t packed_len = 0;
+        const size_t pack_cap = convert_px * 3u;
+        packed = (Uint8 *)SDL_malloc(pack_cap);
+        if (packed &&
+            KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h, &dirty,
+                              packed, pack_cap, &packed_len) &&
+            KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed,
+                                      dirty.x, dirty.y, dirty.w, dirty.h)) {
+            ok = true;
+            wire_mode = KITTY_WIRE_DIRTY_BW;
+            upload_px = convert_px;
+            wdata->rgb_valid = true;
+        } else {
+            /* Fall back to full a=T. */
+            SDL_ClearError();
+        }
+        SDL_free(packed);
+        packed = NULL;
+    }
+
+    if (!ok) {
+        wdata->image_index ^= 1;
+        image_id = wdata->image_ids[wdata->image_index];
+        ok = KITTY_TransmitRGB(vdata, image_id, wdata->rgb_scratch, surface->w, surface->h);
+        if (ok) {
+            const Uint32 prev = wdata->image_ids[wdata->image_index ^ 1];
+            if (wdata->placed) {
+                KITTY_DeleteImage(vdata->tty_fd, prev);
+            }
+            wdata->placed = true;
+            wdata->rgb_valid = true;
+            wdata->live_image_id = image_id;
+            if (wire_mode != KITTY_WIRE_DIRTY_BW) {
+                wire_mode = (convert_mode == KITTY_CONVERT_DIRTY) ? KITTY_WIRE_DIRTY_CPU : KITTY_WIRE_FULL;
+            }
         }
     }
 
-    wdata->image_index ^= 1;
-    image_id = wdata->image_ids[wdata->image_index];
-    ok = KITTY_TransmitRGB(vdata, image_id, rgb, surface->w, surface->h);
-    if (ok) {
-        // Drop the previous buffer's image to limit terminal VRAM use.
-        const Uint32 prev = wdata->image_ids[wdata->image_index ^ 1];
-        if (wdata->placed) {
-            KITTY_DeleteImage(vdata->tty_fd, prev);
+    {
+        const char *dbg = SDL_getenv("SDL_KITTY_DEBUG");
+        if (dbg && dbg[0] && dbg[0] != '0') {
+            static int frames;
+            if (frames < 8 || !ok) {
+                FILE *log = fopen("/tmp/sdl_kitty_debug.log", "a");
+                if (log) {
+                    const float cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
+                    const char *mode_str = "full";
+                    if (wire_mode == KITTY_WIRE_DIRTY_BW) {
+                        mode_str = "dirty_bw";
+                    } else if (wire_mode == KITTY_WIRE_DIRTY_CPU) {
+                        mode_str = "dirty_cpu";
+                    }
+                    fprintf(log,
+                            "present #%d %dx%d place=%d mode=%s rects=%d union=%dx%d coverage=%.2f convert_px=%zu upload_px=%zu live=%u -> %s%s\n",
+                            frames, surface->w, surface->h,
+                            vdata->place_cells ? 1 : 0,
+                            mode_str,
+                            numrects, dirty.w, dirty.h, (double)cov,
+                            convert_px, upload_px,
+                            (unsigned)wdata->live_image_id,
+                            ok ? "ok" : "FAIL ",
+                            ok ? "" : SDL_GetError());
+                    fclose(log);
+                }
+            }
+            frames++;
         }
-        wdata->placed = true;
     }
-    SDL_free(rgb);
     return ok;
 }
 
 void SDL_KITTY_DestroyWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window)
 {
+    SDL_WindowData *wdata = window ? (SDL_WindowData *)window->internal : NULL;
     (void)_this;
+    if (wdata) {
+        KITTY_FreeRGBScratch(wdata);
+    }
     SDL_ClearProperty(SDL_GetWindowProperties(window), KITTY_SURFACE);
 }
 

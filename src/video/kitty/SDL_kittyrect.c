@@ -1,0 +1,222 @@
+/*
+  Simple DirectMedia Layer
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+*/
+#ifdef KITTY_RECT_STANDALONE
+#include <SDL3/SDL.h>
+#else
+#include "SDL_internal.h"
+#include "../SDL_surface_c.h"
+#endif
+
+#if defined(SDL_VIDEO_DRIVER_KITTY) || defined(KITTY_RECT_STANDALONE)
+
+#include "SDL_kittyrect.h"
+
+bool KITTY_UnionRects(int fb_w, int fb_h, const SDL_Rect *rects, int numrects, SDL_Rect *out)
+{
+    SDL_Rect fb;
+    SDL_Rect span;
+    int i;
+    bool any = false;
+
+    if (!out || fb_w <= 0 || fb_h <= 0) {
+        return false;
+    }
+    fb.x = 0;
+    fb.y = 0;
+    fb.w = fb_w;
+    fb.h = fb_h;
+    if (!rects || numrects <= 0) {
+        *out = fb;
+        return true;
+    }
+
+    span.x = 0;
+    span.y = 0;
+    span.w = 0;
+    span.h = 0;
+
+    for (i = 0; i < numrects; ++i) {
+        SDL_Rect clipped;
+        if (!SDL_GetRectIntersection(&rects[i], &fb, &clipped)) {
+            continue;
+        }
+        if (clipped.w <= 0 || clipped.h <= 0) {
+            continue;
+        }
+        if (!any) {
+            span = clipped;
+            any = true;
+        } else {
+            const int x2 = SDL_max(span.x + span.w, clipped.x + clipped.w);
+            const int y2 = SDL_max(span.y + span.h, clipped.y + clipped.h);
+            span.x = SDL_min(span.x, clipped.x);
+            span.y = SDL_min(span.y, clipped.y);
+            span.w = x2 - span.x;
+            span.h = y2 - span.y;
+        }
+    }
+
+    if (!any) {
+        out->x = out->y = out->w = out->h = 0;
+        return false;
+    }
+    *out = span;
+    return true;
+}
+
+float KITTY_CoverageRatio(int fb_w, int fb_h, const SDL_Rect *union_rect)
+{
+    const float denom = (float)fb_w * (float)fb_h;
+    float area;
+    if (fb_w <= 0 || fb_h <= 0 || denom <= 0.0f) {
+        return 1.0f;
+    }
+    if (!union_rect || union_rect->w <= 0 || union_rect->h <= 0) {
+        return 0.0f;
+    }
+    area = (float)union_rect->w * (float)union_rect->h;
+    if (area >= denom) {
+        return 1.0f;
+    }
+    return area / denom;
+}
+
+KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
+                                                 const SDL_Rect *rects, int numrects,
+                                                 bool scratch_valid, SDL_Rect *dirty_out)
+{
+    const char *env;
+    SDL_Rect union_rect;
+    float coverage;
+
+    if (dirty_out) {
+        dirty_out->x = 0;
+        dirty_out->y = 0;
+        dirty_out->w = fb_w;
+        dirty_out->h = fb_h;
+    }
+
+    env = SDL_getenv("SDL_KITTY_DIRTY");
+    if (env && (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
+                SDL_strcasecmp(env, "false") == 0 || SDL_strcasecmp(env, "no") == 0)) {
+        return KITTY_CONVERT_FULL;
+    }
+
+    if (!scratch_valid || fb_w <= 0 || fb_h <= 0) {
+        return KITTY_CONVERT_FULL;
+    }
+
+    if (!KITTY_UnionRects(fb_w, fb_h, rects, numrects, &union_rect)) {
+        return KITTY_CONVERT_FULL;
+    }
+
+    coverage = KITTY_CoverageRatio(fb_w, fb_h, &union_rect);
+    if (coverage >= KITTY_DIRTY_COVERAGE_THRESHOLD) {
+        return KITTY_CONVERT_FULL;
+    }
+
+    if (dirty_out) {
+        *dirty_out = union_rect;
+    }
+    return KITTY_CONVERT_DIRTY;
+}
+
+bool KITTY_DirtyBWEnabled(void)
+{
+    const char *env = SDL_getenv("SDL_KITTY_DIRTY_BW");
+    if (!env || !*env) {
+        return false;
+    }
+    if (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
+        SDL_strcasecmp(env, "false") == 0 || SDL_strcasecmp(env, "no") == 0) {
+        return false;
+    }
+    return true;
+}
+
+bool KITTY_PackRGBRect(const Uint8 *rgb_scratch, int fb_w, int fb_h,
+                       const SDL_Rect *rect, Uint8 *out, size_t out_cap, size_t *out_len)
+{
+    SDL_Rect fb, area;
+    int y;
+    size_t need;
+    size_t off = 0;
+
+    if (!rgb_scratch || !rect || !out || fb_w <= 0 || fb_h <= 0) {
+        return false;
+    }
+    fb.x = 0;
+    fb.y = 0;
+    fb.w = fb_w;
+    fb.h = fb_h;
+    if (!SDL_GetRectIntersection(rect, &fb, &area) || area.w <= 0 || area.h <= 0) {
+        return false;
+    }
+    need = (size_t)area.w * (size_t)area.h * 3u;
+    if (need > out_cap) {
+        return false;
+    }
+    for (y = area.y; y < area.y + area.h; ++y) {
+        const Uint8 *src = rgb_scratch + ((size_t)y * (size_t)fb_w + (size_t)area.x) * 3u;
+        SDL_memcpy(out + off, src, (size_t)area.w * 3u);
+        off += (size_t)area.w * 3u;
+    }
+    if (out_len) {
+        *out_len = off;
+    }
+    return true;
+}
+
+bool KITTY_ConvertSurfaceRectToRGB(SDL_Surface *surface, const SDL_Rect *rect, Uint8 *rgb_scratch)
+{
+    SDL_Rect area;
+    SDL_Rect fb;
+    int x, y;
+
+    if (!surface || !rgb_scratch || !rect) {
+        return false;
+    }
+    if (surface->w <= 0 || surface->h <= 0) {
+        return false;
+    }
+
+    fb.x = 0;
+    fb.y = 0;
+    fb.w = surface->w;
+    fb.h = surface->h;
+    if (!SDL_GetRectIntersection(rect, &fb, &area) || area.w <= 0 || area.h <= 0) {
+        return false;
+    }
+
+    for (y = area.y; y < area.y + area.h; ++y) {
+        const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + (size_t)y * (size_t)surface->pitch);
+        Uint8 *dst = rgb_scratch + ((size_t)y * (size_t)surface->w + (size_t)area.x) * 3u;
+        for (x = area.x; x < area.x + area.w; ++x) {
+            const Uint32 p = src[x];
+            *dst++ = (Uint8)((p >> 16) & 0xFF);
+            *dst++ = (Uint8)((p >> 8) & 0xFF);
+            *dst++ = (Uint8)(p & 0xFF);
+        }
+    }
+    return true;
+}
+
+#endif /* SDL_VIDEO_DRIVER_KITTY || KITTY_RECT_STANDALONE */

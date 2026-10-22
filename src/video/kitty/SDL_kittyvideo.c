@@ -31,6 +31,7 @@
 #include "SDL_kittyframebuffer_c.h"
 #include "SDL_kittywindow.h"
 #include "SDL_kittygraphics.h"
+#include "SDL_kittyprobe.h"
 
 #include <signal.h>
 #include <unistd.h>
@@ -87,8 +88,16 @@ static SDL_VideoDevice *KITTY_CreateDevice(void)
         return NULL;
     }
     data->tty_fd = STDOUT_FILENO;
-    data->transmit_mode = KITTY_TRANSMIT_SHM;
+    /* Prefer direct RGB. Rex rejects zlib (o=z) and is unreliable with SHM;
+     * apps can still force via SDL_KITTY_TRANSMIT=shm|zlib. */
+    data->transmit_mode = KITTY_TRANSMIT_DIRECT;
     data->shm_failed = false;
+    /* Stretch FB to the cell grid by default; SDL_KITTY_PLACE_CELLS=0 for 1:1. */
+    {
+        const char *place = SDL_getenv("SDL_KITTY_PLACE_CELLS");
+        data->place_cells = !(place && (place[0] == '0' || SDL_strcasecmp(place, "false") == 0 ||
+                                        SDL_strcasecmp(place, "no") == 0 || SDL_strcasecmp(place, "off") == 0));
+    }
     device->internal = data;
 
     device->VideoInit = KITTY_VideoInit;
@@ -128,10 +137,62 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
     data->terminal_owned = true;
     data->keyboard_enabled = true;
 
+    /* Install WINCH before sizing waits so Rex pane layout is observed. */
+    KITTY_winch_data = data;
+    data->got_winch = 0;
+    SDL_zero(sa);
+    sa.sa_handler = KITTY_HandleSIGWINCH;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGWINCH, &sa, &old_sa) == 0) {
+        KITTY_prev_winch = old_sa.sa_handler;
+    }
+
+    /* Size before mouse: any-event mode floods the tty and can starve CSI 14t. */
     if (!KITTY_QueryTerminalSize(data)) {
         KITTY_RestoreTerminal(data);
         data->terminal_owned = false;
         return false;
+    }
+
+    /* Rex may spawn at stub 80x24 then deliver SIGWINCH once the pane is laid
+     * out. Wait briefly for a non-stub size before enabling mouse / display. */
+    {
+        for (int i = 0; i < 40; ++i) {
+            if (!(data->cols == 80 && data->rows == 24)) {
+                break;
+            }
+            SDL_Delay(25);
+            if (data->got_winch) {
+                data->got_winch = 0;
+                (void)KITTY_QueryTerminalSize(data);
+                continue;
+            }
+            if ((i % 4) == 3) {
+                (void)KITTY_QueryTerminalSize(data);
+            }
+        }
+    }
+
+    /* a=q probe: pick SHM vs direct (Rex stays direct unless forced). */
+    (void)KITTY_ProbeTransmitModes(data);
+
+    {
+        const char *no_mouse = SDL_getenv("SDL_KITTY_MOUSE");
+        const bool want_mouse = !(no_mouse && (no_mouse[0] == '0' ||
+                                               SDL_strcasecmp(no_mouse, "false") == 0 ||
+                                               SDL_strcasecmp(no_mouse, "off") == 0 ||
+                                               SDL_strcasecmp(no_mouse, "no") == 0));
+        if (want_mouse) {
+            if (!KITTY_EnableMouse(data)) {
+                KITTY_RestoreTerminal(data);
+                data->terminal_owned = false;
+                return false;
+            }
+        } else {
+            data->mouse_enabled = false;
+            data->mouse_sgr_pixels = false;
+        }
     }
 
     SDL_zero(mode);
@@ -144,14 +205,19 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
         return false;
     }
 
-    KITTY_winch_data = data;
-    data->got_winch = 0;
-    SDL_zero(sa);
-    sa.sa_handler = KITTY_HandleSIGWINCH;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    if (sigaction(SIGWINCH, &sa, &old_sa) == 0) {
-        KITTY_prev_winch = old_sa.sa_handler;
+    {
+        const char *dbg = SDL_getenv("SDL_KITTY_DEBUG");
+        if (dbg && dbg[0] && dbg[0] != '0') {
+            FILE *log = fopen("/tmp/sdl_kitty_debug.log", "a");
+            if (log) {
+                fprintf(log,
+                        "init cols=%d rows=%d fb=%dx%d cell=%dx%d place=%d mouse1016=%d\n",
+                        data->cols, data->rows, data->pixel_w, data->pixel_h,
+                        data->cell_w, data->cell_h, data->place_cells ? 1 : 0,
+                        data->mouse_sgr_pixels ? 1 : 0);
+                fclose(log);
+            }
+        }
     }
 
     return true;
