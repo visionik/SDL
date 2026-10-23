@@ -87,7 +87,12 @@ static SDL_VideoDevice *KITTY_CreateDevice(void)
         SDL_free(device);
         return NULL;
     }
-    data->tty_fd = STDOUT_FILENO;
+    /* Writes always go to stdout. Reads prefer stdin when it is a tty
+     * (Rex delivers keys on fd 0 only). Fall back to stdout when stdin
+     * is redirected. */
+    data->tty_out = STDOUT_FILENO;
+    data->tty_in = isatty(STDIN_FILENO) ? STDIN_FILENO : STDOUT_FILENO;
+    data->tty_fd = data->tty_out;
     /* Prefer direct RGB. Rex rejects zlib (o=z) and is unreliable with SHM;
      * apps can still force via SDL_KITTY_TRANSMIT=shm|zlib. */
     data->transmit_mode = KITTY_TRANSMIT_DIRECT;

@@ -296,10 +296,10 @@ static bool KITTY_ProbeDirectQuery(SDL_VideoData *data, Uint32 id)
     const int n = SDL_snprintf(cmd, sizeof(cmd),
                                "\033_Ga=q,t=d,f=24,s=1,v=1,i=%u;AAAA\033\\\033[c",
                                (unsigned)id);
-    if (n <= 0 || !KITTY_WriteAllProbe(data->tty_fd, cmd, (size_t)n)) {
+    if (n <= 0 || !KITTY_WriteAllProbe(data->tty_out, cmd, (size_t)n)) {
         return false;
     }
-    return KITTY_AwaitGraphicsQuery(data->tty_fd, id, 40) == KITTY_GQ_OK;
+    return KITTY_AwaitGraphicsQuery(data->tty_in, id, 40) == KITTY_GQ_OK;
 }
 
 static bool KITTY_ProbeShmQuery(SDL_VideoData *data, Uint32 id)
@@ -338,12 +338,12 @@ static bool KITTY_ProbeShmQuery(SDL_VideoData *data, Uint32 id)
                               "\033_Ga=q,t=s,f=24,s=1,v=1,i=%u,S=%zu;",
                               (unsigned)id, raw_len);
     if (header_len <= 0 ||
-        !KITTY_WriteAllProbe(data->tty_fd, header, (size_t)header_len) ||
-        !KITTY_WriteAllProbe(data->tty_fd, name_b64, encoded) ||
-        !KITTY_WriteAllProbe(data->tty_fd, "\033\\\033[c", 5)) {
+        !KITTY_WriteAllProbe(data->tty_out, header, (size_t)header_len) ||
+        !KITTY_WriteAllProbe(data->tty_out, name_b64, encoded) ||
+        !KITTY_WriteAllProbe(data->tty_out, "\033\\\033[c", 5)) {
         goto done;
     }
-    ok = (KITTY_AwaitGraphicsQuery(data->tty_fd, id, 40) == KITTY_GQ_OK);
+    ok = (KITTY_AwaitGraphicsQuery(data->tty_in, id, 40) == KITTY_GQ_OK);
 
 done:
     if (map != MAP_FAILED) {
@@ -399,29 +399,29 @@ static bool KITTY_ProbeFrameEdit(SDL_VideoData *data, Uint32 id)
     n = SDL_snprintf(cmd, sizeof(cmd),
                      "\033_Ga=t,f=24,t=d,i=%u,s=2,v=2;%s\033\\",
                      (unsigned)id, rgb_b64);
-    if (n <= 0 || !KITTY_WriteAllProbe(data->tty_fd, cmd, (size_t)n)) {
+    if (n <= 0 || !KITTY_WriteAllProbe(data->tty_out, cmd, (size_t)n)) {
         return false;
     }
-    (void)KITTY_AwaitGraphicsQuery(data->tty_fd, id, 20);
-    KITTY_DrainTty(data->tty_fd);
+    (void)KITTY_AwaitGraphicsQuery(data->tty_in, id, 20);
+    KITTY_DrainTty(data->tty_in);
 
     /* Edit root frame (r=1) — this is what dirty BW needs. */
     n = SDL_snprintf(cmd, sizeof(cmd),
                      "\033_Ga=f,i=%u,r=1,X=1,x=0,y=0,s=1,v=1,f=24,t=d;AAAA\033\\\033[c",
                      (unsigned)id);
-    if (n <= 0 || !KITTY_WriteAllProbe(data->tty_fd, cmd, (size_t)n)) {
+    if (n <= 0 || !KITTY_WriteAllProbe(data->tty_out, cmd, (size_t)n)) {
         goto cleanup;
     }
-    st = KITTY_AwaitGraphicsQuery(data->tty_fd, id, 40);
+    st = KITTY_AwaitGraphicsQuery(data->tty_in, id, 40);
     /* OK = explicit support; NONE = silent host (Rex); ERROR = unsupported. */
     ok = (st != KITTY_GQ_ERROR);
 
 cleanup:
     n = SDL_snprintf(cmd, sizeof(cmd), "\033_Ga=d,d=I,i=%u,q=2\033\\", (unsigned)id);
     if (n > 0) {
-        (void)KITTY_WriteAllProbe(data->tty_fd, cmd, (size_t)n);
+        (void)KITTY_WriteAllProbe(data->tty_out, cmd, (size_t)n);
     }
-    KITTY_DrainTty(data->tty_fd);
+    KITTY_DrainTty(data->tty_in);
     return ok;
 }
 
@@ -442,24 +442,8 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
     }
     data->frame_edit_ok = false;
 
-    /* Drain any prior CSI noise. */
-    {
-        unsigned char junk[256];
-        for (;;) {
-            fd_set fds;
-            struct timeval tv;
-            FD_ZERO(&fds);
-            FD_SET(data->tty_fd, &fds);
-            tv.tv_sec = 0;
-            tv.tv_usec = 0;
-            if (select(data->tty_fd + 1, &fds, NULL, NULL, &tv) <= 0) {
-                break;
-            }
-            if (read(data->tty_fd, junk, sizeof(junk)) <= 0) {
-                break;
-            }
-        }
-    }
+    /* Drain any prior CSI noise from the input tty. */
+    KITTY_DrainTty(data->tty_in);
 
     direct_ok = KITTY_ProbeDirectQuery(data, id_direct);
     /* Skip SHM probe on Rex — SelectTransmitMode would ignore it anyway, and

@@ -43,6 +43,10 @@ typedef enum KITTY_TransmitMode
 
 typedef struct SDL_VideoData
 {
+    /* Rex (and some hosts) deliver keyboard on stdin while APC/CSI go out
+     * on stdout. Keep separate fds; tty_fd aliases tty_out for write helpers. */
+    int tty_in;
+    int tty_out;
     int tty_fd;
     bool terminal_owned;
     bool keyboard_enabled;
@@ -66,6 +70,7 @@ typedef struct SDL_VideoData
     int placed_cols; /* last c/r sent with stretch place; 0 = none */
     int placed_rows;
     SDL_Window *focus_window;
+    bool focus_announced; /* re-emit FOCUS_GAINED once from PumpEvents for late listeners (e.g. MAME) */
     volatile sig_atomic_t got_winch;
     unsigned char tty_pending[KITTY_TTY_PENDING_MAX];
     size_t tty_pending_len;

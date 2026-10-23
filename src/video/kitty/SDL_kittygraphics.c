@@ -277,6 +277,10 @@ done:
 
 bool KITTY_ProbeSupport(void)
 {
+    /* Need a tty for graphics out; keyboard prefers stdin when available. */
+    if (!isatty(STDOUT_FILENO) && !isatty(STDIN_FILENO)) {
+        return false;
+    }
     if (!isatty(STDOUT_FILENO)) {
         return false;
     }
@@ -312,13 +316,13 @@ static void KITTY_DrainTTY(SDL_VideoData *data)
         fd_set fds;
         struct timeval tv;
         FD_ZERO(&fds);
-        FD_SET(data->tty_fd, &fds);
+        FD_SET(data->tty_in, &fds);
         tv.tv_sec = 0;
         tv.tv_usec = 0;
-        if (select(data->tty_fd + 1, &fds, NULL, NULL, &tv) <= 0) {
+        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
             break;
         }
-        if (read(data->tty_fd, junk, sizeof(junk)) <= 0) {
+        if (read(data->tty_in, junk, sizeof(junk)) <= 0) {
             break;
         }
     }
@@ -336,7 +340,7 @@ static bool KITTY_QueryPixelSizeCSI(SDL_VideoData *data)
     int got_cell = 0, got_area = 0;
 
     KITTY_DrainTTY(data);
-    if (!KITTY_WriteAll(data->tty_fd, query, sizeof(query) - 1)) {
+    if (!KITTY_WriteAll(data->tty_out, query, sizeof(query) - 1)) {
         return false;
     }
 
@@ -344,14 +348,14 @@ static bool KITTY_QueryPixelSizeCSI(SDL_VideoData *data)
         fd_set fds;
         struct timeval tv;
         FD_ZERO(&fds);
-        FD_SET(data->tty_fd, &fds);
+        FD_SET(data->tty_in, &fds);
         tv.tv_sec = 0;
         tv.tv_usec = 25000;
-        if (select(data->tty_fd + 1, &fds, NULL, NULL, &tv) <= 0) {
+        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
             continue;
         }
         {
-            const ssize_t n = read(data->tty_fd, buf + total, sizeof(buf) - 1 - total);
+            const ssize_t n = read(data->tty_in, buf + total, sizeof(buf) - 1 - total);
             if (n <= 0) {
                 continue;
             }
@@ -505,7 +509,7 @@ bool KITTY_QueryTerminalSize(SDL_VideoData *data)
     const int prev_ph = data->pixel_h;
 
     SDL_zero(ws);
-    if (ioctl(data->tty_fd, TIOCGWINSZ, &ws) != 0) {
+    if (ioctl(data->tty_in, TIOCGWINSZ, &ws) != 0) {
         return SDL_SetError("TIOCGWINSZ failed: %s", strerror(errno));
     }
 
@@ -583,15 +587,19 @@ bool KITTY_QueryTerminalSize(SDL_VideoData *data)
 bool KITTY_EnterRawMode(SDL_VideoData *data)
 {
     struct termios raw;
-    if (tcgetattr(data->tty_fd, &KITTY_saved_termios) != 0) {
+    /* Raw mode must apply to the input tty so keyboard reads see uncooked bytes. */
+    if (tcgetattr(data->tty_in, &KITTY_saved_termios) != 0) {
         return SDL_SetError("tcgetattr failed: %s", strerror(errno));
     }
     KITTY_termios_saved = true;
     raw = KITTY_saved_termios;
     cfmakeraw(&raw);
+    /* Keep ISIG so Ctrl+C / Ctrl+Z still generate signals — otherwise a
+     * stuck app with a broken quit path cannot be killed from the tty. */
+    raw.c_lflag |= ISIG;
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 0;
-    if (tcsetattr(data->tty_fd, TCSANOW, &raw) != 0) {
+    if (tcsetattr(data->tty_in, TCSANOW, &raw) != 0) {
         return SDL_SetError("tcsetattr failed: %s", strerror(errno));
     }
     return true;
@@ -599,9 +607,8 @@ bool KITTY_EnterRawMode(SDL_VideoData *data)
 
 void KITTY_LeaveRawMode(SDL_VideoData *data)
 {
-    (void)data;
-    if (KITTY_termios_saved) {
-        tcsetattr(data->tty_fd, TCSANOW, &KITTY_saved_termios);
+    if (KITTY_termios_saved && data) {
+        tcsetattr(data->tty_in, TCSANOW, &KITTY_saved_termios);
         KITTY_termios_saved = false;
     }
 }
@@ -629,20 +636,20 @@ static bool KITTY_ModeRecognized(SDL_VideoData *data, int mode)
     unsigned char buf[64];
     size_t total = 0;
     const int qlen = SDL_snprintf(query, sizeof(query), "\033[?%d$p", mode);
-    if (qlen <= 0 || !KITTY_WriteAll(data->tty_fd, query, (size_t)qlen)) {
+    if (qlen <= 0 || !KITTY_WriteAll(data->tty_out, query, (size_t)qlen)) {
         return false;
     }
     for (int attempt = 0; attempt < 20; ++attempt) {
         fd_set fds;
         struct timeval tv;
         FD_ZERO(&fds);
-        FD_SET(data->tty_fd, &fds);
+        FD_SET(data->tty_in, &fds);
         tv.tv_sec = 0;
         tv.tv_usec = 25000;
-        if (select(data->tty_fd + 1, &fds, NULL, NULL, &tv) <= 0) {
+        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
             continue;
         }
-        const ssize_t n = read(data->tty_fd, buf + total, sizeof(buf) - 1 - total);
+        const ssize_t n = read(data->tty_in, buf + total, sizeof(buf) - 1 - total);
         if (n <= 0) {
             continue;
         }
@@ -664,7 +671,9 @@ static bool KITTY_ModeRecognized(SDL_VideoData *data, int mode)
 
 bool KITTY_SetupTerminal(SDL_VideoData *data)
 {
-    /* Alt screen + hide cursor + Kitty keyboard only.
+    /* Alt screen + hide cursor + Kitty keyboard.
+     * Flags 1|2|8 = disambiguate + report press/repeat/release + report all
+     * keys as CSI (needed for held game keys; plain UTF-8 has no releases).
      * Mouse is enabled later (KITTY_EnableMouse) after CSI 14t/16t sizing so
      * any-event reports do not flood the size-query read. */
     static const char setup[] =
@@ -672,11 +681,11 @@ bool KITTY_SetupTerminal(SDL_VideoData *data)
         "\033[?25l"
         "\033[H"
         "\033[2J"
-        "\033[>1u";
+        "\033[>11u";
 
     data->mouse_sgr_pixels = false;
     data->mouse_enabled = false;
-    return KITTY_WriteAll(data->tty_fd, setup, sizeof(setup) - 1);
+    return KITTY_WriteAll(data->tty_out, setup, sizeof(setup) - 1);
 }
 
 bool KITTY_EnableMouse(SDL_VideoData *data)
@@ -695,14 +704,14 @@ bool KITTY_EnableMouse(SDL_VideoData *data)
         data->mouse_sgr_pixels = KITTY_ModeRecognized(data, 1016);
     }
 
-    if (!KITTY_WriteAll(data->tty_fd, tracking, sizeof(tracking) - 1)) {
+    if (!KITTY_WriteAll(data->tty_out, tracking, sizeof(tracking) - 1)) {
         return false;
     }
     if (data->mouse_sgr_pixels) {
-        if (!KITTY_WriteAll(data->tty_fd, "\033[?1016h", 8)) {
+        if (!KITTY_WriteAll(data->tty_out, "\033[?1016h", 8)) {
             return false;
         }
-    } else if (!KITTY_WriteAll(data->tty_fd, "\033[?1006h", 8)) {
+    } else if (!KITTY_WriteAll(data->tty_out, "\033[?1006h", 8)) {
         return false;
     }
     data->mouse_enabled = true;
@@ -720,8 +729,8 @@ void KITTY_RestoreTerminal(SDL_VideoData *data)
         "\033[<u"
         "\033[?25h"
         "\033[?1049l";
-    KITTY_DeleteAllImages(data->tty_fd);
-    KITTY_WriteAll(data->tty_fd, restore, sizeof(restore) - 1);
+    KITTY_DeleteAllImages(data->tty_out);
+    KITTY_WriteAll(data->tty_out, restore, sizeof(restore) - 1);
     KITTY_LeaveRawMode(data);
 }
 

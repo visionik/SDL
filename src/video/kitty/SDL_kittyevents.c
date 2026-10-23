@@ -53,9 +53,138 @@ static SDL_Window *KITTY_FocusWindow(SDL_VideoDevice *_this)
     return window;
 }
 
+/*
+ * MAME (and similar) drain the full SDL event queue then sample keyboard
+ * state. A same-queue down+up leaves state cleared. Keep keys down for a
+ * minimum time so at least one input poll sees them pressed.
+ */
+#define KITTY_KEY_HOLD_MS  80u
+#define KITTY_KEY_HOLD_MAX 64
+typedef struct KITTY_KeyHold
+{
+    SDL_Scancode sc;
+    Uint64 earliest_up_ms;
+    bool want_up;
+    bool down;
+} KITTY_KeyHold;
+
+static KITTY_KeyHold KITTY_key_holds[KITTY_KEY_HOLD_MAX];
+static int KITTY_key_hold_n;
+
+static KITTY_KeyHold *KITTY_FindHold(SDL_Scancode sc, bool create)
+{
+    int i;
+    for (i = 0; i < KITTY_key_hold_n; ++i) {
+        if (KITTY_key_holds[i].sc == sc) {
+            return &KITTY_key_holds[i];
+        }
+    }
+    if (!create || KITTY_key_hold_n >= KITTY_KEY_HOLD_MAX) {
+        return NULL;
+    }
+    KITTY_key_holds[KITTY_key_hold_n].sc = sc;
+    KITTY_key_holds[KITTY_key_hold_n].earliest_up_ms = 0;
+    KITTY_key_holds[KITTY_key_hold_n].want_up = false;
+    KITTY_key_holds[KITTY_key_hold_n].down = false;
+    return &KITTY_key_holds[KITTY_key_hold_n++];
+}
+
+static void KITTY_RemoveHoldAt(int idx)
+{
+    if (idx < 0 || idx >= KITTY_key_hold_n) {
+        return;
+    }
+    KITTY_key_holds[idx] = KITTY_key_holds[KITTY_key_hold_n - 1];
+    KITTY_key_hold_n--;
+}
+
+static void KITTY_FlushDueKeyUps(void)
+{
+    const Uint64 now = SDL_GetTicks();
+    int i = 0;
+    while (i < KITTY_key_hold_n) {
+        KITTY_KeyHold *h = &KITTY_key_holds[i];
+        if (h->down && h->want_up && now >= h->earliest_up_ms) {
+            SDL_SendKeyboardKey(0, SDL_GLOBAL_KEYBOARD_ID, 0, h->sc, false);
+            KITTY_RemoveHoldAt(i);
+            continue;
+        }
+        i++;
+    }
+}
+
 static void KITTY_SendKey(SDL_Scancode scancode, bool pressed)
 {
+    if (scancode == SDL_SCANCODE_UNKNOWN) {
+        return;
+    }
     SDL_SendKeyboardKey(0, SDL_GLOBAL_KEYBOARD_ID, 0, scancode, pressed);
+}
+
+static void KITTY_LogKey(SDL_Scancode sc, int event_type, const char *via)
+{
+    if (!SDL_getenv("SDL_KITTY_KEY_DEBUG")) {
+        return;
+    }
+    /* Prefer stderr: LogDebug on INPUT is often filtered, and stdout is the
+     * Kitty graphics channel once the alt-screen is owned. */
+    SDL_Log("kitty key sc=%d event=%d via=%s", (int)sc, event_type, via ? via : "?");
+}
+
+/* Kitty event-type subfield: 1=press (default), 2=repeat, 3=release. */
+static void KITTY_ApplyKeyEvent(SDL_Scancode sc, int event_type, bool has_release)
+{
+    KITTY_KeyHold *h;
+    const Uint64 now = SDL_GetTicks();
+
+    if (sc == SDL_SCANCODE_UNKNOWN) {
+        return;
+    }
+    KITTY_LogKey(sc, event_type, has_release ? "csi" : "legacy");
+
+    if (event_type == 3) {
+        h = KITTY_FindHold(sc, false);
+        if (h && h->down) {
+            h->want_up = true;
+            if (now >= h->earliest_up_ms) {
+                KITTY_SendKey(sc, false);
+                /* remove: linear search again after mutation */
+                {
+                    int i;
+                    for (i = 0; i < KITTY_key_hold_n; ++i) {
+                        if (KITTY_key_holds[i].sc == sc) {
+                            KITTY_RemoveHoldAt(i);
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            KITTY_SendKey(sc, false);
+        }
+        return;
+    }
+
+    if (event_type == 2) {
+        KITTY_SendKey(sc, true);
+        h = KITTY_FindHold(sc, true);
+        if (h) {
+            h->down = true;
+            h->want_up = false;
+            h->earliest_up_ms = now + KITTY_KEY_HOLD_MS;
+        }
+        return;
+    }
+
+    /* Press */
+    KITTY_SendKey(sc, true);
+    h = KITTY_FindHold(sc, true);
+    if (h) {
+        h->down = true;
+        h->earliest_up_ms = now + KITTY_KEY_HOLD_MS;
+        /* Legacy (no release reports): schedule up after min hold. */
+        h->want_up = !has_release;
+    }
 }
 
 static SDL_Scancode KITTY_AsciiToScancode(unsigned char c)
@@ -85,9 +214,174 @@ static SDL_Scancode KITTY_AsciiToScancode(unsigned char c)
     case 0x7f:
     case 0x08:
         return SDL_SCANCODE_BACKSPACE;
-    case 'q':
+    default:
+        return SDL_SCANCODE_UNKNOWN;
+    }
+}
+
+/* Kitty mods field is (1 + bitmask). Bit0=shift … see keyboard protocol. */
+static SDL_Keymod KITTY_ModsToSDL(unsigned mods_field)
+{
+    const unsigned bits = (mods_field > 0) ? (mods_field - 1u) : 0u;
+    SDL_Keymod m = SDL_KMOD_NONE;
+    if (bits & 1u) {
+        m |= SDL_KMOD_SHIFT;
+    }
+    if (bits & 2u) {
+        m |= SDL_KMOD_ALT;
+    }
+    if (bits & 4u) {
+        m |= SDL_KMOD_CTRL;
+    }
+    if (bits & 8u) {
+        m |= SDL_KMOD_GUI;
+    }
+    if (bits & 64u) {
+        m |= SDL_KMOD_CAPS;
+    }
+    if (bits & 128u) {
+        m |= SDL_KMOD_NUM;
+    }
+    return m;
+}
+
+static SDL_Scancode KITTY_CodeToScancode(unsigned code)
+{
+    if (code >= 'a' && code <= 'z') {
+        return (SDL_Scancode)(SDL_SCANCODE_A + (code - 'a'));
+    }
+    if (code >= 'A' && code <= 'Z') {
+        return (SDL_Scancode)(SDL_SCANCODE_A + (code - 'A'));
+    }
+    if (code >= '1' && code <= '9') {
+        return (SDL_Scancode)(SDL_SCANCODE_1 + (code - '1'));
+    }
+    if (code == '0') {
+        return SDL_SCANCODE_0;
+    }
+    switch (code) {
+    case 27:
+        return SDL_SCANCODE_ESCAPE;
+    case 13:
+        return SDL_SCANCODE_RETURN;
+    case 9:
+        return SDL_SCANCODE_TAB;
+    case 127:
+    case 8:
+        return SDL_SCANCODE_BACKSPACE;
+    case 32:
+        return SDL_SCANCODE_SPACE;
+    case 57358:
+        return SDL_SCANCODE_CAPSLOCK;
+    case 57359:
+        return SDL_SCANCODE_SCROLLLOCK;
+    case 57360:
+        return SDL_SCANCODE_NUMLOCKCLEAR;
+    case 57361:
+        return SDL_SCANCODE_PRINTSCREEN;
+    case 57362:
+        return SDL_SCANCODE_PAUSE;
+    case 57363:
+        return SDL_SCANCODE_MENU;
+    case 57417:
+        return SDL_SCANCODE_LEFT;
+    case 57418:
+        return SDL_SCANCODE_RIGHT;
+    case 57419:
+        return SDL_SCANCODE_UP;
+    case 57420:
+        return SDL_SCANCODE_DOWN;
+    /* Modifiers (flag 8 reports these as CSI-u). */
+    case 57441:
+        return SDL_SCANCODE_LSHIFT;
+    case 57442:
+        return SDL_SCANCODE_LCTRL;
+    case 57443:
+        return SDL_SCANCODE_LALT;
+    case 57444:
+        return SDL_SCANCODE_LGUI;
+    case 57447:
+        return SDL_SCANCODE_RSHIFT;
+    case 57448:
+        return SDL_SCANCODE_RCTRL;
+    case 57449:
+        return SDL_SCANCODE_RALT;
+    case 57450:
+        return SDL_SCANCODE_RGUI;
+    default:
+        break;
+    }
+    /* F1–F12 as CSI-u use legacy numbers under 30 in some hosts; PUA F13+. */
+    if (code >= 57376 && code <= 57387) {
+        return (SDL_Scancode)(SDL_SCANCODE_F13 + (int)(code - 57376));
+    }
+    return SDL_SCANCODE_UNKNOWN;
+}
+
+static SDL_Scancode KITTY_LegacyFinalToScancode(unsigned char final_byte, unsigned number)
+{
+    switch (final_byte) {
+    case 'A':
+        return SDL_SCANCODE_UP;
+    case 'B':
+        return SDL_SCANCODE_DOWN;
+    case 'C':
+        return SDL_SCANCODE_RIGHT;
+    case 'D':
+        return SDL_SCANCODE_LEFT;
+    case 'H':
+        return SDL_SCANCODE_HOME;
+    case 'F':
+        return SDL_SCANCODE_END;
+    case 'P':
+        return SDL_SCANCODE_F1;
     case 'Q':
-        return SDL_SCANCODE_Q;
+        return SDL_SCANCODE_F2;
+    case 'R':
+        return SDL_SCANCODE_F3;
+    case 'S':
+        return SDL_SCANCODE_F4;
+    case '~':
+        switch (number) {
+        case 2:
+            return SDL_SCANCODE_INSERT;
+        case 3:
+            return SDL_SCANCODE_DELETE;
+        case 5:
+            return SDL_SCANCODE_PAGEUP;
+        case 6:
+            return SDL_SCANCODE_PAGEDOWN;
+        case 7:
+            return SDL_SCANCODE_HOME;
+        case 8:
+            return SDL_SCANCODE_END;
+        case 11:
+            return SDL_SCANCODE_F1;
+        case 12:
+            return SDL_SCANCODE_F2;
+        case 13:
+            return SDL_SCANCODE_F3;
+        case 14:
+            return SDL_SCANCODE_F4;
+        case 15:
+            return SDL_SCANCODE_F5;
+        case 17:
+            return SDL_SCANCODE_F6;
+        case 18:
+            return SDL_SCANCODE_F7;
+        case 19:
+            return SDL_SCANCODE_F8;
+        case 20:
+            return SDL_SCANCODE_F9;
+        case 21:
+            return SDL_SCANCODE_F10;
+        case 23:
+            return SDL_SCANCODE_F11;
+        case 24:
+            return SDL_SCANCODE_F12;
+        default:
+            return SDL_SCANCODE_UNKNOWN;
+        }
     default:
         return SDL_SCANCODE_UNKNOWN;
     }
@@ -97,17 +391,8 @@ static void KITTY_HandleAscii(SDL_VideoDevice *_this, unsigned char c)
 {
     SDL_Scancode sc = KITTY_AsciiToScancode(c);
     (void)_this;
-    if (sc == SDL_SCANCODE_UNKNOWN) {
-        return;
-    }
-    KITTY_SendKey(sc, true);
-    KITTY_SendKey(sc, false);
-    if (sc == SDL_SCANCODE_ESCAPE || sc == SDL_SCANCODE_Q) {
-        SDL_Event quit;
-        SDL_zero(quit);
-        quit.type = SDL_EVENT_QUIT;
-        SDL_PushEvent(&quit);
-    }
+    /* Legacy text keys have no release; hold until next pump. */
+    KITTY_ApplyKeyEvent(sc, 1, false);
 }
 
 static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t len)
@@ -172,7 +457,7 @@ static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t 
                                        data->mouse_coord_w, data->mouse_coord_h,
                                        data->place_cells ? 1 : 0);
             if (n > 0) {
-                (void)write(data->tty_fd, line, (size_t)n);
+                (void)write(data->tty_out, line, (size_t)n);
             }
         }
     }
@@ -210,41 +495,116 @@ static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t 
     return true;
 }
 
+/*
+ * Parse Kitty CSI-u body (no leading '['), e.g. "97;1:3u", "27u", "97:65;5u".
+ * Event types (when flag 2 is on): 1=press, 2=repeat, 3=release.
+ */
 static bool KITTY_ParseKittyKey(const char *seq, size_t len)
 {
-    // CSI unicode;modifiers u  — e.g. "27;1u" for Escape
-    unsigned code = 0, mods = 0;
-    char term = 0;
+    unsigned code = 0;
+    unsigned mods = 1;
+    unsigned event = 1;
+    size_t i = 0;
     SDL_Scancode sc;
+    bool has_event_field = false;
 
     if (len < 2 || seq[len - 1] != 'u') {
         return false;
     }
-    if (SDL_sscanf(seq, "%u;%u%c", &code, &mods, &term) < 2) {
-        if (SDL_sscanf(seq, "%u%c", &code, &term) != 2 || term != 'u') {
-            return false;
+    while (i < len - 1 && seq[i] >= '0' && seq[i] <= '9') {
+        code = code * 10u + (unsigned)(seq[i] - '0');
+        i++;
+    }
+    /* Skip :shifted:base alternates before ';' or 'u'. */
+    while (i < len - 1 && seq[i] != ';') {
+        i++;
+    }
+    if (i < len - 1 && seq[i] == ';') {
+        i++;
+        mods = 0;
+        while (i < len - 1 && seq[i] >= '0' && seq[i] <= '9') {
+            mods = mods * 10u + (unsigned)(seq[i] - '0');
+            i++;
+        }
+        if (i < len - 1 && seq[i] == ':') {
+            i++;
+            event = 0;
+            has_event_field = true;
+            while (i < len - 1 && seq[i] >= '0' && seq[i] <= '9') {
+                event = event * 10u + (unsigned)(seq[i] - '0');
+                i++;
+            }
+            if (event == 0) {
+                event = 1;
+            }
+        }
+        if (mods == 0) {
+            mods = 1;
         }
     }
-    if (code == 27) {
-        sc = SDL_SCANCODE_ESCAPE;
-    } else if (code == 'q' || code == 'Q') {
-        sc = SDL_SCANCODE_Q;
-    } else if (code >= 'a' && code <= 'z') {
-        sc = (SDL_Scancode)(SDL_SCANCODE_A + (code - 'a'));
-    } else if (code >= 'A' && code <= 'Z') {
-        sc = (SDL_Scancode)(SDL_SCANCODE_A + (code - 'A'));
-    } else {
-        return true; // consumed but unmapped
-    }
-    KITTY_SendKey(sc, true);
-    KITTY_SendKey(sc, false);
-    if (sc == SDL_SCANCODE_ESCAPE || sc == SDL_SCANCODE_Q) {
-        SDL_Event quit;
-        SDL_zero(quit);
-        quit.type = SDL_EVENT_QUIT;
-        SDL_PushEvent(&quit);
-    }
+    /*
+     * Kitty: omitted event-type subfield means press (1), not "no releases".
+     * Rex sends digit presses as CSI 53 u and releases as CSI 53;1:3u.
+     * We always enable flag 2 (report event types), so CSI-u always has
+     * real releases — never arm the legacy min-hold auto-up path here.
+     */
+    (void)has_event_field;
+    SDL_SetModState(KITTY_ModsToSDL(mods));
+    sc = KITTY_CodeToScancode(code);
+    KITTY_ApplyKeyEvent(sc, (int)event, true /* has_release */);
     return true;
+}
+
+/* CSI 1;mods:event A  /  CSI A  /  CSI 15;mods~  etc. */
+static void KITTY_ParseLegacyCSIKey(const char *seq, size_t len, unsigned char final_byte)
+{
+    unsigned number = 1;
+    unsigned mods = 1;
+    unsigned event = 1;
+    bool has_event_field = false;
+    size_t i = 0;
+    SDL_Scancode sc;
+
+    if (len == 0) {
+        return;
+    }
+    if (seq[0] >= '0' && seq[0] <= '9') {
+        number = 0;
+        while (i < len && seq[i] >= '0' && seq[i] <= '9') {
+            number = number * 10u + (unsigned)(seq[i] - '0');
+            i++;
+        }
+        if (i < len && seq[i] == ';') {
+            i++;
+            mods = 0;
+            while (i < len && seq[i] >= '0' && seq[i] <= '9') {
+                mods = mods * 10u + (unsigned)(seq[i] - '0');
+                i++;
+            }
+            if (i < len && seq[i] == ':') {
+                i++;
+                event = 0;
+                has_event_field = true;
+                while (i < len && seq[i] >= '0' && seq[i] <= '9') {
+                    event = event * 10u + (unsigned)(seq[i] - '0');
+                    i++;
+                }
+                if (event == 0) {
+                    event = 1;
+                }
+            }
+            if (mods == 0) {
+                mods = 1;
+            }
+        }
+    }
+    /* With flag 2, Rex sends CSI 1;1:1A / 1;1:3A — treat as release-capable
+     * whenever the event subfield is present; also when omitted after we
+     * requested event types, still expect a later :3 (same as CSI-u). */
+    SDL_SetModState(KITTY_ModsToSDL(mods));
+    sc = KITTY_LegacyFinalToScancode(final_byte, number);
+    KITTY_ApplyKeyEvent(sc, (int)event, true /* has_release */);
+    (void)has_event_field;
 }
 
 static size_t KITTY_HandleCSI(SDL_VideoDevice *_this, const unsigned char *buf, size_t len)
@@ -257,12 +617,20 @@ static size_t KITTY_HandleCSI(SDL_VideoDevice *_this, const unsigned char *buf, 
             char seq[128];
             const size_t seq_len = i; // without leading '['
             if (seq_len < sizeof(seq)) {
+                /* seq holds intermediate bytes + final (e.g. "53u", "1;1:3A"). */
                 SDL_memcpy(seq, buf + 1, seq_len);
                 seq[seq_len] = '\0';
                 if (seq[0] == '<') {
-                    KITTY_ParseSGRMouse(_this, seq, seq_len + 1);
+                    KITTY_ParseSGRMouse(_this, seq, seq_len);
                 } else if (ch == 'u') {
-                    KITTY_ParseKittyKey(seq, seq_len + 1);
+                    /* Must pass seq_len (not +1): ParseKittyKey checks seq[len-1]=='u'.
+                     * Off-by-one made every CSI-u fail (digits/letters/Esc); arrows
+                     * still worked via the legacy A/B/C/D path. */
+                    KITTY_ParseKittyKey(seq, seq_len);
+                } else if (ch == '~' || ch == 'A' || ch == 'B' || ch == 'C' || ch == 'D' ||
+                           ch == 'H' || ch == 'F' || ch == 'P' || ch == 'Q' || ch == 'R' ||
+                           ch == 'S') {
+                    KITTY_ParseLegacyCSIKey(seq, seq_len, ch);
                 }
             }
             return i + 1;
@@ -361,6 +729,20 @@ void KITTY_PumpEvents(SDL_VideoDevice *_this)
         return;
     }
 
+    /* Release keys whose minimum hold elapsed. */
+    KITTY_FlushDueKeyUps();
+
+    /*
+     * CreateWindow emits FOCUS_GAINED before some apps (MAME) register the
+     * window id. Re-announce once from the pump so has_focus()/input poll works.
+     */
+    if (!data->focus_announced && data->focus_window) {
+        data->focus_announced = true;
+        data->focus_window->flags &= ~SDL_WINDOW_INPUT_FOCUS;
+        SDL_SetKeyboardFocus(data->focus_window);
+        SDL_SetMouseFocus(data->focus_window);
+    }
+
     if (data->got_winch) {
         KITTY_HandleWinch(_this);
     }
@@ -374,7 +756,7 @@ void KITTY_PumpEvents(SDL_VideoDevice *_this)
             continue;
         }
 
-        n = read(data->tty_fd, readbuf, room < sizeof(readbuf) ? room : sizeof(readbuf));
+        n = read(data->tty_in, readbuf, room < sizeof(readbuf) ? room : sizeof(readbuf));
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -411,6 +793,20 @@ void KITTY_PumpEvents(SDL_VideoDevice *_this)
                         break; /* incomplete CSI — keep from ESC onward */
                     }
                     i += 1 + consumed;
+                    continue;
+                }
+
+                /* SS3 arrows / F1–F4: ESC O A|B|C|D|P|Q|R|S */
+                if (buf[i + 1] == 'O') {
+                    if (i + 2 >= len) {
+                        break;
+                    }
+                    {
+                        const unsigned char f = buf[i + 2];
+                        const SDL_Scancode sc = KITTY_LegacyFinalToScancode(f, 1);
+                        KITTY_ApplyKeyEvent(sc, 1, false);
+                    }
+                    i += 3;
                     continue;
                 }
 

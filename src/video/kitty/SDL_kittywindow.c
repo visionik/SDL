@@ -79,11 +79,13 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
     window->internal = data;
 
     vdata->focus_window = window;
+    vdata->focus_announced = false;
     SDL_SetKeyboardFocus(window);
     SDL_SetMouseFocus(window);
     SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
     SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_SHOWN, 0, 0);
-    SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_GAINED, 0, 0);
+    /* FOCUS_GAINED also comes from SetKeyboardFocus; PumpEvents re-announces
+     * once so late window registries (MAME) still see focus. */
     return true;
 }
 
