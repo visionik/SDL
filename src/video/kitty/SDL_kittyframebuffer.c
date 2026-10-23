@@ -27,6 +27,7 @@
 #include "SDL_kittyframebuffer_c.h"
 #include "SDL_kittygraphics.h"
 #include "SDL_kittyprobe.h"
+#include "SDL_kittyprofile.h"
 #include "SDL_kittyrect.h"
 
 #define KITTY_SURFACE "SDL.internal.window.surface"
@@ -220,36 +221,52 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         upload_px = (size_t)surface->w * (size_t)surface->h;
         wire_mode = (convert_mode == KITTY_CONVERT_DIRTY) ? KITTY_WIRE_DIRTY_CPU : KITTY_WIRE_FULL;
 
-        /* Sparse a=f whenever dirty + live image; full a=T only if this fails
-         * (or convert_mode was FULL: first present / resize / DIRTY=0). */
-        if (convert_mode == KITTY_CONVERT_DIRTY &&
-            KITTY_SelectDirtyBW(SDL_getenv("SDL_KITTY_DIRTY_BW"), vdata->frame_edit_ok) &&
-            wdata->placed &&
-            wdata->live_image_id != 0) {
-            size_t packed_len = 0;
-            const size_t pack_cap = convert_px * (size_t)bpp;
-            bool pack_ok = false;
-            packed = (Uint8 *)SDL_malloc(pack_cap);
-            if (packed) {
-                pack_ok = use_rgba
-                              ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h, &dirty,
-                                                   packed, pack_cap, &packed_len)
-                              : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h, &dirty,
-                                                  packed, pack_cap, &packed_len);
+        /* Sparse a=f for small dirty unions. Large unions (fireworks burst
+         * covering most of the FB) must use full a=T/SHM — multi-chunk direct
+         * a=f at ~60Hz paints base64 into Kitty when the APC stream stalls.
+         * Coverage / pixel ceilings come from the host profile. */
+        {
+            const float cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
+            const float max_cov =
+                (vdata->term_profile && vdata->term_profile->af_max_coverage > 0.0f)
+                    ? vdata->term_profile->af_max_coverage
+                    : 0.40f;
+            const size_t max_af_px =
+                (vdata->term_profile && vdata->term_profile->af_max_pixels > 0)
+                    ? vdata->term_profile->af_max_pixels
+                    : ((size_t)160 * 1024); /* ~160k px ≈ 480KB RGB */
+            const bool af_small = (cov < max_cov) && (convert_px <= max_af_px);
+
+            if (convert_mode == KITTY_CONVERT_DIRTY &&
+                af_small &&
+                KITTY_SelectDirtyBW(SDL_getenv("SDL_KITTY_DIRTY_BW"), vdata->frame_edit_ok) &&
+                wdata->placed &&
+                wdata->live_image_id != 0) {
+                size_t packed_len = 0;
+                const size_t pack_cap = convert_px * (size_t)bpp;
+                bool pack_ok = false;
+                packed = (Uint8 *)SDL_malloc(pack_cap);
+                if (packed) {
+                    pack_ok = use_rgba
+                                  ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h, &dirty,
+                                                       packed, pack_cap, &packed_len)
+                                  : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h, &dirty,
+                                                      packed, pack_cap, &packed_len);
+                }
+                if (pack_ok &&
+                    KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed,
+                                              dirty.x, dirty.y, dirty.w, dirty.h, kitty_f)) {
+                    ok = true;
+                    wire_mode = KITTY_WIRE_DIRTY_BW;
+                    upload_px = convert_px;
+                    wdata->rgb_valid = true;
+                } else {
+                    /* Fall back to full a=T. */
+                    SDL_ClearError();
+                }
+                SDL_free(packed);
+                packed = NULL;
             }
-            if (pack_ok &&
-                KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed,
-                                          dirty.x, dirty.y, dirty.w, dirty.h, kitty_f)) {
-                ok = true;
-                wire_mode = KITTY_WIRE_DIRTY_BW;
-                upload_px = convert_px;
-                wdata->rgb_valid = true;
-            } else {
-                /* Fall back to full a=T. */
-                SDL_ClearError();
-            }
-            SDL_free(packed);
-            packed = NULL;
         }
 
         if (!ok) {
@@ -296,17 +313,17 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             } else if (wire_mode == KITTY_WIRE_DIFF_SKIP) {
                 mode_str = "diff_skip";
             }
-            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
-                         "kitty: present #%d %dx%d place=%d mode=%s rects=%d union=%dx%d coverage=%.2f convert_px=%zu upload_px=%zu live=%u pingpong=%d -> %s%s",
-                         frames, surface->w, surface->h,
-                         vdata->place_cells ? 1 : 0,
-                         mode_str,
-                         numrects, dirty.w, dirty.h, (double)cov,
-                         convert_px, upload_px,
-                         (unsigned)wdata->live_image_id,
-                         KITTY_SelectPingPong(SDL_getenv("SDL_KITTY_PINGPONG")) ? 1 : 0,
-                         ok ? "ok" : "FAIL ",
-                         ok ? "" : SDL_GetError());
+            KITTY_DebugLog(
+                "kitty: present #%d %dx%d place=%d mode=%s rects=%d union=%dx%d coverage=%.2f convert_px=%zu upload_px=%zu live=%u pingpong=%d -> %s%s",
+                frames, surface->w, surface->h,
+                vdata->place_cells ? 1 : 0,
+                mode_str,
+                numrects, dirty.w, dirty.h, (double)cov,
+                convert_px, upload_px,
+                (unsigned)wdata->live_image_id,
+                KITTY_SelectPingPong(SDL_getenv("SDL_KITTY_PINGPONG")) ? 1 : 0,
+                ok ? "ok" : "FAIL ",
+                ok ? "" : SDL_GetError());
         }
         frames++;
     }

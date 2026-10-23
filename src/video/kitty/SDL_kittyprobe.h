@@ -43,7 +43,7 @@ typedef enum KITTY_TransmitMode
 #endif
 
 KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
-                                            const char *term_program,
+                                            bool prefer_direct,
                                             bool shm_ok,
                                             bool direct_ok);
 
@@ -67,6 +67,9 @@ bool KITTY_SelectFbAlpha(const char *env);
  * Prefer SDL_LogDebug over writing /tmp files.
  */
 bool KITTY_DebugEnabled(void);
+
+/* SDL_LogDebug + fprintf(stderr) so 2>file works on macOS. */
+void KITTY_DebugLog(SDL_PRINTF_FORMAT_STRING const char *fmt, ...) SDL_PRINTF_VARARG_FUNC(1);
 
 /*
  * Format first-chunk a=T APC header (without ESC_G prefix or trailing payload).

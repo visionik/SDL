@@ -24,6 +24,7 @@
 
 #include "SDL_kittygraphics.h"
 #include "SDL_kittyprobe.h"
+#include "SDL_kittyprofile.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -105,7 +106,7 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
                                         int place_cols, int place_rows,
                                         const char *extra_keys,
                                         const Uint8 *payload, size_t payload_len,
-                                        int kitty_f)
+                                        int kitty_f, bool home_cursor)
 {
     const size_t b64_len = ((payload_len + 2) / 3) * 4;
     char *b64 = (char *)SDL_malloc(b64_len + 1);
@@ -118,7 +119,9 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
         return SDL_SetError("base64 encode failed");
     }
 
-    if (!KITTY_WriteAll(fd, "\033[H", 3)) {
+    /* Homing every frame flashes some hosts during full a=T bursts; only home
+     * when placing for the first time or when c/r place size changes. */
+    if (home_cursor && !KITTY_WriteAll(fd, "\033[H", 3)) {
         SDL_free(b64);
         return false;
     }
@@ -167,7 +170,7 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
 }
 
 static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
-                                     int place_cols, int place_rows, int kitty_f)
+                                     int place_cols, int place_rows, int kitty_f, bool home_cursor)
 {
     const int bpp = (kitty_f == 32) ? 4 : 3;
     const uLong raw_len = (uLong)w * (uLong)h * (uLong)bpp;
@@ -183,21 +186,23 @@ static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, 
         return SDL_SetError("zlib compress2 failed (%d)", zerr);
     }
     const bool ok = KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows,
-                                                "o=z", compressed, (size_t)out_len, kitty_f);
+                                                "o=z", compressed, (size_t)out_len, kitty_f,
+                                                home_cursor);
     SDL_free(compressed);
     return ok;
 }
 
 static bool KITTY_TransmitDirectRaw(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
-                                    int place_cols, int place_rows, int kitty_f)
+                                    int place_cols, int place_rows, int kitty_f, bool home_cursor)
 {
     const int bpp = (kitty_f == 32) ? 4 : 3;
     const size_t raw_len = (size_t)w * (size_t)h * (size_t)bpp;
-    return KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows, "", rgb, raw_len, kitty_f);
+    return KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows, "", rgb, raw_len,
+                                       kitty_f, home_cursor);
 }
 
 static bool KITTY_TransmitShm(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
-                              int place_cols, int place_rows, int kitty_f)
+                              int place_cols, int place_rows, int kitty_f, bool home_cursor)
 {
     char name[64];
     const int bpp = (kitty_f == 32) ? 4 : 3;
@@ -235,7 +240,7 @@ static bool KITTY_TransmitShm(int fd, Uint32 image_id, const Uint8 *rgb, int w, 
             SDL_SetError("shm name base64 failed");
             goto done;
         }
-        if (!KITTY_WriteAll(fd, "\033[H", 3)) {
+        if (home_cursor && !KITTY_WriteAll(fd, "\033[H", 3)) {
             goto done;
         }
         {
@@ -426,7 +431,7 @@ static void KITTY_UpdateMouseCoordSpace(SDL_VideoData *data)
  *
  * SDL_KITTY_FB_FIXED=WxH — exact FB size (resize keeps pixels; a=p re-stretch).
  * SDL_KITTY_FB_MAX=W[xH] — aspect-fit into a max box (e.g. 800 or 800x600).
- * Unset on Rex → default max 1280x720 aspect-fit. */
+ * Unset → host profile default_fb_max_* (see docs/terminals.md). */
 static void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
 {
     const char *fixed;
@@ -464,15 +469,14 @@ static void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
             max_w = (int)SDL_strtol(env, NULL, 10);
             max_h = max_w;
         }
+    } else if (data->term_profile &&
+               data->term_profile->default_fb_max_w > 0 &&
+               data->term_profile->default_fb_max_h > 0) {
+        /* Per-host default — Kitty/Ghostty allow 1080p; Rex/unknown stay 720p. */
+        max_w = data->term_profile->default_fb_max_w;
+        max_h = data->term_profile->default_fb_max_h;
     } else {
-        /* Rex drops huge multi-chunk direct RGB (blank frame). */
-        const char *tp = SDL_getenv("TERM_PROGRAM");
-        if (tp && SDL_strcasecmp(tp, "rex") == 0) {
-            max_w = 1280;
-            max_h = 720;
-        } else {
-            return;
-        }
+        return; /* profile says no default cap */
     }
     if (max_w < 16 || max_h < 16) {
         return;
@@ -521,12 +525,9 @@ bool KITTY_QueryTerminalSize(SDL_VideoData *data)
     /* Rex often fills ws_xpixel/ws_ypixel with cell*grid (HiDPI), which is much
      * larger than the CSI 14t drawable area and produces frames the host drops.
      * Ignore ioctl pixels on Rex; prefer CSI / scaled prior area. */
-    {
-        const char *tp = SDL_getenv("TERM_PROGRAM");
-        if (tp && SDL_strcasecmp(tp, "rex") == 0) {
-            data->pixel_w = 0;
-            data->pixel_h = 0;
-        }
+    if (data->term_profile && data->term_profile->kind == KITTY_TERM_REX) {
+        data->pixel_w = 0;
+        data->pixel_h = 0;
     }
 
     if (data->pixel_w > 0 && data->pixel_h > 0) {
@@ -613,6 +614,51 @@ void KITTY_LeaveRawMode(SDL_VideoData *data)
     }
 }
 
+/* Swallow unread APC/CSI (e.g. Gi=1,p=1;OK) so the next shell prompt
+ * does not treat graphics replies as typed input. */
+static void KITTY_DrainInput(SDL_VideoData *data)
+{
+    unsigned char junk[512];
+    int passes;
+
+    if (!data || data->tty_in < 0) {
+        return;
+    }
+    data->tty_pending_len = 0;
+
+    /* Non-blocking drain, then a few short waits for late host replies
+     * (delete / last a=T without q=2 often arrive after restore starts). */
+    for (passes = 0; passes < 8; ++passes) {
+        for (;;) {
+            fd_set fds;
+            struct timeval tv;
+            FD_ZERO(&fds);
+            FD_SET(data->tty_in, &fds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 0;
+            if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+                break;
+            }
+            if (read(data->tty_in, junk, sizeof(junk)) <= 0) {
+                break;
+            }
+        }
+        if (passes < 7) {
+            fd_set fds;
+            struct timeval tv;
+            FD_ZERO(&fds);
+            FD_SET(data->tty_in, &fds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 15000;
+            if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+                /* Quiet for 15ms — likely done. */
+                break;
+            }
+            (void)read(data->tty_in, junk, sizeof(junk));
+        }
+    }
+}
+
 static bool KITTY_WantMousePixels(void)
 {
     /* Default on: SGR-pixels (1016). Set SDL_KITTY_MOUSE_PIXELS=0 for cell SGR (1006). */
@@ -685,6 +731,9 @@ bool KITTY_SetupTerminal(SDL_VideoData *data)
 
     data->mouse_sgr_pixels = false;
     data->mouse_enabled = false;
+    data->place_homed = false;
+    data->placed_cols = 0;
+    data->placed_rows = 0;
     return KITTY_WriteAll(data->tty_out, setup, sizeof(setup) - 1);
 }
 
@@ -731,6 +780,12 @@ void KITTY_RestoreTerminal(SDL_VideoData *data)
         "\033[?1049l";
     KITTY_DeleteAllImages(data->tty_out);
     KITTY_WriteAll(data->tty_out, restore, sizeof(restore) - 1);
+    /* Rex omits q=2 on a=T/SHM, so hosts reply with APC OK. Drain before
+     * cooked mode or the next prompt shows Gi=1,p=1;OK as typed text. */
+    KITTY_DrainInput(data);
+    data->place_homed = false;
+    data->placed_cols = 0;
+    data->placed_rows = 0;
     KITTY_LeaveRawMode(data);
 }
 
@@ -766,6 +821,19 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     }
     if (!vdata || !packed_rgb || image_id == 0 || rw <= 0 || rh <= 0 || x < 0 || y < 0) {
         return SDL_SetError("invalid RGB rect edit");
+    }
+    /* Same ceiling as TransmitRGB direct fallback — huge a=f chunks also
+     * paint base64 into the tty when the host drops the APC. */
+    {
+        const size_t max_direct =
+            (vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
+                ? vdata->term_profile->max_direct_bytes
+                : ((size_t)1920 * 1080 * 4);
+        if (payload_len > max_direct) {
+            return SDL_SetError(
+                "kitty: refusing direct a=f of %dx%d (~%zu bytes); use smaller FB or SHM full present",
+                rw, rh, payload_len);
+        }
     }
 
     b64_len = ((payload_len + 2) / 3) * 4;
@@ -850,6 +918,7 @@ bool KITTY_PlaceExistingImage(SDL_VideoData *vdata, Uint32 image_id,
     }
     vdata->placed_cols = place_cols;
     vdata->placed_rows = place_rows;
+    vdata->place_homed = true;
     return true;
 }
 
@@ -877,34 +946,63 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
         /* place_cells (default): stretch to full grid. Else 1:1 pixels. */
         const int place_cols = vdata->place_cells && vdata->cols > 0 ? vdata->cols : 0;
         const int place_rows = vdata->place_cells && vdata->rows > 0 ? vdata->rows : 0;
+        const bool home_cursor =
+            !vdata->place_homed ||
+            vdata->placed_cols != place_cols ||
+            vdata->placed_rows != place_rows;
         bool ok = false;
 
-        if (vdata->transmit_mode == KITTY_TRANSMIT_SHM && !vdata->shm_failed) {
-            if (KITTY_TransmitShm(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows, kitty_f)) {
-                ok = true;
-            } else {
-                // Fall back for the rest of the session.
-                vdata->shm_failed = true;
-                vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
-                SDL_ClearError();
-            }
-        }
+        {
+            const int bpp = (kitty_f == 32) ? 4 : 3;
+            const size_t raw_len = (size_t)w * (size_t)h * (size_t)bpp;
+            /* Multi-chunk direct of huge FBs often lands as literal base64 in the
+             * tty when the host rejects/drops the APC (seen with dvd_sprite on
+             * Kitty.app at ~3360x2100 after SHM failure). Refuse giant direct;
+             * ceiling comes from the host profile (docs/terminals.md). */
+            const size_t max_direct =
+                (vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
+                    ? vdata->term_profile->max_direct_bytes
+                    : ((size_t)1920 * 1080 * 4);
 
-        if (!ok && vdata->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
-            if (KITTY_TransmitDirectZlib(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows, kitty_f)) {
-                ok = true;
-            } else {
-                vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
-                SDL_ClearError();
+            if (vdata->transmit_mode == KITTY_TRANSMIT_SHM && !vdata->shm_failed) {
+                if (KITTY_TransmitShm(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
+                                      kitty_f, home_cursor)) {
+                    ok = true;
+                } else {
+                    vdata->shm_failed = true;
+                    vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
+                    SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                                "kitty: SHM transmit failed (%s); falling back to direct",
+                                SDL_GetError());
+                    SDL_ClearError();
+                }
             }
-        }
 
-        if (!ok) {
-            ok = KITTY_TransmitDirectRaw(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows, kitty_f);
+            if (!ok && vdata->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
+                if (KITTY_TransmitDirectZlib(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
+                                             kitty_f, home_cursor)) {
+                    ok = true;
+                } else {
+                    vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
+                    SDL_ClearError();
+                }
+            }
+
+            if (!ok) {
+                if (raw_len > max_direct) {
+                    return SDL_SetError(
+                        "kitty: refusing direct transmit of %zux%zu (~%zu bytes); "
+                        "set SDL_KITTY_FB_MAX=1280x720 or fix SHM",
+                        (size_t)w, (size_t)h, raw_len);
+                }
+                ok = KITTY_TransmitDirectRaw(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
+                                             kitty_f, home_cursor);
+            }
         }
         if (ok) {
             vdata->placed_cols = place_cols;
             vdata->placed_rows = place_rows;
+            vdata->place_homed = true;
         }
         return ok;
     }

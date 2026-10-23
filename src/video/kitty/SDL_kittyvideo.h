@@ -41,6 +41,8 @@ typedef enum KITTY_TransmitMode
     KITTY_TRANSMIT_DIRECT
 } KITTY_TransmitMode;
 
+struct KITTY_TerminalProfile; /* SDL_kittyprofile.h */
+
 typedef struct SDL_VideoData
 {
     /* Rex (and some hosts) deliver keyboard on stdin while APC/CSI go out
@@ -48,6 +50,7 @@ typedef struct SDL_VideoData
     int tty_in;
     int tty_out;
     int tty_fd;
+    const struct KITTY_TerminalProfile *term_profile;
     bool terminal_owned;
     bool keyboard_enabled;
     bool mouse_enabled;
@@ -69,6 +72,7 @@ typedef struct SDL_VideoData
     int mouse_raw_y;
     int placed_cols; /* last c/r sent with stretch place; 0 = none */
     int placed_rows;
+    bool place_homed; /* CSI home already sent for current place; skip on replace */
     SDL_Window *focus_window;
     bool focus_announced; /* re-emit FOCUS_GAINED once from PumpEvents for late listeners (e.g. MAME) */
     volatile sig_atomic_t got_winch;

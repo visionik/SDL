@@ -30,6 +30,7 @@
 #include "SDL_kittyframebuffer_c.h"
 #include "SDL_kittygraphics.h"
 #include "SDL_kittyprobe.h"
+#include "SDL_kittyprofile.h"
 #include "SDL_kittyvideo.h"
 #include "SDL_kittywindow.h"
 
@@ -87,15 +88,19 @@ static SDL_VideoDevice *KITTY_CreateDevice(void)
         SDL_free(device);
         return NULL;
     }
-    /* Writes always go to stdout. Reads prefer stdin when it is a tty
-     * (Rex delivers keys on fd 0 only). Fall back to stdout when stdin
-     * is redirected. */
+    data->term_profile = KITTY_DetectTerminalProfile();
+    /* Writes always go to stdout. Reads: profile.keys_on_stdin (Rex) when
+     * stdin is a tty; else stdout. */
     data->tty_out = STDOUT_FILENO;
-    data->tty_in = isatty(STDIN_FILENO) ? STDIN_FILENO : STDOUT_FILENO;
+    if (data->term_profile->keys_on_stdin && isatty(STDIN_FILENO)) {
+        data->tty_in = STDIN_FILENO;
+    } else {
+        data->tty_in = isatty(STDIN_FILENO) ? STDIN_FILENO : STDOUT_FILENO;
+    }
     data->tty_fd = data->tty_out;
-    /* Prefer direct RGB. Rex rejects zlib (o=z) and is unreliable with SHM;
-     * apps can still force via SDL_KITTY_TRANSMIT=shm|zlib. */
-    data->transmit_mode = KITTY_TRANSMIT_DIRECT;
+    /* Initial guess; ProbeTransmitModes + profile refine after terminal setup. */
+    data->transmit_mode = data->term_profile->prefer_direct ? KITTY_TRANSMIT_DIRECT
+                                                           : KITTY_TRANSMIT_SHM;
     data->shm_failed = false;
     data->frame_edit_ok = false;
     /* Stretch FB to the cell grid by default; SDL_KITTY_PLACE_CELLS=0 for 1:1. */
@@ -214,11 +219,12 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
     }
 
     if (KITTY_DebugEnabled()) {
-        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
-                     "kitty: init cols=%d rows=%d fb=%dx%d cell=%dx%d place=%d mouse1016=%d",
-                     data->cols, data->rows, data->pixel_w, data->pixel_h,
-                     data->cell_w, data->cell_h, data->place_cells ? 1 : 0,
-                     data->mouse_sgr_pixels ? 1 : 0);
+        KITTY_DebugLog(
+            "kitty: init term=%s cols=%d rows=%d fb=%dx%d cell=%dx%d place=%d mouse1016=%d",
+            data->term_profile ? data->term_profile->name : "?",
+            data->cols, data->rows, data->pixel_w, data->pixel_h,
+            data->cell_w, data->cell_h, data->place_cells ? 1 : 0,
+            data->mouse_sgr_pixels ? 1 : 0);
     }
 
     return true;

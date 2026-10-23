@@ -13,8 +13,12 @@
 
 #include "SDL_kittyprobe.h"
 
+#include <stdio.h>
+#include <stdarg.h>
+
 #ifndef KITTY_PROBE_STANDALONE
 #include "SDL_kittygraphics.h"
+#include "SDL_kittyprofile.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -177,14 +181,35 @@ bool KITTY_DebugEnabled(void)
         const char *dbg = SDL_getenv("SDL_KITTY_DEBUG");
         cached = (dbg && dbg[0] && dbg[0] != '0') ? 1 : 0;
         if (cached) {
+#ifndef KITTY_PROBE_STANDALONE
             SDL_SetLogPriority(SDL_LOG_CATEGORY_VIDEO, SDL_LOG_PRIORITY_DEBUG);
+#endif
+            /* macOS SDL_Log often bypasses redirected stderr (os_log). */
+            setvbuf(stderr, NULL, _IOLBF, 0);
         }
     }
     return cached != 0;
 }
 
+void KITTY_DebugLog(const char *fmt, ...)
+{
+    va_list ap;
+    char buf[512];
+    if (!KITTY_DebugEnabled() || !fmt) {
+        return;
+    }
+    va_start(ap, fmt);
+    SDL_vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+#ifndef KITTY_PROBE_STANDALONE
+    SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO, "%s", buf);
+#endif
+    fprintf(stderr, "%s\r\n", buf);
+    fflush(stderr);
+}
+
 KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
-                                            const char *term_program,
+                                            bool prefer_direct,
                                             bool shm_ok,
                                             bool direct_ok)
 {
@@ -202,8 +227,8 @@ KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
         }
     }
 
-    /* Rex: SHM/zlib historically blank or flaky — stay on direct unless forced. */
-    if (term_program && SDL_strcasecmp(term_program, "rex") == 0) {
+    /* Host profile (e.g. Rex) may prefer direct even when SHM probes OK. */
+    if (prefer_direct) {
         return KITTY_TRANSMIT_DIRECT;
     }
 
@@ -378,8 +403,8 @@ static void KITTY_DrainTty(int fd)
 }
 
 /* Transmit-only 2x2 image, then a=f edit one pixel; delete. No on-screen place.
- * Rex may apply a=f successfully without an APC OK reply — treat ERROR as fail,
- * OK or silent (NONE) as success when the write succeeded. */
+ * Hosts with silent_af_ok (Rex) may apply a=f without an APC OK — treat ERROR
+ * as fail and OK or silent (NONE) as success. Strict hosts require OK. */
 static bool KITTY_ProbeFrameEdit(SDL_VideoData *data, Uint32 id)
 {
     const Uint8 rgb2x2[12] = { 0 };
@@ -389,6 +414,8 @@ static bool KITTY_ProbeFrameEdit(SDL_VideoData *data, Uint32 id)
     int n;
     KITTY_GraphicsQueryStatus st;
     bool ok = false;
+    const bool silent_ok =
+        data->term_profile ? data->term_profile->silent_af_ok : true;
 
     enc = KITTY_B64EncodeLocal(rgb2x2, sizeof(rgb2x2), rgb_b64, sizeof(rgb_b64));
     if (enc == 0) {
@@ -413,8 +440,11 @@ static bool KITTY_ProbeFrameEdit(SDL_VideoData *data, Uint32 id)
         goto cleanup;
     }
     st = KITTY_AwaitGraphicsQuery(data->tty_in, id, 40);
-    /* OK = explicit support; NONE = silent host (Rex); ERROR = unsupported. */
-    ok = (st != KITTY_GQ_ERROR);
+    if (silent_ok) {
+        ok = (st != KITTY_GQ_ERROR);
+    } else {
+        ok = (st == KITTY_GQ_OK);
+    }
 
 cleanup:
     n = SDL_snprintf(cmd, sizeof(cmd), "\033_Ga=d,d=I,i=%u,q=2\033\\", (unsigned)id);
@@ -428,8 +458,9 @@ cleanup:
 bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
 {
     const char *force = SDL_getenv("SDL_KITTY_TRANSMIT");
-    const char *tp = SDL_getenv("TERM_PROGRAM");
     const char *bw_env = SDL_getenv("SDL_KITTY_DIRTY_BW");
+    const char *term_name = "unknown";
+    bool prefer_direct = false;
     bool direct_ok = false;
     bool shm_ok = false;
     bool frame_ok = false;
@@ -441,22 +472,34 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
         return false;
     }
     data->frame_edit_ok = false;
+    if (data->term_profile) {
+        prefer_direct = data->term_profile->prefer_direct;
+        term_name = data->term_profile->name;
+    }
 
     /* Drain any prior CSI noise from the input tty. */
     KITTY_DrainTty(data->tty_in);
 
     direct_ok = KITTY_ProbeDirectQuery(data, id_direct);
-    /* Skip SHM probe on Rex — SelectTransmitMode would ignore it anyway, and
-     * creating SHM objects just to fail wastes time. Still probe if forced. */
+    /* Skip SHM probe when the profile prefers direct (Rex) — SelectTransmitMode
+     * would ignore SHM anyway. Still probe if SDL_KITTY_TRANSMIT=shm. */
     {
-        const bool probe_shm = (force && SDL_strcasecmp(force, "shm") == 0) ||
-                               !(tp && SDL_strcasecmp(tp, "rex") == 0);
+        const bool probe_shm =
+            (force && SDL_strcasecmp(force, "shm") == 0) || !prefer_direct;
         if (probe_shm) {
             shm_ok = KITTY_ProbeShmQuery(data, id_shm);
         }
 
-        data->transmit_mode = KITTY_SelectTransmitMode(force, tp, shm_ok, direct_ok);
-        data->shm_failed = !shm_ok;
+        data->transmit_mode =
+            KITTY_SelectTransmitMode(force, prefer_direct, shm_ok, direct_ok);
+        /* If mode is SHM (probe OK or SDL_KITTY_TRANSMIT=shm), clear the
+         * failure latch so the first present actually tries t=s. A failed
+         * a=q probe must not silently skip SHM when the user forced it. */
+        if (data->transmit_mode == KITTY_TRANSMIT_SHM) {
+            data->shm_failed = false;
+        } else {
+            data->shm_failed = !shm_ok;
+        }
 
         /* Frame-edit probe only if graphics direct works (or we still try). */
         frame_ok = KITTY_ProbeFrameEdit(data, id_frame);
@@ -470,18 +513,17 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
             } else if (data->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
                 mode = "zlib";
             }
-            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
-                         "kitty: transmit_probe direct=%s shm=%s force=%s term=%s -> %s",
-                         direct_ok ? "ok" : "fail",
-                         probe_shm ? (shm_ok ? "ok" : "fail") : "skip",
-                         force ? force : "(none)",
-                         tp ? tp : "(none)",
-                         mode);
-            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
-                         "kitty: frame_edit_probe %s -> dirty_bw=%s (env=%s)",
-                         frame_ok ? "ok" : "fail",
-                         bw ? "on" : "off",
-                         bw_env ? bw_env : "(none)");
+            KITTY_DebugLog("kitty: transmit_probe direct=%s shm=%s force=%s term=%s prefer_direct=%d -> %s",
+                           direct_ok ? "ok" : "fail",
+                           probe_shm ? (shm_ok ? "ok" : "fail") : "skip",
+                           force ? force : "(none)",
+                           term_name,
+                           prefer_direct ? 1 : 0,
+                           mode);
+            KITTY_DebugLog("kitty: frame_edit_probe %s -> dirty_bw=%s (env=%s)",
+                           frame_ok ? "ok" : "fail",
+                           bw ? "on" : "off",
+                           bw_env ? bw_env : "(none)");
         }
     }
 
