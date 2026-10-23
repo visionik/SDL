@@ -39,14 +39,40 @@ typedef enum KITTY_PresentWireMode
 {
     KITTY_WIRE_FULL = 0,  /* full-frame a=T */
     KITTY_WIRE_DIRTY_CPU, /* dirty convert, full a=T (Step 1a) */
-    KITTY_WIRE_DIRTY_BW   /* dirty convert + a=f rect edit (Step 1b) */
+    KITTY_WIRE_DIRTY_BW,  /* dirty convert + a=f rect edit (Step 1b) */
+    KITTY_WIRE_DIFF_SKIP  /* tile-diff found no changes; upload skipped */
 } KITTY_PresentWireMode;
+
+typedef enum KITTY_DiffOutcome
+{
+    KITTY_DIFF_NONE = 0, /* buffers identical */
+    KITTY_DIFF_RECT,     /* use dirty_out bbox for sparse upload */
+    KITTY_DIFF_FULL      /* bbox coverage too high — full present */
+} KITTY_DiffOutcome;
 
 /* Clamp and union rects into the FB. Returns false if nothing remains. */
 bool KITTY_UnionRects(int fb_w, int fb_h, const SDL_Rect *rects, int numrects, SDL_Rect *out);
 
 /* area(union) / (fb_w*fb_h); 1 if fb empty. */
 float KITTY_CoverageRatio(int fb_w, int fb_h, const SDL_Rect *union_rect);
+
+/*
+ * 32x32 (or tile) memcmp of prev vs next tightly packed RGB/RGBA frames.
+ * dirty_out receives the bounding box of changed tiles when RECT/FULL.
+ * cover_limit: if bbox coverage >= limit → FULL (default caller uses ~0.45).
+ */
+KITTY_DiffOutcome KITTY_TileDiffBBox(const Uint8 *prev, const Uint8 *next,
+                                     int fb_w, int fb_h, int bpp, int tile,
+                                     float cover_limit, SDL_Rect *dirty_out);
+
+/* SDL_KITTY_FB_DIFF: default on; 0/off/false/no disables. */
+bool KITTY_SelectFbDiff(const char *env);
+
+/* SDL_KITTY_FB_DIFF_TILE: default 32, clamped 8..128. */
+int KITTY_SelectFbDiffTile(const char *env);
+
+/* SDL_KITTY_FB_DIFF_COVER: default 0.45, clamped 0.05..1.0. */
+float KITTY_SelectFbDiffCover(const char *env);
 
 /*
  * Decide full vs dirty convert. dirty_out set when mode is DIRTY (union of rects).

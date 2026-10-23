@@ -99,6 +99,118 @@ float KITTY_CoverageRatio(int fb_w, int fb_h, const SDL_Rect *union_rect)
     return area / denom;
 }
 
+bool KITTY_SelectFbDiff(const char *env)
+{
+    if (!env || !env[0]) {
+        return true; /* default on — helps full-frame apps (MAME soft) */
+    }
+    if (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
+        SDL_strcasecmp(env, "false") == 0 || SDL_strcasecmp(env, "no") == 0) {
+        return false;
+    }
+    return true;
+}
+
+int KITTY_SelectFbDiffTile(const char *env)
+{
+    int tile = 32;
+    if (env && env[0]) {
+        tile = (int)SDL_strtol(env, NULL, 10);
+    }
+    if (tile < 8) {
+        tile = 8;
+    }
+    if (tile > 128) {
+        tile = 128;
+    }
+    return tile;
+}
+
+float KITTY_SelectFbDiffCover(const char *env)
+{
+    float cover = 0.45f;
+    if (env && env[0]) {
+        cover = (float)SDL_atof(env);
+    }
+    if (cover < 0.05f) {
+        cover = 0.05f;
+    }
+    if (cover > 1.0f) {
+        cover = 1.0f;
+    }
+    return cover;
+}
+
+KITTY_DiffOutcome KITTY_TileDiffBBox(const Uint8 *prev, const Uint8 *next,
+                                     int fb_w, int fb_h, int bpp, int tile,
+                                     float cover_limit, SDL_Rect *dirty_out)
+{
+    int ty, tx;
+    int min_x = fb_w, min_y = fb_h, max_x = 0, max_y = 0;
+    int dirty_tiles = 0;
+    SDL_Rect bbox;
+
+    if (dirty_out) {
+        dirty_out->x = 0;
+        dirty_out->y = 0;
+        dirty_out->w = fb_w;
+        dirty_out->h = fb_h;
+    }
+    if (!prev || !next || fb_w <= 0 || fb_h <= 0 || (bpp != 3 && bpp != 4) || tile <= 0) {
+        return KITTY_DIFF_FULL;
+    }
+
+    for (ty = 0; ty < fb_h; ty += tile) {
+        const int th = (ty + tile <= fb_h) ? tile : (fb_h - ty);
+        for (tx = 0; tx < fb_w; tx += tile) {
+            const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
+            int row;
+            bool changed = false;
+            for (row = 0; row < th; ++row) {
+                const size_t off = ((size_t)(ty + row) * (size_t)fb_w + (size_t)tx) * (size_t)bpp;
+                if (SDL_memcmp(prev + off, next + off, (size_t)tw * (size_t)bpp) != 0) {
+                    changed = true;
+                    break;
+                }
+            }
+            if (changed) {
+                dirty_tiles++;
+                if (tx < min_x) {
+                    min_x = tx;
+                }
+                if (ty < min_y) {
+                    min_y = ty;
+                }
+                if (tx + tw > max_x) {
+                    max_x = tx + tw;
+                }
+                if (ty + th > max_y) {
+                    max_y = ty + th;
+                }
+            }
+        }
+    }
+
+    if (dirty_tiles == 0) {
+        if (dirty_out) {
+            dirty_out->x = dirty_out->y = dirty_out->w = dirty_out->h = 0;
+        }
+        return KITTY_DIFF_NONE;
+    }
+
+    bbox.x = min_x;
+    bbox.y = min_y;
+    bbox.w = max_x - min_x;
+    bbox.h = max_y - min_y;
+    if (dirty_out) {
+        *dirty_out = bbox;
+    }
+    if (KITTY_CoverageRatio(fb_w, fb_h, &bbox) >= cover_limit) {
+        return KITTY_DIFF_FULL;
+    }
+    return KITTY_DIFF_RECT;
+}
+
 KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
                                                  const SDL_Rect *rects, int numrects,
                                                  bool scratch_valid, SDL_Rect *dirty_out)

@@ -72,8 +72,10 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
     data->image_index = 0;
     data->placed = false;
     data->rgb_scratch = NULL;
+    data->rgb_back = NULL;
     data->rgb_w = 0;
     data->rgb_h = 0;
+    data->scratch_bpp = 0;
     data->rgb_valid = false;
     data->live_image_id = 0;
     window->internal = data;
@@ -103,6 +105,8 @@ void KITTY_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
     if (data) {
         SDL_free(data->rgb_scratch);
         data->rgb_scratch = NULL;
+        SDL_free(data->rgb_back);
+        data->rgb_back = NULL;
         SDL_free(data);
     }
     window->internal = NULL;

@@ -38,6 +38,8 @@ static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
     }
     SDL_free(wdata->rgb_scratch);
     wdata->rgb_scratch = NULL;
+    SDL_free(wdata->rgb_back);
+    wdata->rgb_back = NULL;
     wdata->rgb_w = 0;
     wdata->rgb_h = 0;
     wdata->scratch_bpp = 0;
@@ -51,12 +53,15 @@ static bool KITTY_EnsureRGBScratch(SDL_WindowData *wdata, int w, int h, int bpp)
     if (!wdata || w <= 0 || h <= 0 || (bpp != 3 && bpp != 4)) {
         return false;
     }
-    if (wdata->rgb_scratch && wdata->rgb_w == w && wdata->rgb_h == h && wdata->scratch_bpp == bpp) {
+    if (wdata->rgb_scratch && wdata->rgb_back && wdata->rgb_w == w && wdata->rgb_h == h &&
+        wdata->scratch_bpp == bpp) {
         return true;
     }
     KITTY_FreeRGBScratch(wdata);
     wdata->rgb_scratch = (Uint8 *)SDL_malloc(need);
-    if (!wdata->rgb_scratch) {
+    wdata->rgb_back = (Uint8 *)SDL_malloc(need);
+    if (!wdata->rgb_scratch || !wdata->rgb_back) {
+        KITTY_FreeRGBScratch(wdata);
         return false;
     }
     wdata->rgb_w = w;
@@ -65,6 +70,17 @@ static bool KITTY_EnsureRGBScratch(SDL_WindowData *wdata, int w, int h, int bpp)
     wdata->rgb_valid = false;
     wdata->live_image_id = 0;
     return true;
+}
+
+static void KITTY_SwapRGBScratch(SDL_WindowData *wdata)
+{
+    Uint8 *tmp;
+    if (!wdata) {
+        return;
+    }
+    tmp = wdata->rgb_scratch;
+    wdata->rgb_scratch = wdata->rgb_back;
+    wdata->rgb_back = tmp;
 }
 
 bool SDL_KITTY_CreateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window, SDL_PixelFormat *format, void **pixels, int *pitch)
@@ -135,6 +151,52 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         full.w = surface->w;
         full.h = surface->h;
 
+        /*
+         * Tile-diff for full-frame presents (MAME soft always flips the whole
+         * surface). Convert into rgb_back, memcmp 32x32 tiles vs rgb_scratch,
+         * then sparse a=f on the bbox — or skip if identical.
+         */
+        {
+            const float app_cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
+            const bool want_diff = KITTY_SelectFbDiff(SDL_getenv("SDL_KITTY_FB_DIFF")) &&
+                                   wdata->rgb_valid && wdata->rgb_back &&
+                                   app_cov >= 0.90f;
+            if (want_diff) {
+                const bool conv_ok = use_rgba
+                                         ? KITTY_ConvertSurfaceRectToRGBA(surface, &full, wdata->rgb_back)
+                                         : KITTY_ConvertSurfaceRectToRGB(surface, &full, wdata->rgb_back);
+                if (!conv_ok) {
+                    return SDL_SetError("kitty RGB convert failed");
+                }
+                {
+                    const int tile = KITTY_SelectFbDiffTile(SDL_getenv("SDL_KITTY_FB_DIFF_TILE"));
+                    const float cover = KITTY_SelectFbDiffCover(SDL_getenv("SDL_KITTY_FB_DIFF_COVER"));
+                    const KITTY_DiffOutcome diff =
+                        KITTY_TileDiffBBox(wdata->rgb_scratch, wdata->rgb_back, surface->w, surface->h,
+                                           bpp, tile, cover, &dirty);
+                    if (diff == KITTY_DIFF_NONE) {
+                        if (KITTY_DebugEnabled()) {
+                            static int skips;
+                            if (skips < 4 || (skips % 120) == 0) {
+                                SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                                             "kitty: present diff_skip (identical FB)");
+                            }
+                            skips++;
+                        }
+                        return true;
+                    }
+                    KITTY_SwapRGBScratch(wdata); /* scratch now holds the new frame */
+                    if (diff == KITTY_DIFF_FULL) {
+                        dirty = full;
+                        convert_mode = KITTY_CONVERT_FULL;
+                    } else {
+                        convert_mode = KITTY_CONVERT_DIRTY;
+                    }
+                }
+                goto kitty_present_after_convert;
+            }
+        }
+
         if (convert_mode == KITTY_CONVERT_DIRTY) {
             const bool conv_ok = use_rgba
                                      ? KITTY_ConvertSurfaceRectToRGBA(surface, &dirty, wdata->rgb_scratch)
@@ -153,6 +215,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             dirty = full;
         }
 
+    kitty_present_after_convert:
         convert_px = (size_t)dirty.w * (size_t)dirty.h;
         upload_px = (size_t)surface->w * (size_t)surface->h;
         wire_mode = (convert_mode == KITTY_CONVERT_DIRTY) ? KITTY_WIRE_DIRTY_CPU : KITTY_WIRE_FULL;
@@ -230,6 +293,8 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 mode_str = "dirty_bw";
             } else if (wire_mode == KITTY_WIRE_DIRTY_CPU) {
                 mode_str = "dirty_cpu";
+            } else if (wire_mode == KITTY_WIRE_DIFF_SKIP) {
+                mode_str = "diff_skip";
             }
             SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
                          "kitty: present #%d %dx%d place=%d mode=%s rects=%d union=%dx%d coverage=%.2f convert_px=%zu upload_px=%zu live=%u pingpong=%d -> %s%s",
