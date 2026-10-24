@@ -84,6 +84,7 @@ static const KITTY_TerminalProfile KITTY_profile_ghostty = {
     .af_max_coverage = 0.40f,
     .af_max_pixels = KITTY_AF_MAX_PX_DEFAULT,
     .keys_on_stdin = true,
+    /* 1.3.1: a=f unimplemented ("ERROR: unimplemented action"); tip #13943 adds it. */
     .silent_af_ok = false,
     .ignore_ioctl_pixels = false,
     .direct_af_when_shm = false,
