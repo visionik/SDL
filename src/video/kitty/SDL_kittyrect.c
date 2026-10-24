@@ -99,6 +99,87 @@ float KITTY_CoverageRatio(int fb_w, int fb_h, const SDL_Rect *union_rect)
     return area / denom;
 }
 
+bool KITTY_FbRectToPlaceCells(int fb_w, int fb_h, const SDL_Rect *fb_rect,
+                              int cols, int rows,
+                              int *out_col0, int *out_row0,
+                              int *out_place_cols, int *out_place_rows)
+{
+    int x0, y0, x1, y1;
+    int col0, row0, col1, row1;
+
+    if (!fb_rect || !out_col0 || !out_row0 || !out_place_cols || !out_place_rows ||
+        fb_w <= 0 || fb_h <= 0 || cols <= 0 || rows <= 0 ||
+        fb_rect->w <= 0 || fb_rect->h <= 0) {
+        return false;
+    }
+
+    x0 = fb_rect->x;
+    y0 = fb_rect->y;
+    x1 = fb_rect->x + fb_rect->w;
+    y1 = fb_rect->y + fb_rect->h;
+    if (x0 < 0) {
+        x0 = 0;
+    }
+    if (y0 < 0) {
+        y0 = 0;
+    }
+    if (x1 > fb_w) {
+        x1 = fb_w;
+    }
+    if (y1 > fb_h) {
+        y1 = fb_h;
+    }
+    if (x1 <= x0 || y1 <= y0) {
+        return false;
+    }
+
+    col0 = (x0 * cols) / fb_w;
+    row0 = (y0 * rows) / fb_h;
+    col1 = (x1 * cols + fb_w - 1) / fb_w;
+    row1 = (y1 * rows + fb_h - 1) / fb_h;
+    if (col1 > cols) {
+        col1 = cols;
+    }
+    if (row1 > rows) {
+        row1 = rows;
+    }
+    if (col1 <= col0) {
+        col1 = col0 + 1;
+    }
+    if (row1 <= row0) {
+        row1 = row0 + 1;
+    }
+    if (col0 >= cols) {
+        col0 = cols - 1;
+        col1 = cols;
+    }
+    if (row0 >= rows) {
+        row0 = rows - 1;
+        row1 = rows;
+    }
+
+    *out_col0 = col0;
+    *out_row0 = row0;
+    *out_place_cols = col1 - col0;
+    *out_place_rows = row1 - row0;
+    return *out_place_cols > 0 && *out_place_rows > 0;
+}
+
+bool KITTY_FbPixelToCellCursor(int x, int y, int cell_w, int cell_h,
+                               int *out_col0, int *out_row0,
+                               int *out_X, int *out_Y)
+{
+    if (!out_col0 || !out_row0 || !out_X || !out_Y || cell_w <= 0 || cell_h <= 0 ||
+        x < 0 || y < 0) {
+        return false;
+    }
+    *out_col0 = x / cell_w;
+    *out_row0 = y / cell_h;
+    *out_X = x % cell_w;
+    *out_Y = y % cell_h;
+    return true;
+}
+
 bool KITTY_SelectFbDiff(const char *env, bool default_on)
 {
     if (!env || !env[0]) {

@@ -39,6 +39,18 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
 /* Edit root frame (r=1) with packed pixels for rectangle x,y,s,v (Kitty a=f). */
 bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                                const Uint8 *packed_rgb, int x, int y, int rw, int rh, int kitty_f);
+/*
+ * Experiment: transmit+place a packed rect as its own image at a cursor cell.
+ * place_col/row are 1-based CSI CUP; place_cols/rows 0 = natural pixel size;
+ * cell_X/Y are in-cell pixel offsets (0 when unused). z stacks above the base.
+ */
+bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
+                                const Uint8 *packed_rgb, int rw, int rh,
+                                int place_col, int place_row,
+                                int place_cols, int place_rows,
+                                int cell_X, int cell_Y, int z, int kitty_f);
+/* Delete active dirty_at overlay images; clears wdata->overlay_count. */
+void KITTY_ClearOverlays(SDL_VideoData *vdata, SDL_WindowData *wdata);
 /* Re-place existing image with new c/r (no pixel upload). */
 bool KITTY_PlaceExistingImage(SDL_VideoData *vdata, Uint32 image_id,
                               int place_cols, int place_rows);

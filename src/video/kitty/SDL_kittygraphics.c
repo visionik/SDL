@@ -814,6 +814,85 @@ bool KITTY_DeleteImage(int fd, Uint32 image_id)
     return KITTY_WriteAll(fd, cmd, (size_t)n);
 }
 
+void KITTY_ClearOverlays(SDL_VideoData *vdata, SDL_WindowData *wdata)
+{
+    int i;
+    if (!wdata) {
+        return;
+    }
+    if (vdata) {
+        for (i = 0; i < wdata->overlay_count; ++i) {
+            if (wdata->overlay_ids[i] != 0) {
+                KITTY_DeleteImage(vdata->tty_fd, wdata->overlay_ids[i]);
+            }
+        }
+    }
+    wdata->overlay_count = 0;
+}
+
+bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
+                                const Uint8 *packed_rgb, int rw, int rh,
+                                int place_col, int place_row,
+                                int place_cols, int place_rows,
+                                int cell_X, int cell_Y, int z, int kitty_f)
+{
+    const int bpp = (kitty_f == 32) ? 4 : 3;
+    const size_t payload_len = (size_t)rw * (size_t)rh * (size_t)bpp;
+    char cup[32];
+    char extra[64];
+    int cup_len;
+    int extra_len;
+    size_t max_direct;
+    size_t chunk_bytes;
+
+    if (kitty_f != 24 && kitty_f != 32) {
+        kitty_f = 24;
+    }
+    if (!vdata || !packed_rgb || image_id == 0 || rw <= 0 || rh <= 0 ||
+        place_col < 1 || place_row < 1) {
+        return SDL_SetError("invalid RGB rect place");
+    }
+
+    max_direct = (vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
+                     ? vdata->term_profile->max_direct_bytes
+                     : ((size_t)1920 * 1080 * 4);
+    if (payload_len > max_direct) {
+        return SDL_SetError(
+            "kitty: refusing direct a=T overlay of %dx%d (~%zu bytes)",
+            rw, rh, payload_len);
+    }
+
+    if (cell_X < 0) {
+        cell_X = 0;
+    }
+    if (cell_Y < 0) {
+        cell_Y = 0;
+    }
+    if (z == 0) {
+        z = 10; /* above default base placements */
+    }
+
+    cup_len = SDL_snprintf(cup, sizeof(cup), "\033[%d;%dH", place_row, place_col);
+    if (cup_len <= 0 || !KITTY_WriteAll(vdata->tty_fd, cup, (size_t)cup_len)) {
+        return false;
+    }
+
+    if (cell_X > 0 || cell_Y > 0) {
+        extra_len = SDL_snprintf(extra, sizeof(extra), "z=%d,X=%d,Y=%d", z, cell_X, cell_Y);
+    } else {
+        extra_len = SDL_snprintf(extra, sizeof(extra), "z=%d", z);
+    }
+    if (extra_len <= 0) {
+        return SDL_SetError("overlay extra keys failed");
+    }
+
+    chunk_bytes = KITTY_ProfileApcChunkBytes(vdata->term_profile);
+    return KITTY_TransmitDirectPayload(vdata->tty_fd, image_id, rw, rh,
+                                       place_cols, place_rows, extra,
+                                       packed_rgb, payload_len, kitty_f,
+                                       false, chunk_bytes);
+}
+
 bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                                const Uint8 *packed_rgb, int x, int y, int rw, int rh, int kitty_f)
 {

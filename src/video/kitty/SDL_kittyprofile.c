@@ -112,6 +112,8 @@ static const KITTY_TerminalProfile KITTY_profile_wezterm = {
     .silent_af_ok = false,
     .ignore_ioctl_pixels = false,
     .direct_af_when_shm = false,
+    /* Stacked a=T dirty rects until upstream invalidates ImageData.hash. */
+    .dirty_at_overlays = true,
     KITTY_PROFILE_TUNABLES
 };
 

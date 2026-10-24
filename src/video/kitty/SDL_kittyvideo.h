@@ -81,6 +81,10 @@ typedef struct SDL_VideoData
     size_t tty_pending_len;
 } SDL_VideoData;
 
+/* Stacked a=T dirty overlays (dirty_at_overlays experiment). Ids 100+. */
+#define KITTY_OVERLAY_MAX 16
+#define KITTY_OVERLAY_ID_BASE 100u
+
 typedef struct SDL_WindowData
 {
     SDL_Window *sdl_window;
@@ -97,6 +101,9 @@ typedef struct SDL_WindowData
     bool rgb_valid;
     /* Image id of the last successful full place (Step 1b a=f target). */
     Uint32 live_image_id;
+    /* Active dirty_at overlay image ids from the previous present. */
+    Uint32 overlay_ids[KITTY_OVERLAY_MAX];
+    int overlay_count;
 } SDL_WindowData;
 
 #endif // SDL_kittyvideo_h_

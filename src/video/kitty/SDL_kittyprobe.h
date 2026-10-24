@@ -53,6 +53,12 @@ KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
  */
 bool KITTY_SelectDirtyBW(const char *env, bool frame_edit_ok);
 
+/*
+ * Dirty-AT overlays: env SDL_KITTY_DIRTY_AT forces on/off; if unset, follow
+ * profile dirty_at_overlays (WezTerm experiment).
+ */
+bool KITTY_SelectDirtyAT(const char *env, bool profile_default);
+
 /* SDL_KITTY_PINGPONG=1 restores delete+swap presents; default is same-(i,p) replace. */
 bool KITTY_SelectPingPong(const char *env, bool default_on);
 

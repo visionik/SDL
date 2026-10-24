@@ -64,6 +64,13 @@ typedef struct KITTY_TerminalProfile
     /* Allow direct a=f while transmit_mode is SHM (Rex true; Kitty false). */
     bool direct_af_when_shm;
 
+    /*
+     * Experiment: sparse dirty updates as stacked a=T overlays (one image per
+     * dirty rect) when a=f cannot refresh the display (WezTerm hash bug).
+     * Env SDL_KITTY_DIRTY_AT=0|1 overrides.
+     */
+    bool dirty_at_overlays;
+
     /* Max raw size for SHM-fail → direct fallback when !prefer_direct. */
     size_t direct_fallback_max_bytes;
 

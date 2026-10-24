@@ -46,6 +46,7 @@ static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
     wdata->scratch_bpp = 0;
     wdata->rgb_valid = false;
     wdata->live_image_id = 0;
+    wdata->overlay_count = 0;
 }
 
 static bool KITTY_EnsureRGBScratch(SDL_WindowData *wdata, int w, int h, int bpp)
@@ -322,6 +323,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     wire_mode = KITTY_WIRE_DIRTY_BW;
                     upload_px = multi_upload;
                     wdata->rgb_valid = true;
+                    KITTY_ClearOverlays(vdata, wdata);
                 }
             }
 
@@ -346,11 +348,126 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                         wire_mode = KITTY_WIRE_DIRTY_BW;
                         upload_px = convert_px;
                         wdata->rgb_valid = true;
+                        /* a=f patched the base; drop any leftover overlays. */
+                        KITTY_ClearOverlays(vdata, wdata);
                     } else {
                         SDL_ClearError();
                     }
                     SDL_free(packed);
                     packed = NULL;
+                }
+            }
+
+            /* WezTerm experiment: stacked a=T overlays when a=f cannot paint. */
+            if (!ok) {
+                const bool want_at =
+                    convert_mode == KITTY_CONVERT_DIRTY &&
+                    KITTY_SelectDirtyAT(SDL_getenv("SDL_KITTY_DIRTY_AT"),
+                                        vdata->term_profile &&
+                                            vdata->term_profile->dirty_at_overlays) &&
+                    wdata->placed &&
+                    wdata->live_image_id != 0 &&
+                    cov < max_cov &&
+                    convert_px <= max_af_px;
+                if (want_at) {
+                    const SDL_Rect *at_rects = rects;
+                    int at_n = numrects;
+                    SDL_Rect one = dirty;
+                    int placed_n = 0;
+                    size_t at_upload = 0;
+                    bool at_ok = true;
+                    int ri;
+
+                    if (!at_rects || at_n <= 0) {
+                        at_rects = &one;
+                        at_n = 1;
+                    }
+                    if (at_n > KITTY_OVERLAY_MAX) {
+                        at_ok = false;
+                    }
+
+                    /* Drop previous overlays before placing this frame's set. */
+                    KITTY_ClearOverlays(vdata, wdata);
+
+                    for (ri = 0; at_ok && ri < at_n; ++ri) {
+                        SDL_Rect clipped;
+                        SDL_Rect fb = { 0, 0, surface->w, surface->h };
+                        size_t rpx;
+                        size_t packed_len = 0;
+                        bool pack_ok = false;
+                        int col0 = 0, row0 = 0, place_c = 0, place_r = 0;
+                        int cell_X = 0, cell_Y = 0;
+                        Uint32 oid;
+
+                        if (!SDL_GetRectIntersection(&at_rects[ri], &fb, &clipped) ||
+                            clipped.w <= 0 || clipped.h <= 0) {
+                            continue;
+                        }
+                        rpx = (size_t)clipped.w * (size_t)clipped.h;
+                        if (rpx == 0 || at_upload + rpx > max_af_px) {
+                            at_ok = false;
+                            break;
+                        }
+
+                        if (vdata->place_cells && vdata->cols > 0 && vdata->rows > 0) {
+                            if (!KITTY_FbRectToPlaceCells(surface->w, surface->h, &clipped,
+                                                         vdata->cols, vdata->rows,
+                                                         &col0, &row0, &place_c, &place_r)) {
+                                at_ok = false;
+                                break;
+                            }
+                        } else if (vdata->cell_w > 0 && vdata->cell_h > 0) {
+                            if (!KITTY_FbPixelToCellCursor(clipped.x, clipped.y,
+                                                          vdata->cell_w, vdata->cell_h,
+                                                          &col0, &row0, &cell_X, &cell_Y)) {
+                                at_ok = false;
+                                break;
+                            }
+                            place_c = 0;
+                            place_r = 0;
+                        } else {
+                            at_ok = false;
+                            break;
+                        }
+
+                        packed = (Uint8 *)SDL_malloc(rpx * (size_t)bpp);
+                        if (!packed) {
+                            at_ok = false;
+                            break;
+                        }
+                        pack_ok = use_rgba
+                                      ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h,
+                                                           &clipped, packed, rpx * (size_t)bpp, &packed_len)
+                                      : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h,
+                                                          &clipped, packed, rpx * (size_t)bpp, &packed_len);
+                        oid = wdata->overlay_ids[placed_n];
+                        if (!pack_ok ||
+                            !KITTY_TransmitRGBRectPlace(vdata, oid, packed,
+                                                       clipped.w, clipped.h,
+                                                       col0 + 1, row0 + 1,
+                                                       place_c, place_r,
+                                                       cell_X, cell_Y, 10, kitty_f)) {
+                            at_ok = false;
+                            SDL_ClearError();
+                        } else {
+                            at_upload += rpx;
+                            placed_n++;
+                        }
+                        SDL_free(packed);
+                        packed = NULL;
+                    }
+
+                    if (at_ok && placed_n > 0) {
+                        ok = true;
+                        wire_mode = KITTY_WIRE_DIRTY_AT;
+                        upload_px = at_upload;
+                        wdata->overlay_count = placed_n;
+                        wdata->rgb_valid = true;
+                    } else if (placed_n > 0) {
+                        /* Partial failure — clear what we placed and fall through. */
+                        wdata->overlay_count = placed_n;
+                        KITTY_ClearOverlays(vdata, wdata);
+                    }
                 }
             }
         }
@@ -360,6 +477,9 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 SDL_getenv("SDL_KITTY_PINGPONG"),
                 vdata->term_profile && vdata->term_profile->pingpong);
             Uint32 prev = 0;
+
+            /* Full replace must not leave stale overlays on top of the new base. */
+            KITTY_ClearOverlays(vdata, wdata);
 
             if (pingpong) {
                 wdata->image_index ^= 1;
@@ -378,7 +498,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 wdata->placed = true;
                 wdata->rgb_valid = true;
                 wdata->live_image_id = image_id;
-                if (wire_mode != KITTY_WIRE_DIRTY_BW) {
+                if (wire_mode != KITTY_WIRE_DIRTY_BW && wire_mode != KITTY_WIRE_DIRTY_AT) {
                     wire_mode = (convert_mode == KITTY_CONVERT_DIRTY) ? KITTY_WIRE_DIRTY_CPU : KITTY_WIRE_FULL;
                 }
             }
@@ -396,6 +516,8 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             const char *mode_str = "full";
             if (wire_mode == KITTY_WIRE_DIRTY_BW) {
                 mode_str = "dirty_bw";
+            } else if (wire_mode == KITTY_WIRE_DIRTY_AT) {
+                mode_str = "dirty_at";
             } else if (wire_mode == KITTY_WIRE_DIRTY_CPU) {
                 mode_str = "dirty_cpu";
             } else if (wire_mode == KITTY_WIRE_DIFF_SKIP) {

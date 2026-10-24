@@ -83,6 +83,13 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
     data->scratch_bpp = 0;
     data->rgb_valid = false;
     data->live_image_id = 0;
+    data->overlay_count = 0;
+    {
+        int oi;
+        for (oi = 0; oi < KITTY_OVERLAY_MAX; ++oi) {
+            data->overlay_ids[oi] = KITTY_OVERLAY_ID_BASE + (Uint32)oi;
+        }
+    }
     window->internal = data;
 
     vdata->focus_window = window;

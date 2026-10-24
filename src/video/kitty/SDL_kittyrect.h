@@ -40,6 +40,7 @@ typedef enum KITTY_PresentWireMode
     KITTY_WIRE_FULL = 0,  /* full-frame a=T */
     KITTY_WIRE_DIRTY_CPU, /* dirty convert, full a=T (Step 1a) */
     KITTY_WIRE_DIRTY_BW,  /* dirty convert + a=f rect edit (Step 1b) */
+    KITTY_WIRE_DIRTY_AT,  /* dirty convert + stacked a=T overlays (experiment) */
     KITTY_WIRE_DIFF_SKIP  /* tile-diff found no changes; upload skipped */
 } KITTY_PresentWireMode;
 
@@ -55,6 +56,22 @@ bool KITTY_UnionRects(int fb_w, int fb_h, const SDL_Rect *rects, int numrects, S
 
 /* area(union) / (fb_w*fb_h); 1 if fb empty. */
 float KITTY_CoverageRatio(int fb_w, int fb_h, const SDL_Rect *union_rect);
+
+/*
+ * Map an FB pixel rect onto the place_cells stretch grid (cols×rows).
+ * out_col0/out_row0 are 0-based; place_cols/rows are at least 1 when true.
+ */
+bool KITTY_FbRectToPlaceCells(int fb_w, int fb_h, const SDL_Rect *fb_rect,
+                              int cols, int rows,
+                              int *out_col0, int *out_row0,
+                              int *out_place_cols, int *out_place_rows);
+
+/*
+ * Map FB pixel (x,y) to a 0-based cell + in-cell pixel offset for 1:1 place.
+ */
+bool KITTY_FbPixelToCellCursor(int x, int y, int cell_w, int cell_h,
+                               int *out_col0, int *out_row0,
+                               int *out_X, int *out_Y);
 
 /*
  * 32x32 (or tile) memcmp of prev vs next tightly packed RGB/RGBA frames.
