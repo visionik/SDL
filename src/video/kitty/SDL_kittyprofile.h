@@ -2,12 +2,16 @@
   Simple DirectMedia Layer
   Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
 */
+#ifdef KITTY_PROFILE_STANDALONE
+#include <SDL3/SDL.h>
+#else
 #include "SDL_internal.h"
+#endif
 
 #ifndef SDL_kittyprofile_h_
 #define SDL_kittyprofile_h_
 
-#ifdef SDL_VIDEO_DRIVER_KITTY
+#if defined(SDL_VIDEO_DRIVER_KITTY) || defined(KITTY_PROFILE_STANDALONE)
 
 #include <stddef.h>
 
@@ -21,9 +25,11 @@ typedef enum KITTY_TerminalKind
 } KITTY_TerminalKind;
 
 /*
- * Static per-host policy. Runtime probes (a=q / SHM / a=f) still decide what
- * is *available*; this struct decides defaults and quirk thresholds.
- * See docs/terminals.md.
+ * Per-host policy + tunable defaults. Runtime probes (a=q / SHM / a=f) still
+ * decide what is *available*; this struct decides defaults and quirk thresholds.
+ *
+ * Canonical file: config/terminals.toml (see docs/terminal-profiles.md).
+ * Env SDL_KITTY_* still wins last.
  */
 typedef struct KITTY_TerminalProfile
 {
@@ -49,10 +55,80 @@ typedef struct KITTY_TerminalProfile
 
     /* Treat silent a=f probe as success (Rex). */
     bool silent_af_ok;
+
+    /* --- §B host conditionals (Phase 4 wires call sites) --- */
+
+    /* Ignore TIOCGWINSZ xpixel/ypixel (Rex HiDPI stub). */
+    bool ignore_ioctl_pixels;
+
+    /* Allow direct a=f while transmit_mode is SHM (Rex true; Kitty false). */
+    bool direct_af_when_shm;
+
+    /* Max raw size for SHM-fail → direct fallback when !prefer_direct. */
+    size_t direct_fallback_max_bytes;
+
+    /* --- §C tunables (usually from [defaults]; Phase 4 wires call sites) --- */
+
+    size_t apc_chunk_bytes;
+    int probe_timeout_ms;
+    int drain_passes;
+    int drain_quiet_us;
+    int stub_winch_iters;
+    int stub_winch_delay_ms;
+    int stub_cols;
+    int stub_rows;
+    int key_hold_ms;
+    bool fb_diff;
+    int fb_diff_tile;
+    float fb_diff_cover;
+    int tty_pending_max;
+    int window_fallback_w;
+    int window_fallback_h;
+    bool place_cells;
+    bool pingpong;
+    /* Protocol: terminal unlinks after read — client must not unlink on success. */
+    bool shm_unlink_after_send;
+
+    /* Docs / DEBUG only; may be NULL. */
+    const char *notes;
 } KITTY_TerminalProfile;
 
-/* Detect from TERM_PROGRAM / TERM. Never returns NULL. */
+/* Load TOML overlays (search paths / SDL_KITTY_PROFILES). Idempotent. */
+void KITTY_EnsureTerminalProfilesLoaded(void);
+
+/* Overlay or replace from an explicit path. Returns true on success. */
+bool KITTY_LoadTerminalProfiles(const char *path);
+
+/* Drop loaded table; next Ensure/Detect uses builtins only. */
+void KITTY_ResetTerminalProfilesToBuiltin(void);
+
+/* Detect from TERM_PROGRAM / TERM (+ loaded matchers). Never returns NULL. */
 const KITTY_TerminalProfile *KITTY_DetectTerminalProfile(void);
 
-#endif /* SDL_VIDEO_DRIVER_KITTY */
+/* "builtin" or path of last successful load (for DEBUG). Never NULL. */
+const char *KITTY_TerminalProfilesSource(void);
+
+/* True when a loaded [[terminal]] matcher hits the current env (ProbeSupport). */
+bool KITTY_EnvMatchesLoadedProfile(void);
+
+/* Builtin TERM_PROGRAM / TERM / KITTY_WINDOW_ID heuristics when no TOML loaded. */
+bool KITTY_BuiltinEnvLooksLikeKittyHost(void);
+
+static inline size_t KITTY_ProfileApcChunkBytes(const KITTY_TerminalProfile *p)
+{
+    return (p && p->apc_chunk_bytes > 0) ? p->apc_chunk_bytes : ((size_t)2 * 1024 * 1024);
+}
+
+static inline size_t KITTY_ProfileDirectFallbackBytes(const KITTY_TerminalProfile *p)
+{
+    return (p && p->direct_fallback_max_bytes > 0) ? p->direct_fallback_max_bytes
+                                                   : ((size_t)256 * 1024);
+}
+
+static inline int KITTY_ProfileProbeAttempts(const KITTY_TerminalProfile *p)
+{
+    return (p && p->probe_timeout_ms > 0) ? p->probe_timeout_ms : 40;
+}
+
+#endif /* SDL_VIDEO_DRIVER_KITTY || KITTY_PROFILE_STANDALONE */
 #endif /* SDL_kittyprofile_h_ */

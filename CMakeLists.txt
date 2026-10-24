@@ -3552,7 +3552,10 @@ if(SDL_VIDEO)
     sdl_glob_sources(
       "${SDL3_SOURCE_DIR}/src/video/kitty/*.c"
       "${SDL3_SOURCE_DIR}/src/video/kitty/*.h"
+      "${SDL3_SOURCE_DIR}/src/video/kitty/tomlc17/*.c"
+      "${SDL3_SOURCE_DIR}/src/video/kitty/tomlc17/*.h"
     )
+    sdl_include_directories(PRIVATE "${SDL3_SOURCE_DIR}/src/video/kitty/tomlc17")
     find_package(ZLIB)
     if(ZLIB_FOUND)
       sdl_link_dependency(kitty_zlib LIBS ZLIB::ZLIB PKG_CONFIG_SPECS zlib)

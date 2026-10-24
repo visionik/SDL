@@ -27,6 +27,7 @@
 #include "../../events/SDL_windowevents_c.h"
 #include "../SDL_sysvideo.h"
 #include "SDL_kittygraphics.h"
+#include "SDL_kittyprofile.h"
 #include "SDL_kittywindow.h"
 
 bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_PropertiesID create_props)
@@ -58,8 +59,12 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
         window->w = vdata->pixel_w;
         window->h = vdata->pixel_h;
     } else if (window->w <= 1 || window->h <= 1) {
-        window->w = 640;
-        window->h = 480;
+        window->w = (vdata->term_profile && vdata->term_profile->window_fallback_w > 0)
+                        ? vdata->term_profile->window_fallback_w
+                        : 640;
+        window->h = (vdata->term_profile && vdata->term_profile->window_fallback_h > 0)
+                        ? vdata->term_profile->window_fallback_h
+                        : 480;
     }
     window->windowed.w = window->floating.w = window->w;
     window->windowed.h = window->floating.h = window->h;

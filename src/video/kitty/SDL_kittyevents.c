@@ -29,6 +29,7 @@
 #include "SDL_kittyevents_c.h"
 #include "SDL_kittygraphics.h"
 #include "SDL_kittyprobe.h"
+#include "SDL_kittyprofile.h"
 
 #include <errno.h>
 #include <unistd.h>
@@ -58,7 +59,7 @@ static SDL_Window *KITTY_FocusWindow(SDL_VideoDevice *_this)
  * state. A same-queue down+up leaves state cleared. Keep keys down for a
  * minimum time so at least one input poll sees them pressed.
  */
-#define KITTY_KEY_HOLD_MS  80u
+#define KITTY_KEY_HOLD_MS_DEFAULT 80u
 #define KITTY_KEY_HOLD_MAX 64
 typedef struct KITTY_KeyHold
 {
@@ -70,6 +71,18 @@ typedef struct KITTY_KeyHold
 
 static KITTY_KeyHold KITTY_key_holds[KITTY_KEY_HOLD_MAX];
 static int KITTY_key_hold_n;
+
+static Uint32 KITTY_KeyHoldMs(void)
+{
+    SDL_VideoDevice *dev = SDL_GetVideoDevice();
+    if (dev && dev->internal) {
+        SDL_VideoData *vd = (SDL_VideoData *)dev->internal;
+        if (vd->term_profile && vd->term_profile->key_hold_ms > 0) {
+            return (Uint32)vd->term_profile->key_hold_ms;
+        }
+    }
+    return KITTY_KEY_HOLD_MS_DEFAULT;
+}
 
 static KITTY_KeyHold *KITTY_FindHold(SDL_Scancode sc, bool create)
 {
@@ -171,7 +184,7 @@ static void KITTY_ApplyKeyEvent(SDL_Scancode sc, int event_type, bool has_releas
         if (h) {
             h->down = true;
             h->want_up = false;
-            h->earliest_up_ms = now + KITTY_KEY_HOLD_MS;
+            h->earliest_up_ms = now + KITTY_KeyHoldMs();
         }
         return;
     }
@@ -181,7 +194,7 @@ static void KITTY_ApplyKeyEvent(SDL_Scancode sc, int event_type, bool has_releas
     h = KITTY_FindHold(sc, true);
     if (h) {
         h->down = true;
-        h->earliest_up_ms = now + KITTY_KEY_HOLD_MS;
+        h->earliest_up_ms = now + KITTY_KeyHoldMs();
         /* Legacy (no release reports): schedule up after min hold. */
         h->want_up = !has_release;
     }

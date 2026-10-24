@@ -159,7 +159,9 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
          */
         {
             const float app_cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
-            const bool want_diff = KITTY_SelectFbDiff(SDL_getenv("SDL_KITTY_FB_DIFF")) &&
+            const bool want_diff =
+                KITTY_SelectFbDiff(SDL_getenv("SDL_KITTY_FB_DIFF"),
+                                   vdata->term_profile ? vdata->term_profile->fb_diff : true) &&
                                    wdata->rgb_valid && wdata->rgb_back &&
                                    app_cov >= 0.90f;
             if (want_diff) {
@@ -170,8 +172,12 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     return SDL_SetError("kitty RGB convert failed");
                 }
                 {
-                    const int tile = KITTY_SelectFbDiffTile(SDL_getenv("SDL_KITTY_FB_DIFF_TILE"));
-                    const float cover = KITTY_SelectFbDiffCover(SDL_getenv("SDL_KITTY_FB_DIFF_COVER"));
+                    const int tile = KITTY_SelectFbDiffTile(
+                        SDL_getenv("SDL_KITTY_FB_DIFF_TILE"),
+                        vdata->term_profile ? vdata->term_profile->fb_diff_tile : 32);
+                    const float cover = KITTY_SelectFbDiffCover(
+                        SDL_getenv("SDL_KITTY_FB_DIFF_COVER"),
+                        vdata->term_profile ? vdata->term_profile->fb_diff_cover : 0.45f);
                     const KITTY_DiffOutcome diff =
                         KITTY_TileDiffBBox(wdata->rgb_scratch, wdata->rgb_back, surface->w, surface->h,
                                            bpp, tile, cover, &dirty);
@@ -221,10 +227,10 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         upload_px = (size_t)surface->w * (size_t)surface->h;
         wire_mode = (convert_mode == KITTY_CONVERT_DIRTY) ? KITTY_WIRE_DIRTY_CPU : KITTY_WIRE_FULL;
 
-        /* Sparse a=f for small dirty unions. Large unions (fireworks burst
-         * covering most of the FB) must use full a=T/SHM — multi-chunk direct
-         * a=f at ~60Hz paints base64 into Kitty when the APC stream stalls.
-         * Coverage / pixel ceilings come from the host profile. */
+        /* Sparse direct a=f. Prefer per-rect edits when the app passed multiple
+         * dirty rects (alpha_blit discs) — a single union of far-apart rects is
+         * huge and either flashes (full a=T) or risks base64 (giant direct a=f).
+         * SHM a=f blanked on Kitty.app; keep a=f on t=d only. */
         {
             const float cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
             const float max_cov =
@@ -235,42 +241,106 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 (vdata->term_profile && vdata->term_profile->af_max_pixels > 0)
                     ? vdata->term_profile->af_max_pixels
                     : ((size_t)160 * 1024); /* ~160k px ≈ 480KB RGB */
-            const bool af_small = (cov < max_cov) && (convert_px <= max_af_px);
-
-            if (convert_mode == KITTY_CONVERT_DIRTY &&
-                af_small &&
+            /* Kitty SHM sessions: skip direct a=f unless the profile allows it
+             * (direct_af_when_shm). Rex keeps direct a=f; Kitty uses full SHM a=T. */
+            const bool shm_session =
+                (vdata->transmit_mode == KITTY_TRANSMIT_SHM && !vdata->shm_failed);
+            const bool allow_direct_af =
+                !shm_session ||
+                (vdata->term_profile && vdata->term_profile->direct_af_when_shm);
+            const bool want_af =
+                convert_mode == KITTY_CONVERT_DIRTY &&
+                allow_direct_af &&
                 KITTY_SelectDirtyBW(SDL_getenv("SDL_KITTY_DIRTY_BW"), vdata->frame_edit_ok) &&
                 wdata->placed &&
-                wdata->live_image_id != 0) {
-                size_t packed_len = 0;
-                const size_t pack_cap = convert_px * (size_t)bpp;
-                bool pack_ok = false;
-                packed = (Uint8 *)SDL_malloc(pack_cap);
-                if (packed) {
+                wdata->live_image_id != 0;
+
+            if (want_af && rects && numrects > 1) {
+                bool multi_ok = true;
+                size_t multi_upload = 0;
+                int ri;
+                SDL_Rect fb = { 0, 0, surface->w, surface->h };
+
+                for (ri = 0; ri < numrects && multi_ok; ++ri) {
+                    SDL_Rect clipped;
+                    size_t rpx;
+                    size_t packed_len = 0;
+                    bool pack_ok = false;
+
+                    if (!SDL_GetRectIntersection(&rects[ri], &fb, &clipped) ||
+                        clipped.w <= 0 || clipped.h <= 0) {
+                        continue;
+                    }
+                    rpx = (size_t)clipped.w * (size_t)clipped.h;
+                    if (rpx > max_af_px) {
+                        multi_ok = false;
+                        break;
+                    }
+                    packed = (Uint8 *)SDL_malloc(rpx * (size_t)bpp);
+                    if (!packed) {
+                        multi_ok = false;
+                        break;
+                    }
                     pack_ok = use_rgba
-                                  ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h, &dirty,
-                                                       packed, pack_cap, &packed_len)
-                                  : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h, &dirty,
-                                                      packed, pack_cap, &packed_len);
+                                  ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h,
+                                                       &clipped, packed, rpx * (size_t)bpp, &packed_len)
+                                  : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h,
+                                                      &clipped, packed, rpx * (size_t)bpp, &packed_len);
+                    if (!pack_ok ||
+                        !KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed,
+                                                   clipped.x, clipped.y, clipped.w, clipped.h,
+                                                   kitty_f)) {
+                        multi_ok = false;
+                        SDL_ClearError();
+                    } else {
+                        multi_upload += rpx;
+                    }
+                    SDL_free(packed);
+                    packed = NULL;
                 }
-                if (pack_ok &&
-                    KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed,
-                                              dirty.x, dirty.y, dirty.w, dirty.h, kitty_f)) {
+
+                if (multi_ok && multi_upload > 0) {
                     ok = true;
                     wire_mode = KITTY_WIRE_DIRTY_BW;
-                    upload_px = convert_px;
+                    upload_px = multi_upload;
                     wdata->rgb_valid = true;
-                } else {
-                    /* Fall back to full a=T. */
-                    SDL_ClearError();
                 }
-                SDL_free(packed);
-                packed = NULL;
+            }
+
+            if (!ok && want_af) {
+                const bool af_small = (cov < max_cov) && (convert_px <= max_af_px);
+                if (af_small) {
+                    size_t packed_len = 0;
+                    const size_t pack_cap = convert_px * (size_t)bpp;
+                    bool pack_ok = false;
+                    packed = (Uint8 *)SDL_malloc(pack_cap);
+                    if (packed) {
+                        pack_ok = use_rgba
+                                      ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h,
+                                                           &dirty, packed, pack_cap, &packed_len)
+                                      : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h,
+                                                          &dirty, packed, pack_cap, &packed_len);
+                    }
+                    if (pack_ok &&
+                        KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed,
+                                                  dirty.x, dirty.y, dirty.w, dirty.h, kitty_f)) {
+                        ok = true;
+                        wire_mode = KITTY_WIRE_DIRTY_BW;
+                        upload_px = convert_px;
+                        wdata->rgb_valid = true;
+                    } else {
+                        SDL_ClearError();
+                    }
+                    SDL_free(packed);
+                    packed = NULL;
+                }
             }
         }
 
         if (!ok) {
-            const bool pingpong = KITTY_SelectPingPong(SDL_getenv("SDL_KITTY_PINGPONG"));
+            const bool pingpong = KITTY_SelectPingPong(
+                SDL_getenv("SDL_KITTY_PINGPONG"),
+                vdata->term_profile && vdata->term_profile->pingpong);
             Uint32 prev = 0;
 
             if (pingpong) {
@@ -321,7 +391,10 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 numrects, dirty.w, dirty.h, (double)cov,
                 convert_px, upload_px,
                 (unsigned)wdata->live_image_id,
-                KITTY_SelectPingPong(SDL_getenv("SDL_KITTY_PINGPONG")) ? 1 : 0,
+                KITTY_SelectPingPong(SDL_getenv("SDL_KITTY_PINGPONG"),
+                                     vdata->term_profile && vdata->term_profile->pingpong)
+                    ? 1
+                    : 0,
                 ok ? "ok" : "FAIL ",
                 ok ? "" : SDL_GetError());
         }

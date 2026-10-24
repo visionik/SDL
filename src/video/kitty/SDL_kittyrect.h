@@ -65,14 +65,14 @@ KITTY_DiffOutcome KITTY_TileDiffBBox(const Uint8 *prev, const Uint8 *next,
                                      int fb_w, int fb_h, int bpp, int tile,
                                      float cover_limit, SDL_Rect *dirty_out);
 
-/* SDL_KITTY_FB_DIFF: default on; 0/off/false/no disables. */
-bool KITTY_SelectFbDiff(const char *env);
+/* SDL_KITTY_FB_DIFF: env overrides; default_on from profile (usually true). */
+bool KITTY_SelectFbDiff(const char *env, bool default_on);
 
-/* SDL_KITTY_FB_DIFF_TILE: default 32, clamped 8..128. */
-int KITTY_SelectFbDiffTile(const char *env);
+/* SDL_KITTY_FB_DIFF_TILE: env overrides; default_tile from profile (usually 32). */
+int KITTY_SelectFbDiffTile(const char *env, int default_tile);
 
-/* SDL_KITTY_FB_DIFF_COVER: default 0.45, clamped 0.05..1.0. */
-float KITTY_SelectFbDiffCover(const char *env);
+/* SDL_KITTY_FB_DIFF_COVER: env overrides; default_cover from profile (usually 0.45). */
+float KITTY_SelectFbDiffCover(const char *env, float default_cover);
 
 /*
  * Decide full vs dirty convert. dirty_out set when mode is DIRTY (union of rects).

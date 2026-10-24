@@ -162,10 +162,10 @@ bool KITTY_SelectDirtyBW(const char *env, bool frame_edit_ok)
     return frame_edit_ok;
 }
 
-bool KITTY_SelectPingPong(const char *env)
+bool KITTY_SelectPingPong(const char *env, bool default_on)
 {
     if (!env || !*env) {
-        return false; /* default: same-(i,p) replace */
+        return default_on;
     }
     if (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
         SDL_strcasecmp(env, "false") == 0 || SDL_strcasecmp(env, "no") == 0) {
@@ -324,7 +324,8 @@ static bool KITTY_ProbeDirectQuery(SDL_VideoData *data, Uint32 id)
     if (n <= 0 || !KITTY_WriteAllProbe(data->tty_out, cmd, (size_t)n)) {
         return false;
     }
-    return KITTY_AwaitGraphicsQuery(data->tty_in, id, 40) == KITTY_GQ_OK;
+    return KITTY_AwaitGraphicsQuery(data->tty_in, id,
+                                    KITTY_ProfileProbeAttempts(data->term_profile)) == KITTY_GQ_OK;
 }
 
 static bool KITTY_ProbeShmQuery(SDL_VideoData *data, Uint32 id)
@@ -368,7 +369,8 @@ static bool KITTY_ProbeShmQuery(SDL_VideoData *data, Uint32 id)
         !KITTY_WriteAllProbe(data->tty_out, "\033\\\033[c", 5)) {
         goto done;
     }
-    ok = (KITTY_AwaitGraphicsQuery(data->tty_in, id, 40) == KITTY_GQ_OK);
+    ok = (KITTY_AwaitGraphicsQuery(data->tty_in, id,
+                                   KITTY_ProfileProbeAttempts(data->term_profile)) == KITTY_GQ_OK);
 
 done:
     if (map != MAP_FAILED) {
@@ -429,7 +431,13 @@ static bool KITTY_ProbeFrameEdit(SDL_VideoData *data, Uint32 id)
     if (n <= 0 || !KITTY_WriteAllProbe(data->tty_out, cmd, (size_t)n)) {
         return false;
     }
-    (void)KITTY_AwaitGraphicsQuery(data->tty_in, id, 20);
+    {
+        int half = KITTY_ProfileProbeAttempts(data->term_profile) / 2;
+        if (half < 1) {
+            half = 1;
+        }
+        (void)KITTY_AwaitGraphicsQuery(data->tty_in, id, half);
+    }
     KITTY_DrainTty(data->tty_in);
 
     /* Edit root frame (r=1) — this is what dirty BW needs. */
@@ -439,7 +447,8 @@ static bool KITTY_ProbeFrameEdit(SDL_VideoData *data, Uint32 id)
     if (n <= 0 || !KITTY_WriteAllProbe(data->tty_out, cmd, (size_t)n)) {
         goto cleanup;
     }
-    st = KITTY_AwaitGraphicsQuery(data->tty_in, id, 40);
+    st = KITTY_AwaitGraphicsQuery(data->tty_in, id,
+                                  KITTY_ProfileProbeAttempts(data->term_profile));
     if (silent_ok) {
         ok = (st != KITTY_GQ_ERROR);
     } else {

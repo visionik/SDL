@@ -103,11 +103,19 @@ static SDL_VideoDevice *KITTY_CreateDevice(void)
                                                            : KITTY_TRANSMIT_SHM;
     data->shm_failed = false;
     data->frame_edit_ok = false;
-    /* Stretch FB to the cell grid by default; SDL_KITTY_PLACE_CELLS=0 for 1:1. */
+    /* Stretch FB to the cell grid by default (profile.place_cells); env overrides. */
     {
         const char *place = SDL_getenv("SDL_KITTY_PLACE_CELLS");
-        data->place_cells = !(place && (place[0] == '0' || SDL_strcasecmp(place, "false") == 0 ||
-                                        SDL_strcasecmp(place, "no") == 0 || SDL_strcasecmp(place, "off") == 0));
+        const bool profile_place =
+            !data->term_profile || data->term_profile->place_cells;
+        if (!place || !place[0]) {
+            data->place_cells = profile_place;
+        } else if (place[0] == '0' || SDL_strcasecmp(place, "false") == 0 ||
+                   SDL_strcasecmp(place, "no") == 0 || SDL_strcasecmp(place, "off") == 0) {
+            data->place_cells = false;
+        } else {
+            data->place_cells = true;
+        }
     }
     device->internal = data;
 
@@ -166,14 +174,30 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
         return false;
     }
 
-    /* Rex may spawn at stub 80x24 then deliver SIGWINCH once the pane is laid
-     * out. Wait briefly for a non-stub size before enabling mouse / display. */
+    /* Some hosts spawn at a stub grid then deliver SIGWINCH once the pane is
+     * laid out. Wait briefly for a non-stub size before enabling mouse / display. */
     {
-        for (int i = 0; i < 40; ++i) {
-            if (!(data->cols == 80 && data->rows == 24)) {
+        const int stub_iters =
+            (data->term_profile && data->term_profile->stub_winch_iters > 0)
+                ? data->term_profile->stub_winch_iters
+                : 40;
+        const int stub_delay =
+            (data->term_profile && data->term_profile->stub_winch_delay_ms > 0)
+                ? data->term_profile->stub_winch_delay_ms
+                : 25;
+        const int stub_cols =
+            (data->term_profile && data->term_profile->stub_cols > 0)
+                ? data->term_profile->stub_cols
+                : 80;
+        const int stub_rows =
+            (data->term_profile && data->term_profile->stub_rows > 0)
+                ? data->term_profile->stub_rows
+                : 24;
+        for (int i = 0; i < stub_iters; ++i) {
+            if (!(data->cols == stub_cols && data->rows == stub_rows)) {
                 break;
             }
-            SDL_Delay(25);
+            SDL_Delay(stub_delay);
             if (data->got_winch) {
                 data->got_winch = 0;
                 (void)KITTY_QueryTerminalSize(data);
@@ -220,8 +244,10 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
 
     if (KITTY_DebugEnabled()) {
         KITTY_DebugLog(
-            "kitty: init term=%s cols=%d rows=%d fb=%dx%d cell=%dx%d place=%d mouse1016=%d",
+            "kitty: init term=%s profiles=%s prefer_direct=%d cols=%d rows=%d fb=%dx%d cell=%dx%d place=%d mouse1016=%d",
             data->term_profile ? data->term_profile->name : "?",
+            KITTY_TerminalProfilesSource(),
+            data->term_profile && data->term_profile->prefer_direct ? 1 : 0,
             data->cols, data->rows, data->pixel_w, data->pixel_h,
             data->cell_w, data->cell_h, data->place_cells ? 1 : 0,
             data->mouse_sgr_pixels ? 1 : 0);

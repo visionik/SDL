@@ -41,9 +41,8 @@
 #define MAP_FAILED ((void *)-1)
 #endif
 
-/* Rex rejects multi-chunk (m=1) and zlib (o=z) in practice — keep one APC.
- * ~2MiB covers a 640x400 RGB frame in base64 (~960KiB). */
-#define KITTY_CHUNK (2 * 1024 * 1024)
+/* Fallback APC chunk when no profile is available yet. */
+#define KITTY_CHUNK_DEFAULT ((size_t)2 * 1024 * 1024)
 
 static struct termios KITTY_saved_termios;
 static bool KITTY_termios_saved = false;
@@ -106,9 +105,11 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
                                         int place_cols, int place_rows,
                                         const char *extra_keys,
                                         const Uint8 *payload, size_t payload_len,
-                                        int kitty_f, bool home_cursor)
+                                        int kitty_f, bool home_cursor,
+                                        size_t chunk_bytes)
 {
     const size_t b64_len = ((payload_len + 2) / 3) * 4;
+    const size_t chunk_cap = chunk_bytes > 0 ? chunk_bytes : KITTY_CHUNK_DEFAULT;
     char *b64 = (char *)SDL_malloc(b64_len + 1);
     if (!b64) {
         return false;
@@ -130,8 +131,8 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
     bool first = true;
     while (offset < encoded) {
         size_t chunk = encoded - offset;
-        if (chunk > KITTY_CHUNK) {
-            chunk = KITTY_CHUNK;
+        if (chunk > chunk_cap) {
+            chunk = chunk_cap;
         }
         const int more = (offset + chunk < encoded) ? 1 : 0;
         char header[256];
@@ -170,7 +171,8 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
 }
 
 static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
-                                     int place_cols, int place_rows, int kitty_f, bool home_cursor)
+                                     int place_cols, int place_rows, int kitty_f, bool home_cursor,
+                                     size_t chunk_bytes)
 {
     const int bpp = (kitty_f == 32) ? 4 : 3;
     const uLong raw_len = (uLong)w * (uLong)h * (uLong)bpp;
@@ -187,32 +189,43 @@ static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, 
     }
     const bool ok = KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows,
                                                 "o=z", compressed, (size_t)out_len, kitty_f,
-                                                home_cursor);
+                                                home_cursor, chunk_bytes);
     SDL_free(compressed);
     return ok;
 }
 
 static bool KITTY_TransmitDirectRaw(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
-                                    int place_cols, int place_rows, int kitty_f, bool home_cursor)
+                                    int place_cols, int place_rows, int kitty_f, bool home_cursor,
+                                    size_t chunk_bytes)
 {
     const int bpp = (kitty_f == 32) ? 4 : 3;
     const size_t raw_len = (size_t)w * (size_t)h * (size_t)bpp;
     return KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows, "", rgb, raw_len,
-                                       kitty_f, home_cursor);
+                                       kitty_f, home_cursor, chunk_bytes);
 }
 
-static bool KITTY_TransmitShm(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
+/* POSIX SHM transmit. Unique names per call avoid reuse races when the host
+ * is slow to drop the previous object (seen as mid-run SHM→direct base64). */
+static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, int w, int h,
                               int place_cols, int place_rows, int kitty_f, bool home_cursor)
 {
-    char name[64];
+    char name[80];
     const int bpp = (kitty_f == 32) ? 4 : 3;
     const size_t raw_len = (size_t)w * (size_t)h * (size_t)bpp;
+    const Uint32 seq = vdata ? ++vdata->shm_seq : 1u;
     int shm_fd = -1;
     void *map = MAP_FAILED;
     bool ok = false;
+    int fd;
 
-    SDL_snprintf(name, sizeof(name), "/sdl-kitty-%d-%u", (int)getpid(), (unsigned)image_id);
-    shm_unlink(name); // clear stale name if any
+    if (!vdata) {
+        return SDL_SetError("invalid SHM transmit");
+    }
+    fd = vdata->tty_fd;
+
+    SDL_snprintf(name, sizeof(name), "/sdl-kitty-%d-%u-%u", (int)getpid(), (unsigned)image_id,
+                 (unsigned)seq);
+    shm_unlink(name);
 
     shm_fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (shm_fd < 0) {
@@ -273,8 +286,9 @@ done:
     if (shm_fd >= 0) {
         close(shm_fd);
     }
-    // Terminal deletes the object after reading; unlink defensively if transmit failed.
-    if (!ok) {
+    /* Protocol: the terminal unlinks after reading. Only unlink on failure, or
+     * when the profile explicitly asks for client unlink (legacy / buggy hosts). */
+    if (!ok || (vdata->term_profile && vdata->term_profile->shm_unlink_after_send)) {
         shm_unlink(name);
     }
     return ok;
@@ -295,23 +309,11 @@ bool KITTY_ProbeSupport(void)
         return true;
     }
 
-    const char *term_program = SDL_getenv("TERM_PROGRAM");
-    if (term_program) {
-        if (SDL_strcasecmp(term_program, "kitty") == 0 ||
-            SDL_strcasecmp(term_program, "ghostty") == 0 ||
-            SDL_strcasecmp(term_program, "WezTerm") == 0 ||
-            SDL_strcasecmp(term_program, "rex") == 0) {
-            return true;
-        }
-    }
-    if (SDL_getenv("KITTY_WINDOW_ID") != NULL) {
+    /* Prefer matchers from loaded profiles (config/terminals.toml). */
+    if (KITTY_EnvMatchesLoadedProfile()) {
         return true;
     }
-    const char *term = SDL_getenv("TERM");
-    if (term && (SDL_strstr(term, "kitty") || SDL_strstr(term, "ghostty"))) {
-        return true;
-    }
-    return false;
+    return KITTY_BuiltinEnvLooksLikeKittyHost();
 }
 
 static void KITTY_DrainTTY(SDL_VideoData *data)
@@ -522,10 +524,10 @@ bool KITTY_QueryTerminalSize(SDL_VideoData *data)
     data->pixel_w = ws.ws_xpixel;
     data->pixel_h = ws.ws_ypixel;
 
-    /* Rex often fills ws_xpixel/ws_ypixel with cell*grid (HiDPI), which is much
+    /* Some hosts fill ws_xpixel/ws_ypixel with cell*grid (HiDPI), which is much
      * larger than the CSI 14t drawable area and produces frames the host drops.
-     * Ignore ioctl pixels on Rex; prefer CSI / scaled prior area. */
-    if (data->term_profile && data->term_profile->kind == KITTY_TERM_REX) {
+     * Profile ignore_ioctl_pixels (Rex) clears them; prefer CSI / scaled prior. */
+    if (data->term_profile && data->term_profile->ignore_ioctl_pixels) {
         data->pixel_w = 0;
         data->pixel_h = 0;
     }
@@ -620,6 +622,14 @@ static void KITTY_DrainInput(SDL_VideoData *data)
 {
     unsigned char junk[512];
     int passes;
+    const int max_passes =
+        (data && data->term_profile && data->term_profile->drain_passes > 0)
+            ? data->term_profile->drain_passes
+            : 8;
+    const int quiet_us =
+        (data && data->term_profile && data->term_profile->drain_quiet_us > 0)
+            ? data->term_profile->drain_quiet_us
+            : 15000;
 
     if (!data || data->tty_in < 0) {
         return;
@@ -628,7 +638,7 @@ static void KITTY_DrainInput(SDL_VideoData *data)
 
     /* Non-blocking drain, then a few short waits for late host replies
      * (delete / last a=T without q=2 often arrive after restore starts). */
-    for (passes = 0; passes < 8; ++passes) {
+    for (passes = 0; passes < max_passes; ++passes) {
         for (;;) {
             fd_set fds;
             struct timeval tv;
@@ -643,15 +653,14 @@ static void KITTY_DrainInput(SDL_VideoData *data)
                 break;
             }
         }
-        if (passes < 7) {
+        if (passes < max_passes - 1) {
             fd_set fds;
             struct timeval tv;
             FD_ZERO(&fds);
             FD_SET(data->tty_in, &fds);
             tv.tv_sec = 0;
-            tv.tv_usec = 15000;
+            tv.tv_usec = quiet_us;
             if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
-                /* Quiet for 15ms — likely done. */
                 break;
             }
             (void)read(data->tty_in, junk, sizeof(junk));
@@ -822,8 +831,12 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     if (!vdata || !packed_rgb || image_id == 0 || rw <= 0 || rh <= 0 || x < 0 || y < 0) {
         return SDL_SetError("invalid RGB rect edit");
     }
-    /* Same ceiling as TransmitRGB direct fallback — huge a=f chunks also
-     * paint base64 into the tty when the host drops the APC. */
+
+    /* a=f stays on direct (t=d). SHM a=f (t=s) wrote successfully on Kitty.app
+     * but left a blank image; frame_edit_probe also fails there. Full a=T/SHM
+     * is used for large updates instead. */
+
+    /* Direct a=f ceiling — huge chunks paint base64 when the host drops the APC. */
     {
         const size_t max_direct =
             (vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
@@ -848,41 +861,44 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     }
 
     /* Edit root frame in place — do not home cursor or re-place. */
-    while (offset < encoded) {
-        size_t chunk = encoded - offset;
-        char header[256];
-        int header_len;
-        int more;
-        if (chunk > KITTY_CHUNK) {
-            chunk = KITTY_CHUNK;
-        }
-        more = (offset + chunk < encoded) ? 1 : 0;
-        if (first) {
-            /* r=1 edits root; X=1 overwrite; x,y,s,v = dirty bbox in image pixels. */
-            if (more) {
-                header_len = SDL_snprintf(header, sizeof(header),
-                                          "\033_Ga=f,f=%d,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,m=1;",
-                                          kitty_f, (unsigned)image_id, x, y, rw, rh);
-            } else {
-                header_len = SDL_snprintf(header, sizeof(header),
-                                          "\033_Ga=f,f=%d,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d;",
-                                          kitty_f, (unsigned)image_id, x, y, rw, rh);
+    {
+        const size_t chunk_cap = KITTY_ProfileApcChunkBytes(vdata->term_profile);
+        while (offset < encoded) {
+            size_t chunk = encoded - offset;
+            char header[256];
+            int header_len;
+            int more;
+            if (chunk > chunk_cap) {
+                chunk = chunk_cap;
             }
-            first = false;
-        } else {
-            header_len = SDL_snprintf(header, sizeof(header), "\033_Ga=f,m=%d;", more);
+            more = (offset + chunk < encoded) ? 1 : 0;
+            if (first) {
+                /* r=1 edits root; X=1 overwrite; x,y,s,v = dirty bbox in image pixels. */
+                if (more) {
+                    header_len = SDL_snprintf(header, sizeof(header),
+                                              "\033_Ga=f,f=%d,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,m=1;",
+                                              kitty_f, (unsigned)image_id, x, y, rw, rh);
+                } else {
+                    header_len = SDL_snprintf(header, sizeof(header),
+                                              "\033_Ga=f,f=%d,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d;",
+                                              kitty_f, (unsigned)image_id, x, y, rw, rh);
+                }
+                first = false;
+            } else {
+                header_len = SDL_snprintf(header, sizeof(header), "\033_Ga=f,m=%d;", more);
+            }
+            if (header_len <= 0) {
+                SDL_free(b64);
+                return SDL_SetError("frame-edit header snprintf failed");
+            }
+            if (!KITTY_WriteAll(vdata->tty_fd, header, (size_t)header_len) ||
+                !KITTY_WriteAll(vdata->tty_fd, b64 + offset, chunk) ||
+                !KITTY_WriteAll(vdata->tty_fd, "\033\\", 2)) {
+                SDL_free(b64);
+                return false;
+            }
+            offset += chunk;
         }
-        if (header_len <= 0) {
-            SDL_free(b64);
-            return SDL_SetError("frame-edit header snprintf failed");
-        }
-        if (!KITTY_WriteAll(vdata->tty_fd, header, (size_t)header_len) ||
-            !KITTY_WriteAll(vdata->tty_fd, b64 + offset, chunk) ||
-            !KITTY_WriteAll(vdata->tty_fd, "\033\\", 2)) {
-            SDL_free(b64);
-            return false;
-        }
-        offset += chunk;
     }
 
     SDL_free(b64);
@@ -965,22 +981,43 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
                     : ((size_t)1920 * 1080 * 4);
 
             if (vdata->transmit_mode == KITTY_TRANSMIT_SHM && !vdata->shm_failed) {
-                if (KITTY_TransmitShm(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
-                                      kitty_f, home_cursor)) {
+                if (KITTY_TransmitShm(vdata, image_id, rgb, w, h, place_cols, place_rows, kitty_f,
+                                      home_cursor)) {
                     ok = true;
                 } else {
-                    vdata->shm_failed = true;
-                    vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
-                    SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
-                                "kitty: SHM transmit failed (%s); falling back to direct",
-                                SDL_GetError());
+                    /* One retry with a fresh object name (seq bumps inside). */
                     SDL_ClearError();
+                    if (KITTY_TransmitShm(vdata, image_id, rgb, w, h, place_cols, place_rows, kitty_f,
+                                          home_cursor)) {
+                        ok = true;
+                    } else {
+                        const bool prefer_direct =
+                            vdata->term_profile && vdata->term_profile->prefer_direct;
+                        /* Kitty/Ghostty: never fall back to giant direct — that is the
+                         * mid-run base64 flood. Rex may still use direct. */
+                        const bool allow_direct_fallback =
+                            prefer_direct ||
+                            raw_len <= KITTY_ProfileDirectFallbackBytes(vdata->term_profile);
+                        if (!allow_direct_fallback) {
+                            return SDL_SetError(
+                                "kitty: SHM transmit failed (%s); refusing direct fallback "
+                                "of %zux%zu (~%zu bytes) to avoid base64 flood",
+                                SDL_GetError(), (size_t)w, (size_t)h, raw_len);
+                        }
+                        vdata->shm_failed = true;
+                        vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
+                        SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                                    "kitty: SHM transmit failed (%s); falling back to direct",
+                                    SDL_GetError());
+                        SDL_ClearError();
+                    }
                 }
             }
 
             if (!ok && vdata->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
                 if (KITTY_TransmitDirectZlib(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
-                                             kitty_f, home_cursor)) {
+                                             kitty_f, home_cursor,
+                                             KITTY_ProfileApcChunkBytes(vdata->term_profile))) {
                     ok = true;
                 } else {
                     vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
@@ -996,7 +1033,8 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
                         (size_t)w, (size_t)h, raw_len);
                 }
                 ok = KITTY_TransmitDirectRaw(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
-                                             kitty_f, home_cursor);
+                                             kitty_f, home_cursor,
+                                             KITTY_ProfileApcChunkBytes(vdata->term_profile));
             }
         }
         if (ok) {

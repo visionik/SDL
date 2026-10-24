@@ -99,10 +99,10 @@ float KITTY_CoverageRatio(int fb_w, int fb_h, const SDL_Rect *union_rect)
     return area / denom;
 }
 
-bool KITTY_SelectFbDiff(const char *env)
+bool KITTY_SelectFbDiff(const char *env, bool default_on)
 {
     if (!env || !env[0]) {
-        return true; /* default on — helps full-frame apps (MAME soft) */
+        return default_on;
     }
     if (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
         SDL_strcasecmp(env, "false") == 0 || SDL_strcasecmp(env, "no") == 0) {
@@ -111,9 +111,9 @@ bool KITTY_SelectFbDiff(const char *env)
     return true;
 }
 
-int KITTY_SelectFbDiffTile(const char *env)
+int KITTY_SelectFbDiffTile(const char *env, int default_tile)
 {
-    int tile = 32;
+    int tile = default_tile > 0 ? default_tile : 32;
     if (env && env[0]) {
         tile = (int)SDL_strtol(env, NULL, 10);
     }
@@ -126,9 +126,9 @@ int KITTY_SelectFbDiffTile(const char *env)
     return tile;
 }
 
-float KITTY_SelectFbDiffCover(const char *env)
+float KITTY_SelectFbDiffCover(const char *env, float default_cover)
 {
-    float cover = 0.45f;
+    float cover = default_cover > 0.0f ? default_cover : 0.45f;
     if (env && env[0]) {
         cover = (float)SDL_atof(env);
     }
