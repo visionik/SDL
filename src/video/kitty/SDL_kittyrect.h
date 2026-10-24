@@ -84,6 +84,10 @@ Uint64 KITTY_Fnv1a64(const Uint8 *data, size_t len);
 int KITTY_CoalesceRects(int fb_w, int fb_h, const SDL_Rect *in, int n_in,
                         int gap_px, SDL_Rect *out, int max_out);
 
+/* True if the place_cells box touches the screen edge (Exp 3 skip). */
+bool KITTY_PlaceCellsTouchesEdge(int col0, int row0, int place_cols, int place_rows,
+                                 int cols, int rows);
+
 /*
  * 32x32 (or tile) memcmp of prev vs next tightly packed RGB/RGBA frames.
  * dirty_out receives the bounding box of changed tiles when RECT/FULL.

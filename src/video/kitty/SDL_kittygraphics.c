@@ -889,8 +889,14 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
         z = 10; /* above default base placements */
     }
 
+    /* Save/restore cursor so CUP for overlays does not drift the base origin. */
+    if (!KITTY_WriteAll(vdata->tty_fd, "\0337", 2)) {
+        return false;
+    }
+
     cup_len = SDL_snprintf(cup, sizeof(cup), "\033[%d;%dH", place_row, place_col);
     if (cup_len <= 0 || !KITTY_WriteAll(vdata->tty_fd, cup, (size_t)cup_len)) {
+        KITTY_WriteAll(vdata->tty_fd, "\0338", 2);
         return false;
     }
 
@@ -900,6 +906,7 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
         extra_len = SDL_snprintf(extra, sizeof(extra), "z=%d", z);
     }
     if (extra_len <= 0) {
+        KITTY_WriteAll(vdata->tty_fd, "\0338", 2);
         return SDL_SetError("overlay extra keys failed");
     }
 
@@ -910,8 +917,9 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
                                                    place_cols, place_rows, extra,
                                                    packed_rgb, payload_len, kitty_f,
                                                    false, chunk_bytes, &wire);
+        KITTY_WriteAll(vdata->tty_fd, "\0338", 2); /* DECRC */
         if (ok) {
-            vdata->last_wire_bytes = wire + (size_t)cup_len;
+            vdata->last_wire_bytes = wire + (size_t)cup_len + 4; /* + DECSC/DECRC */
             vdata->last_raw_bytes = payload_len;
             vdata->total_wire_bytes += vdata->last_wire_bytes;
             vdata->wire_presents += 1;

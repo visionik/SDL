@@ -194,6 +194,21 @@ Uint64 KITTY_Fnv1a64(const Uint8 *data, size_t len)
     return h;
 }
 
+bool KITTY_PlaceCellsTouchesEdge(int col0, int row0, int place_cols, int place_rows,
+                                 int cols, int rows)
+{
+    if (cols <= 0 || rows <= 0 || place_cols <= 0 || place_rows <= 0) {
+        return true;
+    }
+    if (col0 <= 0 || row0 <= 0) {
+        return true;
+    }
+    if (col0 + place_cols >= cols || row0 + place_rows >= rows) {
+        return true;
+    }
+    return false;
+}
+
 int KITTY_CoalesceRects(int fb_w, int fb_h, const SDL_Rect *in, int n_in,
                         int gap_px, SDL_Rect *out, int max_out)
 {

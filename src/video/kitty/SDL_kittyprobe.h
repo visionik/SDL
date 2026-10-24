@@ -68,6 +68,9 @@ bool KITTY_SelectDirtyBW(const char *env, bool frame_edit_ok);
  */
 bool KITTY_SelectDirtyAT(const char *env, bool profile_default);
 
+/* SDL_KITTY_DIRTY_UNION_AT: env forces on/off; else profile dirty_union_at. */
+bool KITTY_SelectDirtyUnionAT(const char *env, bool profile_default);
+
 /* SDL_KITTY_UPLOAD_SKIP: env forces on/off; else profile upload_skip. */
 bool KITTY_SelectUploadSkip(const char *env, bool profile_default);
 

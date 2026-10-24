@@ -79,9 +79,15 @@ typedef struct KITTY_TerminalProfile
     /*
      * Experiment: sparse dirty updates as stacked a=T overlays (one image per
      * dirty rect) when a=f cannot refresh the display (WezTerm hash bug).
-     * Env SDL_KITTY_DIRTY_AT=0|1 overrides.
+     * Env SDL_KITTY_DIRTY_AT=0|1 overrides. Default off (host hang).
      */
     bool dirty_at_overlays;
+
+    /*
+     * Exp 3: single union a=T overlay (DECSC/DECRC + edge skip). Safer than
+     * multi dirty_at. Env SDL_KITTY_DIRTY_UNION_AT=0|1 overrides.
+     */
+    bool dirty_union_at;
 
     /*
      * Exp 6: skip wire upload when full scratch FNV matches last successful

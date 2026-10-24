@@ -396,6 +396,9 @@ static void KITTY_OverlayProfileFromTable(KITTY_TerminalProfile *p, toml_datum_t
     if (KITTY_TomlGetBool(tab, "dirty_at_overlays", &b)) {
         p->dirty_at_overlays = b;
     }
+    if (KITTY_TomlGetBool(tab, "dirty_union_at", &b)) {
+        p->dirty_union_at = b;
+    }
     if (KITTY_TomlGetBool(tab, "upload_skip", &b)) {
         p->upload_skip = b;
     }

@@ -412,7 +412,85 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 }
             }
 
-            /* WezTerm experiment: stacked a=T overlays when a=f cannot paint. */
+            /*
+             * Exp 3: single union a=T overlay (safer than multi dirty_at).
+             * DECSC/DECRC in TransmitRGBRectPlace; skip if cell box hits edge.
+             */
+            if (!ok) {
+                const bool want_union =
+                    convert_mode == KITTY_CONVERT_DIRTY &&
+                    KITTY_SelectDirtyUnionAT(SDL_getenv("SDL_KITTY_DIRTY_UNION_AT"),
+                                             vdata->term_profile &&
+                                                 vdata->term_profile->dirty_union_at) &&
+                    wdata->placed &&
+                    wdata->live_image_id != 0 &&
+                    cov < max_cov &&
+                    convert_px <= max_af_px &&
+                    dirty.w > 0 && dirty.h > 0;
+                if (want_union) {
+                    int col0 = 0, row0 = 0, place_c = 0, place_r = 0;
+                    int cell_X = 0, cell_Y = 0;
+                    bool mapped = false;
+                    bool edge = true;
+
+                    if (vdata->place_cells && vdata->cols > 0 && vdata->rows > 0) {
+                        mapped = KITTY_FbRectToPlaceCells(surface->w, surface->h, &dirty,
+                                                         vdata->cols, vdata->rows,
+                                                         &col0, &row0, &place_c, &place_r);
+                        edge = KITTY_PlaceCellsTouchesEdge(col0, row0, place_c, place_r,
+                                                          vdata->cols, vdata->rows);
+                    } else if (vdata->cell_w > 0 && vdata->cell_h > 0) {
+                        mapped = KITTY_FbPixelToCellCursor(dirty.x, dirty.y,
+                                                          vdata->cell_w, vdata->cell_h,
+                                                          &col0, &row0, &cell_X, &cell_Y);
+                        place_c = 0;
+                        place_r = 0;
+                        /* 1:1: treat last cell row/col as edge. */
+                        edge = (col0 <= 0 || row0 <= 0 ||
+                                (vdata->cols > 0 && col0 >= vdata->cols - 1) ||
+                                (vdata->rows > 0 && row0 >= vdata->rows - 1));
+                    }
+
+                    if (mapped && !edge) {
+                        size_t packed_len = 0;
+                        const size_t pack_cap = convert_px * (size_t)bpp;
+                        bool pack_ok = false;
+                        packed = (Uint8 *)SDL_malloc(pack_cap);
+                        if (packed) {
+                            pack_ok = use_rgba
+                                          ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w,
+                                                               surface->h, &dirty, packed,
+                                                               pack_cap, &packed_len)
+                                          : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w,
+                                                              surface->h, &dirty, packed,
+                                                              pack_cap, &packed_len);
+                        }
+                        KITTY_ClearOverlays(vdata, wdata);
+                        /* place_cells: stretch with c/r so overlay matches base scale.
+                         * Edge skip + DECSC/DECRC mitigate WezTerm assign_image hang;
+                         * natural size (0,0) was small/jumpy and left trails. */
+                        if (pack_ok &&
+                            KITTY_TransmitRGBRectPlace(vdata, wdata->overlay_ids[0], packed,
+                                                       dirty.w, dirty.h,
+                                                       col0 + 1, row0 + 1,
+                                                       place_c, place_r,
+                                                       cell_X, cell_Y, 10, kitty_f)) {
+                            ok = true;
+                            wire_mode = KITTY_WIRE_DIRTY_AT;
+                            upload_px = convert_px;
+                            wdata->overlay_count = 1;
+                            wdata->rgb_valid = true;
+                        } else {
+                            SDL_ClearError();
+                            wdata->overlay_count = 0;
+                        }
+                        SDL_free(packed);
+                        packed = NULL;
+                    }
+                }
+            }
+
+            /* Multi a=T overlays (dirty_at_overlays) — default off after WezTerm hang. */
             if (!ok) {
                 const bool want_at =
                     convert_mode == KITTY_CONVERT_DIRTY &&
@@ -583,7 +661,10 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             if (wire_mode == KITTY_WIRE_DIRTY_BW) {
                 mode_str = "dirty_bw";
             } else if (wire_mode == KITTY_WIRE_DIRTY_AT) {
-                mode_str = "dirty_at";
+                mode_str = (vdata->term_profile && vdata->term_profile->dirty_union_at &&
+                            !(vdata->term_profile->dirty_at_overlays))
+                               ? "dirty_union"
+                               : "dirty_at";
             } else if (wire_mode == KITTY_WIRE_DIRTY_CPU) {
                 mode_str = "dirty_cpu";
             } else if (wire_mode == KITTY_WIRE_DIFF_SKIP) {
