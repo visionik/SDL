@@ -191,6 +191,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                         KITTY_TileDiffBBox(wdata->rgb_scratch, wdata->rgb_back, surface->w, surface->h,
                                            bpp, tile, cover, &dirty);
                     if (diff == KITTY_DIFF_NONE) {
+#ifdef SDL_KITTY_RUNTIME_DEBUG
                         if (KITTY_DebugEnabled()) {
                             static int skips;
                             if (skips < 4 || (skips % 120) == 0) {
@@ -199,6 +200,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                             }
                             skips++;
                         }
+#endif
                         return true;
                     }
                     KITTY_SwapRGBScratch(wdata); /* scratch now holds the new frame */
@@ -207,6 +209,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                      * vs zlib/direct full a=T. Expanding to full used to force
                      * full-frame a=f on Rex (af_max=1.01) even when only ~half the
                      * tiles changed. */
+#ifdef SDL_KITTY_RUNTIME_DEBUG
                     if (KITTY_DebugEnabled() && diff == KITTY_DIFF_FULL) {
                         static int fulls;
                         if (fulls < 4 || (fulls % 60) == 0) {
@@ -217,6 +220,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                         }
                         fulls++;
                     }
+#endif
                     convert_mode = KITTY_CONVERT_DIRTY;
                 }
                 goto kitty_present_after_convert;
@@ -326,10 +330,12 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     if (cn > 0) {
                         af_rects = coal_buf;
                         af_n = cn;
+#ifdef SDL_KITTY_RUNTIME_DEBUG
                         if (KITTY_DebugEnabled() && cn != numrects) {
                             KITTY_DebugLog("kitty: coalesce %d -> %d rects (gap=%d)",
                                            numrects, cn, gap);
                         }
+#endif
                     }
                 }
 
@@ -662,6 +668,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         (void)0;
     }
 
+#ifdef SDL_KITTY_RUNTIME_DEBUG
     if (KITTY_DebugEnabled()) {
         static int frames;
         const float cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
@@ -724,6 +731,9 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         }
         frames++;
     }
+#else
+    (void)upload_px;
+#endif /* SDL_KITTY_RUNTIME_DEBUG */
     return ok;
 }
 

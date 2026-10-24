@@ -136,12 +136,18 @@ static void KITTY_SendKey(SDL_Scancode scancode, bool pressed)
 
 static void KITTY_LogKey(SDL_Scancode sc, int event_type, const char *via)
 {
+#ifdef SDL_KITTY_RUNTIME_DEBUG
     if (!SDL_getenv("SDL_KITTY_KEY_DEBUG")) {
         return;
     }
     /* Prefer stderr: LogDebug on INPUT is often filtered, and stdout is the
      * Kitty graphics channel once the alt-screen is owned. */
     SDL_Log("kitty key sc=%d event=%d via=%s", (int)sc, event_type, via ? via : "?");
+#else
+    (void)sc;
+    (void)event_type;
+    (void)via;
+#endif
 }
 
 /* Kitty event-type subfield: 1=press (default), 2=repeat, 3=release. */
@@ -459,6 +465,7 @@ static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t 
         px = ((float)data->mouse_raw_x + 0.5f) * (float)data->pixel_w / (float)data->cols;
         py = ((float)data->mouse_raw_y + 0.5f) * (float)data->pixel_h / (float)data->rows;
     }
+#ifdef SDL_KITTY_RUNTIME_DEBUG
     if (SDL_getenv("SDL_KITTY_MOUSE_DEBUG")) {
         static int dbg_n;
         if ((dbg_n++ % 8) == 0) {
@@ -474,6 +481,7 @@ static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t 
             }
         }
     }
+#endif /* SDL_KITTY_RUNTIME_DEBUG */
     SDL_SendMouseMotion(0, window, SDL_GLOBAL_MOUSE_ID, false, px, py);
 
     // button: 0=left,1=middle,2=right, 32+ = drag, 64+ = wheel;
@@ -684,6 +692,7 @@ static void KITTY_HandleWinch(SDL_VideoDevice *_this)
                                   old_pw, old_ph, data->pixel_w, data->pixel_h,
                                   old_cols, old_rows, data->cols, data->rows);
 
+#ifdef SDL_KITTY_RUNTIME_DEBUG
     if (KITTY_DebugEnabled()) {
         const char *an = "full";
         if (action == KITTY_RESIZE_REPLACE) {
@@ -697,6 +706,7 @@ static void KITTY_HandleWinch(SDL_VideoDevice *_this)
                      old_cols, old_rows, data->cols, data->rows,
                      wdata ? (unsigned)wdata->live_image_id : 0u);
     }
+#endif /* SDL_KITTY_RUNTIME_DEBUG */
 
     if (action == KITTY_RESIZE_NONE) {
         return;

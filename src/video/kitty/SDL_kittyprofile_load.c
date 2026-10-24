@@ -68,6 +68,7 @@ static char g_source[KITTY_SOURCE_MAX] = "builtin";
 
 static void KITTY_ProfileDebug(const char *fmt, ...)
 {
+#ifdef SDL_KITTY_RUNTIME_DEBUG
     va_list ap;
     const char *dbg = SDL_getenv("SDL_KITTY_DEBUG");
     if (!dbg || !dbg[0] || dbg[0] == '0') {
@@ -89,6 +90,9 @@ static void KITTY_ProfileDebug(const char *fmt, ...)
     fprintf(stderr, "\n");
     va_end(ap);
 #endif
+#else
+    (void)fmt;
+#endif /* SDL_KITTY_RUNTIME_DEBUG */
 }
 
 static void KITTY_FreeStringList(KITTY_StringList *list)

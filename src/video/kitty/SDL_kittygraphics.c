@@ -990,14 +990,14 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
             }
             more = (offset + chunk < encoded) ? 1 : 0;
             if (first) {
-                /* r=1 edits root; X=1 overwrite; x,y,s,v = dirty bbox in image pixels. */
+                /* r=1 edits root; X=1 overwrite; q=2 quiet (no APC OK). */
                 if (more) {
                     header_len = SDL_snprintf(header, sizeof(header),
-                                              "\033_Ga=f,f=%d,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,m=1;",
+                                              "\033_Ga=f,f=%d,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2,m=1;",
                                               kitty_f, (unsigned)image_id, x, y, rw, rh);
                 } else {
                     header_len = SDL_snprintf(header, sizeof(header),
-                                              "\033_Ga=f,f=%d,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d;",
+                                              "\033_Ga=f,f=%d,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
                                               kitty_f, (unsigned)image_id, x, y, rw, rh);
                 }
                 first = false;
@@ -1193,9 +1193,9 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
             vdata->total_ms_tx += vdata->last_ms_tx;
             vdata->wire_presents += 1;
 
+#ifdef SDL_KITTY_PERF_ACK
             /* Optional host round-trip: wait for Gi=<id>;OK after a=T.
-             * Captures inflate+store latency zlib adds on the terminal side.
-             * Enable with SDL_KITTY_PERF_ACK=1 (slows presents to sync rate). */
+             * Compile with -DSDL_KITTY_PERF_ACK=ON; then SDL_KITTY_PERF_ACK=1 at run. */
             {
                 const char *ack_env = SDL_getenv("SDL_KITTY_PERF_ACK");
                 if (ack_env && (ack_env[0] == '1' || SDL_strcasecmp(ack_env, "true") == 0 ||
@@ -1212,6 +1212,7 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
                     }
                 }
             }
+#endif /* SDL_KITTY_PERF_ACK */
         }
         return ok;
     }

@@ -269,6 +269,7 @@ bool KITTY_SelectPingPong(const char *env, bool default_on)
     return true;
 }
 
+#ifdef SDL_KITTY_RUNTIME_DEBUG
 bool KITTY_DebugEnabled(void)
 {
     static int cached = -1;
@@ -302,6 +303,7 @@ void KITTY_DebugLog(const char *fmt, ...)
     fprintf(stderr, "%s\r\n", buf);
     fflush(stderr);
 }
+#endif /* SDL_KITTY_RUNTIME_DEBUG */
 
 static KITTY_TransmitMode KITTY_ParseTransmitForce(const char *force)
 {
@@ -423,6 +425,7 @@ static KITTY_GraphicsQueryStatus KITTY_AwaitGraphicsQuery(int fd, Uint32 id, int
     return KITTY_GQ_NONE;
 }
 
+#ifdef SDL_KITTY_PERF_ACK
 KITTY_GraphicsQueryStatus KITTY_AwaitGraphicsAck(int fd, Uint32 id, int timeout_ms)
 {
     int attempts;
@@ -438,6 +441,7 @@ KITTY_GraphicsQueryStatus KITTY_AwaitGraphicsAck(int fd, Uint32 id, int timeout_
     }
     return KITTY_AwaitGraphicsQuery(fd, id, attempts);
 }
+#endif /* SDL_KITTY_PERF_ACK */
 
 static bool KITTY_ProbeDirectQuery(SDL_VideoData *data, Uint32 id)
 {
@@ -593,7 +597,9 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
 {
     const char *force = SDL_getenv("SDL_KITTY_TRANSMIT");
     const char *bw_env = SDL_getenv("SDL_KITTY_DIRTY_BW");
+#ifdef SDL_KITTY_RUNTIME_DEBUG
     const char *term_name = "unknown";
+#endif
     const char *force_profile = NULL;
     bool prefer_direct = false;
     bool prefer_zlib = false;
@@ -612,7 +618,9 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
         prefer_direct = data->term_profile->prefer_direct;
         prefer_zlib = data->term_profile->prefer_zlib;
         force_profile = data->term_profile->force_transmit;
+#ifdef SDL_KITTY_RUNTIME_DEBUG
         term_name = data->term_profile->name;
+#endif
     }
 
     /* Drain any prior CSI noise from the input tty. */
@@ -640,10 +648,21 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
             data->shm_failed = !shm_ok;
         }
 
-        /* Frame-edit probe only if graphics direct works (or we still try). */
-        frame_ok = KITTY_ProbeFrameEdit(data, id_frame);
+        /* Skip a=f probe when DIRTY_BW is forced — avoids AwaitGraphicsQuery. */
+        if (bw_env && bw_env[0] &&
+            (bw_env[0] == '0' || SDL_strcasecmp(bw_env, "off") == 0 ||
+             SDL_strcasecmp(bw_env, "false") == 0 || SDL_strcasecmp(bw_env, "no") == 0)) {
+            frame_ok = false;
+        } else if (bw_env && bw_env[0] &&
+                   (bw_env[0] == '1' || SDL_strcasecmp(bw_env, "on") == 0 ||
+                    SDL_strcasecmp(bw_env, "true") == 0 || SDL_strcasecmp(bw_env, "yes") == 0)) {
+            frame_ok = true;
+        } else {
+            frame_ok = KITTY_ProbeFrameEdit(data, id_frame);
+        }
         data->frame_edit_ok = frame_ok;
 
+#ifdef SDL_KITTY_RUNTIME_DEBUG
         if (KITTY_DebugEnabled()) {
             const char *mode = "direct";
             const bool bw = KITTY_SelectDirtyBW(bw_env, frame_ok);
@@ -668,6 +687,7 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
                            bw ? "on" : "off",
                            bw_env ? bw_env : "(none)");
         }
+#endif
     }
 
     return true;

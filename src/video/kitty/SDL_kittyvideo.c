@@ -242,6 +242,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
         return false;
     }
 
+#ifdef SDL_KITTY_RUNTIME_DEBUG
     if (KITTY_DebugEnabled()) {
         KITTY_DebugLog(
             "kitty: init term=%s profiles=%s prefer_direct=%d cols=%d rows=%d fb=%dx%d cell=%dx%d place=%d mouse1016=%d",
@@ -252,6 +253,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
             data->cell_w, data->cell_h, data->place_cells ? 1 : 0,
             data->mouse_sgr_pixels ? 1 : 0);
     }
+#endif
 
     return true;
 }

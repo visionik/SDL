@@ -27,8 +27,10 @@ typedef enum KITTY_GraphicsQueryStatus
 /* Scan buf for APC reply ESC_Gi=<id>;OK|error ESC\ */
 KITTY_GraphicsQueryStatus KITTY_ParseGraphicsQueryReply(const char *buf, size_t len, Uint32 expect_id);
 
-/* Wait for Gi=<id>;OK|ERROR on fd (used for PERF_ACK present timing). */
+#ifdef SDL_KITTY_PERF_ACK
+/* Wait for Gi=<id>;OK|ERROR on fd (optional present timing; cmake -DSDL_KITTY_PERF_ACK=ON). */
 KITTY_GraphicsQueryStatus KITTY_AwaitGraphicsAck(int fd, Uint32 id, int timeout_ms);
+#endif
 
 /*
  * Choose transmit mode from env + probe results.
@@ -80,20 +82,24 @@ int KITTY_SelectCoalesceGap(const char *env, int profile_default);
 /* SDL_KITTY_PINGPONG=1 restores delete+swap presents; default is same-(i,p) replace. */
 bool KITTY_SelectPingPong(const char *env, bool default_on);
 
-/* Step 3: no cursor advance, transient image, stable placement id. */
-#define KITTY_AT_PLACE_KEYS "C=1,N=1,p=1"
+/* Step 3: no cursor advance, transient, quiet (q=2 = no APC OK replies). */
+#define KITTY_AT_PLACE_KEYS "C=1,N=1,p=1,q=2"
 
 /* SDL_KITTY_FB_ALPHA=1/true/yes/on → ARGB8888 window FB + Kitty f=32. */
 bool KITTY_SelectFbAlpha(const char *env);
 
 /*
- * SDL_KITTY_DEBUG=1 → enable VIDEO debug logs (raises category priority once).
- * Prefer SDL_LogDebug over writing /tmp files.
+ * Runtime debug (present lines, probes) is compiled only when
+ * SDL_KITTY_RUNTIME_DEBUG is defined (CMake -DSDL_KITTY_RUNTIME_DEBUG=ON).
+ * Then SDL_KITTY_DEBUG=1 enables VIDEO logs at runtime.
  */
+#ifdef SDL_KITTY_RUNTIME_DEBUG
 bool KITTY_DebugEnabled(void);
-
-/* SDL_LogDebug + fprintf(stderr) so 2>file works on macOS. */
 void KITTY_DebugLog(SDL_PRINTF_FORMAT_STRING const char *fmt, ...) SDL_PRINTF_VARARG_FUNC(1);
+#else
+#define KITTY_DebugEnabled() (false)
+#define KITTY_DebugLog(...) ((void)0)
+#endif
 
 /*
  * Format first-chunk a=T APC header (without ESC_G prefix or trailing payload).
