@@ -260,10 +260,26 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             if (want_af && rects && numrects > 1) {
                 bool multi_ok = true;
                 size_t multi_upload = 0;
+                size_t multi_total_px = 0;
                 int ri;
                 SDL_Rect fb = { 0, 0, surface->w, surface->h };
 
-                for (ri = 0; ri < numrects && multi_ok; ++ri) {
+                /* Same af_max_* gates as the single-rect path: total pixels and
+                 * union coverage. Per-rect-only caps allowed alpha_blit (~600k
+                 * base64) to flood Kitty's PTY while each rect stayed under max. */
+                for (ri = 0; ri < numrects; ++ri) {
+                    SDL_Rect clipped;
+                    if (!SDL_GetRectIntersection(&rects[ri], &fb, &clipped) ||
+                        clipped.w <= 0 || clipped.h <= 0) {
+                        continue;
+                    }
+                    multi_total_px += (size_t)clipped.w * (size_t)clipped.h;
+                }
+                if (cov >= max_cov || multi_total_px > max_af_px || multi_total_px == 0) {
+                    multi_ok = false;
+                }
+
+                for (ri = 0; multi_ok && ri < numrects; ++ri) {
                     SDL_Rect clipped;
                     size_t rpx;
                     size_t packed_len = 0;
@@ -301,7 +317,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     packed = NULL;
                 }
 
-                if (multi_ok && multi_upload > 0) {
+                if (multi_ok && multi_upload > 0 && multi_upload <= max_af_px) {
                     ok = true;
                     wire_mode = KITTY_WIRE_DIRTY_BW;
                     upload_px = multi_upload;

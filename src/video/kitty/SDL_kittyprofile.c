@@ -61,17 +61,23 @@ static const KITTY_TerminalProfile KITTY_profile_rex = {
 static const KITTY_TerminalProfile KITTY_profile_kitty = {
     .kind = KITTY_TERM_KITTY,
     .name = "kitty",
-    .prefer_direct = false, /* prefer SHM when ok */
+    .prefer_direct = false, /* SHM first-class in graphics.c */
     .default_fb_max_w = 1920,
     .default_fb_max_h = 1080,
     .max_direct_bytes = KITTY_MAX_DIRECT_BYTES_DEFAULT,
     .af_max_coverage = 0.40f,
     .af_max_pixels = KITTY_AF_MAX_PX_DEFAULT,
     .keys_on_stdin = true,
-    .silent_af_ok = false,
+    .silent_af_ok = false, /* Kitty replies Gi=…[,r=N];OK */
     .ignore_ioctl_pixels = false,
-    .direct_af_when_shm = false,
-    KITTY_PROFILE_TUNABLES
+    .direct_af_when_shm = true, /* a=f t=d edits root of SHM-placed image */
+    /* Override tunables: Kitty ignores APC > MAX_ESCAPE_CODE_LENGTH (256KiB). */
+    .shm_unlink_after_send = false,
+    .place_cells = true,
+    .pingpong = false,
+    .fb_diff = true,
+    .apc_chunk_bytes = 261888, /* 262144 - header/ST headroom */
+    .tty_pending_max = 4096,
 };
 
 static const KITTY_TerminalProfile KITTY_profile_ghostty = {
