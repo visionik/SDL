@@ -396,6 +396,9 @@ static void KITTY_OverlayProfileFromTable(KITTY_TerminalProfile *p, toml_datum_t
     if (KITTY_TomlGetBool(tab, "dirty_at_overlays", &b)) {
         p->dirty_at_overlays = b;
     }
+    if (KITTY_TomlGetBool(tab, "upload_skip", &b)) {
+        p->upload_skip = b;
+    }
     if (KITTY_TomlGetInt(tab, "direct_fallback_max_bytes", &i64) && i64 > 0) {
         p->direct_fallback_max_bytes = (size_t)i64;
     }

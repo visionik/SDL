@@ -41,7 +41,8 @@ typedef enum KITTY_PresentWireMode
     KITTY_WIRE_DIRTY_CPU, /* dirty convert, full a=T (Step 1a) */
     KITTY_WIRE_DIRTY_BW,  /* dirty convert + a=f rect edit (Step 1b) */
     KITTY_WIRE_DIRTY_AT,  /* dirty convert + stacked a=T overlays (experiment) */
-    KITTY_WIRE_DIFF_SKIP  /* tile-diff found no changes; upload skipped */
+    KITTY_WIRE_DIFF_SKIP, /* tile-diff found no changes; upload skipped */
+    KITTY_WIRE_UPLOAD_SKIP /* scratch FNV matches last upload; wire skipped */
 } KITTY_PresentWireMode;
 
 typedef enum KITTY_DiffOutcome
@@ -72,6 +73,9 @@ bool KITTY_FbRectToPlaceCells(int fb_w, int fb_h, const SDL_Rect *fb_rect,
 bool KITTY_FbPixelToCellCursor(int x, int y, int cell_w, int cell_h,
                                int *out_col0, int *out_row0,
                                int *out_X, int *out_Y);
+
+/* FNV-1a 64-bit over bytes (upload_skip fingerprint). */
+Uint64 KITTY_Fnv1a64(const Uint8 *data, size_t len);
 
 /*
  * 32x32 (or tile) memcmp of prev vs next tightly packed RGB/RGBA frames.

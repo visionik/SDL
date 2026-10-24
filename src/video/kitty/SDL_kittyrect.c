@@ -180,6 +180,20 @@ bool KITTY_FbPixelToCellCursor(int x, int y, int cell_w, int cell_h,
     return true;
 }
 
+Uint64 KITTY_Fnv1a64(const Uint8 *data, size_t len)
+{
+    Uint64 h = 14695981039346656037ULL;
+    size_t i;
+    if (!data) {
+        return h;
+    }
+    for (i = 0; i < len; ++i) {
+        h ^= (Uint64)data[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 bool KITTY_SelectFbDiff(const char *env, bool default_on)
 {
     if (!env || !env[0]) {

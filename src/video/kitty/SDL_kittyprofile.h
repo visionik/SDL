@@ -83,6 +83,12 @@ typedef struct KITTY_TerminalProfile
      */
     bool dirty_at_overlays;
 
+    /*
+     * Exp 6: skip wire upload when full scratch FNV matches last successful
+     * upload (no-op present). Env SDL_KITTY_UPLOAD_SKIP=0|1 overrides.
+     */
+    bool upload_skip;
+
     /* Max raw size for SHM-fail → direct fallback when !prefer_direct. */
     size_t direct_fallback_max_bytes;
 

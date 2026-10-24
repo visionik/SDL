@@ -115,6 +115,9 @@ typedef struct SDL_WindowData
     /* Active dirty_at overlay image ids from the previous present. */
     Uint32 overlay_ids[KITTY_OVERLAY_MAX];
     int overlay_count;
+    /* Exp 6: FNV of last successfully uploaded scratch (full buffer). */
+    Uint64 last_upload_hash;
+    bool last_upload_hash_valid;
 } SDL_WindowData;
 
 #endif // SDL_kittyvideo_h_

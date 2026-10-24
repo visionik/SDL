@@ -206,6 +206,18 @@ bool KITTY_SelectDirtyAT(const char *env, bool profile_default)
     return profile_default;
 }
 
+bool KITTY_SelectUploadSkip(const char *env, bool profile_default)
+{
+    if (env && *env) {
+        if (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
+            SDL_strcasecmp(env, "false") == 0 || SDL_strcasecmp(env, "no") == 0) {
+            return false;
+        }
+        return true;
+    }
+    return profile_default;
+}
+
 bool KITTY_SelectPingPong(const char *env, bool default_on)
 {
     if (!env || !*env) {

@@ -40,6 +40,7 @@
     .place_cells = true,                                                       \
     .pingpong = false,                                                         \
     .shm_unlink_after_send = false,                                            \
+    .upload_skip = true,                                                       \
     .notes = NULL
 
 static const KITTY_TerminalProfile KITTY_profile_rex = {

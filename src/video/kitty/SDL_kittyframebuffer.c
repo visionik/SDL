@@ -47,6 +47,8 @@ static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
     wdata->rgb_valid = false;
     wdata->live_image_id = 0;
     wdata->overlay_count = 0;
+    wdata->last_upload_hash = 0;
+    wdata->last_upload_hash_valid = false;
 }
 
 static bool KITTY_EnsureRGBScratch(SDL_WindowData *wdata, int w, int h, int bpp)
@@ -235,6 +237,31 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         convert_px = (size_t)dirty.w * (size_t)dirty.h;
         upload_px = (size_t)surface->w * (size_t)surface->h;
         wire_mode = (convert_mode == KITTY_CONVERT_DIRTY) ? KITTY_WIRE_DIRTY_CPU : KITTY_WIRE_FULL;
+
+        /*
+         * Exp 6: if the full scratch matches the last successful upload, skip
+         * the wire (covers dirty_cpu full a=T storms when pixels did not change).
+         */
+        {
+            const bool want_skip =
+                KITTY_SelectUploadSkip(SDL_getenv("SDL_KITTY_UPLOAD_SKIP"),
+                                       vdata->term_profile
+                                           ? vdata->term_profile->upload_skip
+                                           : true) &&
+                wdata->placed && wdata->last_upload_hash_valid && wdata->rgb_scratch;
+            if (want_skip) {
+                const size_t bytes =
+                    (size_t)surface->w * (size_t)surface->h * (size_t)bpp;
+                const Uint64 h = KITTY_Fnv1a64(wdata->rgb_scratch, bytes);
+                if (h == wdata->last_upload_hash) {
+                    ok = true;
+                    wire_mode = KITTY_WIRE_UPLOAD_SKIP;
+                    upload_px = 0;
+                    vdata->skip_presents += 1;
+                    goto kitty_present_log;
+                }
+            }
+        }
 
         /* Sparse direct a=f. Prefer per-rect edits when the app passed multiple
          * dirty rects (alpha_blit discs) — a single union of far-apart rects is
@@ -509,13 +536,25 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 }
             }
         }
+
+        /* Fingerprint scratch after any successful wire upload (full or sparse). */
+        if (ok && wire_mode != KITTY_WIRE_UPLOAD_SKIP && wdata->rgb_scratch) {
+            const size_t bytes =
+                (size_t)surface->w * (size_t)surface->h * (size_t)bpp;
+            wdata->last_upload_hash = KITTY_Fnv1a64(wdata->rgb_scratch, bytes);
+            wdata->last_upload_hash_valid = true;
+        }
+
+    kitty_present_log:
+        (void)0;
     }
 
     if (KITTY_DebugEnabled()) {
         static int frames;
         const float cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
-        /* Log startup, failures, full presents, high-coverage sparse, or every 60th. */
+        /* Log startup, failures, full presents, high-coverage sparse, skips, or every 60th. */
         const bool log_it = frames < 8 || !ok || wire_mode == KITTY_WIRE_FULL ||
+                            wire_mode == KITTY_WIRE_UPLOAD_SKIP ||
                             (wire_mode == KITTY_WIRE_DIRTY_BW && cov >= 0.5f) ||
                             (frames % 60) == 0;
         if (log_it) {
@@ -528,6 +567,8 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 mode_str = "dirty_cpu";
             } else if (wire_mode == KITTY_WIRE_DIFF_SKIP) {
                 mode_str = "diff_skip";
+            } else if (wire_mode == KITTY_WIRE_UPLOAD_SKIP) {
+                mode_str = "upload_skip";
             }
             KITTY_DebugLog(
                 "kitty: present #%d %dx%d place=%d mode=%s rects=%d union=%dx%d coverage=%.2f "
