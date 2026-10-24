@@ -193,12 +193,14 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                         return true;
                     }
                     KITTY_SwapRGBScratch(wdata); /* scratch now holds the new frame */
+                    /* DIFF_FULL = change bbox is huge. Stay on CONVERT_DIRTY with a
+                     * full dirty so af_max_coverage / af_max_pixels still choose
+                     * a=f vs a=T. CONVERT_FULL would skip a=f and flash on full a=T
+                     * (solid_present on Rex). Sparse DIFF_RECT path unchanged. */
                     if (diff == KITTY_DIFF_FULL) {
                         dirty = full;
-                        convert_mode = KITTY_CONVERT_FULL;
-                    } else {
-                        convert_mode = KITTY_CONVERT_DIRTY;
                     }
+                    convert_mode = KITTY_CONVERT_DIRTY;
                 }
                 goto kitty_present_after_convert;
             }
