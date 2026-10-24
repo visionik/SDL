@@ -202,12 +202,20 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                         return true;
                     }
                     KITTY_SwapRGBScratch(wdata); /* scratch now holds the new frame */
-                    /* DIFF_FULL = change bbox is huge. Stay on CONVERT_DIRTY with a
-                     * full dirty so af_max_coverage / af_max_pixels still choose
-                     * a=f vs a=T. CONVERT_FULL would skip a=f and flash on full a=T
-                     * (solid_present on Rex). Sparse DIFF_RECT path unchanged. */
-                    if (diff == KITTY_DIFF_FULL) {
-                        dirty = full;
+                    /* DIFF_FULL / DIFF_RECT both keep the tile-change bbox (do not
+                     * expand to the full FB). af_max_coverage then chooses sparse a=f
+                     * vs zlib/direct full a=T. Expanding to full used to force
+                     * full-frame a=f on Rex (af_max=1.01) even when only ~half the
+                     * tiles changed. */
+                    if (KITTY_DebugEnabled() && diff == KITTY_DIFF_FULL) {
+                        static int fulls;
+                        if (fulls < 4 || (fulls % 60) == 0) {
+                            const float bc = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
+                            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                                         "kitty: tile-diff FULL bbox=%dx%d cov=%.2f (kept bbox)",
+                                         dirty.w, dirty.h, (double)bc);
+                        }
+                        fulls++;
                     }
                     convert_mode = KITTY_CONVERT_DIRTY;
                 }
@@ -269,10 +277,16 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
          * SHM a=f blanked on Kitty.app; keep a=f on t=d only. */
         {
             const float cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
-            const float max_cov =
+            float max_cov =
                 (vdata->term_profile && vdata->term_profile->af_max_coverage > 0.0f)
                     ? vdata->term_profile->af_max_coverage
                     : 0.40f;
+            {
+                const char *cov_env = SDL_getenv("SDL_KITTY_AF_MAX_COVERAGE");
+                if (cov_env && cov_env[0]) {
+                    max_cov = (float)SDL_atof(cov_env);
+                }
+            }
             const size_t max_af_px =
                 (vdata->term_profile && vdata->term_profile->af_max_pixels > 0)
                     ? vdata->term_profile->af_max_pixels
