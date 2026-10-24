@@ -977,6 +977,9 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     /* Edit root frame in place — do not home cursor or re-place. */
     {
         const size_t chunk_cap = KITTY_ProfileApcChunkBytes(vdata->term_profile);
+        size_t wire = 0;
+        const Uint64 t0 = SDL_GetTicksNS();
+
         while (offset < encoded) {
             size_t chunk = encoded - offset;
             char header[256];
@@ -1011,7 +1014,21 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                 SDL_free(b64);
                 return false;
             }
+            wire += (size_t)header_len + chunk + 2;
             offset += chunk;
+        }
+
+        {
+            const Uint64 t1 = SDL_GetTicksNS();
+            const double ms = (double)(t1 - t0) / 1000000.0;
+            /* Accumulate: framebuffer zeros last_* at present start (multi a=f). */
+            vdata->last_wire_bytes += wire;
+            vdata->last_raw_bytes += payload_len;
+            vdata->last_ms_tx += ms;
+            vdata->last_ms_ack = -1.0;
+            vdata->total_wire_bytes += wire;
+            vdata->total_ms_tx += ms;
+            vdata->wire_presents += 1;
         }
     }
 
