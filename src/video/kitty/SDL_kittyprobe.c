@@ -34,25 +34,57 @@ KITTY_GraphicsQueryStatus KITTY_ParseGraphicsQueryReply(const char *buf, size_t 
     }
     for (i = 0; i + 6 < len; ++i) {
         unsigned id = 0;
+        const char *p;
+        const char *semi;
+        char *end = NULL;
+        size_t plen;
         char payload[128];
-        int n;
+
         if ((unsigned char)buf[i] != 0x1b || buf[i + 1] != '_') {
             continue;
         }
         if (buf[i + 2] != 'G') {
             continue;
         }
-        /* Forms: Gi=31;OK  or  Gi=31;EBADF:...  (ST may be ESC\ or BEL) */
-        n = SDL_sscanf(buf + i + 3, "i=%u;%127[^\x1b\x07]", &id, payload);
-        if (n < 2 || (Uint32)id != expect_id) {
+        /*
+         * Forms (ST may be ESC\ or BEL):
+         *   Gi=31;OK
+         *   Gi=31;EBADF:...
+         *   Gi=97,r=1;OK          (Ghostty tip a=f echoes r=)
+         *   Gi=1,I=2,p=3;OK
+         */
+        p = buf + i + 3;
+        if (p[0] != 'i' || p[1] != '=') {
             continue;
         }
+        id = (unsigned)SDL_strtoul(p + 2, &end, 10);
+        if (end == p + 2 || (Uint32)id != expect_id) {
+            continue;
+        }
+        /* Skip optional ,key=value pairs until ';' */
+        p = end;
+        while (*p && *p != ';' && (unsigned char)*p != 0x1b && *p != '\x07') {
+            ++p;
+        }
+        if (*p != ';') {
+            continue;
+        }
+        semi = p;
+        plen = 0;
+        p = semi + 1;
+        while (plen + 1 < sizeof(payload) && p < buf + len &&
+               (unsigned char)*p != 0x1b && *p != '\x07') {
+            payload[plen++] = *p++;
+        }
+        payload[plen] = '\0';
         if (SDL_strncmp(payload, "OK", 2) == 0 &&
-            (payload[2] == '\0' || payload[2] == '\x1b' || payload[2] == '\x07' ||
-             payload[2] == ' ' || payload[2] == '\r' || payload[2] == '\n')) {
+            (payload[2] == '\0' || payload[2] == ' ' || payload[2] == '\r' ||
+             payload[2] == '\n')) {
             return KITTY_GQ_OK;
         }
-        return KITTY_GQ_ERROR;
+        if (payload[0] != '\0') {
+            return KITTY_GQ_ERROR;
+        }
     }
     return KITTY_GQ_NONE;
 }

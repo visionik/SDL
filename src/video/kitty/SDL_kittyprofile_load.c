@@ -43,8 +43,18 @@ typedef struct KITTY_ProfileEntry
     KITTY_StringList term_when_program_empty;
     KITTY_StringList term_substring;
     bool match_kitty_window_id;
+    char *version_min; /* owned; match.term_program_version_min */
+    char *version_max; /* owned; match.term_program_version_max */
     bool has_matchers;
 } KITTY_ProfileEntry;
+
+typedef struct KITTY_ParsedVersion
+{
+    int major;
+    int minor;
+    int patch;
+    bool has_pre; /* true if a '-' pre-release follows the numeric core */
+} KITTY_ParsedVersion;
 
 /* From SDL_kittyprofile.c */
 const KITTY_TerminalProfile *KITTY_BuiltinDefaultsProfile(void);
@@ -103,6 +113,10 @@ static void KITTY_ClearEntry(KITTY_ProfileEntry *e)
     KITTY_FreeStringList(&e->term_substring);
     SDL_free(e->notes_heap);
     e->notes_heap = NULL;
+    SDL_free(e->version_min);
+    e->version_min = NULL;
+    SDL_free(e->version_max);
+    e->version_max = NULL;
     SDL_zerop(e);
 }
 
@@ -125,16 +139,116 @@ static KITTY_TerminalKind KITTY_KindFromId(const char *id)
     if (SDL_strcasecmp(id, "rex") == 0) {
         return KITTY_TERM_REX;
     }
-    if (SDL_strcasecmp(id, "kitty") == 0) {
+    if (SDL_strcasecmp(id, "kitty") == 0 || SDL_strncasecmp(id, "kitty-", 6) == 0) {
         return KITTY_TERM_KITTY;
     }
-    if (SDL_strcasecmp(id, "ghostty") == 0) {
+    if (SDL_strcasecmp(id, "ghostty") == 0 || SDL_strncasecmp(id, "ghostty-", 8) == 0) {
         return KITTY_TERM_GHOSTTY;
     }
-    if (SDL_strcasecmp(id, "wezterm") == 0) {
+    if (SDL_strcasecmp(id, "wezterm") == 0 || SDL_strncasecmp(id, "wezterm-", 8) == 0) {
         return KITTY_TERM_WEZTERM;
     }
     return KITTY_TERM_UNKNOWN;
+}
+
+/* Parse leading major[.minor[.patch]] from TERM_PROGRAM_VERSION / match bounds.
+ * Accepts prefixes like "ghostty 1.3.1" by skipping to the first digit.
+ * Pre-release: "1.3.2-main+abc" → 1.3.2 has_pre=true. */
+static bool KITTY_ParseVersion(const char *s, KITTY_ParsedVersion *out)
+{
+    const char *p;
+    long major = 0, minor = 0, patch = 0;
+    char *end = NULL;
+
+    if (!s || !out) {
+        return false;
+    }
+    SDL_zerop(out);
+    p = s;
+    while (*p && (*p < '0' || *p > '9')) {
+        ++p;
+    }
+    if (!*p) {
+        return false;
+    }
+    major = SDL_strtol(p, &end, 10);
+    if (end == p) {
+        return false;
+    }
+    p = end;
+    if (*p == '.') {
+        ++p;
+        minor = SDL_strtol(p, &end, 10);
+        if (end == p) {
+            return false;
+        }
+        p = end;
+        if (*p == '.') {
+            ++p;
+            patch = SDL_strtol(p, &end, 10);
+            if (end == p) {
+                return false;
+            }
+            p = end;
+        }
+    }
+    out->major = (int)major;
+    out->minor = (int)minor;
+    out->patch = (int)patch;
+    out->has_pre = (*p == '-');
+    return true;
+}
+
+/* Semver-ish: major/minor/patch first; when equal, release (no pre) > pre-release. */
+static int KITTY_CmpParsedVersion(const KITTY_ParsedVersion *a, const KITTY_ParsedVersion *b)
+{
+    if (a->major != b->major) {
+        return (a->major < b->major) ? -1 : 1;
+    }
+    if (a->minor != b->minor) {
+        return (a->minor < b->minor) ? -1 : 1;
+    }
+    if (a->patch != b->patch) {
+        return (a->patch < b->patch) ? -1 : 1;
+    }
+    if (a->has_pre != b->has_pre) {
+        return a->has_pre ? -1 : 1;
+    }
+    return 0;
+}
+
+static bool KITTY_VersionInRange(const char *actual,
+                                 const char *min_s,
+                                 const char *max_s)
+{
+    KITTY_ParsedVersion v, bound;
+
+    if ((!min_s || !min_s[0]) && (!max_s || !max_s[0])) {
+        return true; /* no version constraint */
+    }
+    if (!actual || !actual[0]) {
+        return false; /* constrained row needs TERM_PROGRAM_VERSION */
+    }
+    if (!KITTY_ParseVersion(actual, &v)) {
+        return false;
+    }
+    if (min_s && min_s[0]) {
+        if (!KITTY_ParseVersion(min_s, &bound)) {
+            return false;
+        }
+        if (KITTY_CmpParsedVersion(&v, &bound) < 0) {
+            return false;
+        }
+    }
+    if (max_s && max_s[0]) {
+        if (!KITTY_ParseVersion(max_s, &bound)) {
+            return false;
+        }
+        if (KITTY_CmpParsedVersion(&v, &bound) > 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool KITTY_ParseWxH(const char *s, int *w, int *h)
@@ -358,6 +472,18 @@ static void KITTY_OverlayMatchers(KITTY_ProfileEntry *entry, toml_datum_t tab)
             entry->has_matchers = true;
         }
     }
+    a = toml_seek(tab, "match.term_program_version_min");
+    if (a.type == TOML_STRING && a.u.s && a.u.s[0]) {
+        SDL_free(entry->version_min);
+        entry->version_min = SDL_strdup(a.u.s);
+        entry->has_matchers = true;
+    }
+    a = toml_seek(tab, "match.term_program_version_max");
+    if (a.type == TOML_STRING && a.u.s && a.u.s[0]) {
+        SDL_free(entry->version_max);
+        entry->version_max = SDL_strdup(a.u.s);
+        entry->has_matchers = true;
+    }
 }
 
 static bool KITTY_ListContainsCI(const KITTY_StringList *list, const char *s)
@@ -390,23 +516,28 @@ static bool KITTY_ListSubstring(const KITTY_StringList *list, const char *s)
 
 static bool KITTY_EntryMatches(const KITTY_ProfileEntry *e, const char *tp, const char *term)
 {
+    bool identity = false;
+    const char *tpv;
+
     if (!e || !e->has_matchers) {
         return false;
     }
     if (tp && *tp && KITTY_ListContainsCI(&e->term_program, tp)) {
-        return true;
+        identity = true;
+    } else if ((!tp || !*tp) && term && *term &&
+               KITTY_ListContainsCI(&e->term_when_program_empty, term)) {
+        identity = true;
+    } else if (term && *term && KITTY_ListSubstring(&e->term_substring, term)) {
+        identity = true;
+    } else if (e->match_kitty_window_id && SDL_getenv("KITTY_WINDOW_ID") != NULL) {
+        identity = true;
     }
-    if ((!tp || !*tp) && term && *term &&
-        KITTY_ListContainsCI(&e->term_when_program_empty, term)) {
-        return true;
+    if (!identity) {
+        return false;
     }
-    if (term && *term && KITTY_ListSubstring(&e->term_substring, term)) {
-        return true;
-    }
-    if (e->match_kitty_window_id && SDL_getenv("KITTY_WINDOW_ID") != NULL) {
-        return true;
-    }
-    return false;
+    /* Version bounds AND with identity. Missing env fails a constrained row. */
+    tpv = SDL_getenv("TERM_PROGRAM_VERSION");
+    return KITTY_VersionInRange(tpv, e->version_min, e->version_max);
 }
 
 static KITTY_ProfileEntry *KITTY_FindEntryByName(const char *name)
@@ -516,13 +647,19 @@ static bool KITTY_ApplyTomlResult(toml_result_t result, bool replace)
                 (toml_seek(tab, "match.term_program").type == TOML_ARRAY) ||
                 (toml_seek(tab, "match.term_when_program_empty").type == TOML_ARRAY) ||
                 (toml_seek(tab, "match.term_substring").type == TOML_ARRAY) ||
-                (toml_seek(tab, "match.kitty_window_id").type == TOML_BOOLEAN);
+                (toml_seek(tab, "match.kitty_window_id").type == TOML_BOOLEAN) ||
+                (toml_seek(tab, "match.term_program_version_min").type == TOML_STRING) ||
+                (toml_seek(tab, "match.term_program_version_max").type == TOML_STRING);
             if (is_new || any_match_key) {
                 if (any_match_key) {
                     KITTY_FreeStringList(&e->term_program);
                     KITTY_FreeStringList(&e->term_when_program_empty);
                     KITTY_FreeStringList(&e->term_substring);
                     e->match_kitty_window_id = false;
+                    SDL_free(e->version_min);
+                    e->version_min = NULL;
+                    SDL_free(e->version_max);
+                    e->version_max = NULL;
                     e->has_matchers = false;
                     KITTY_OverlayMatchers(e, tab);
                 }
