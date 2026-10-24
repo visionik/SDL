@@ -218,6 +218,33 @@ bool KITTY_SelectUploadSkip(const char *env, bool profile_default)
     return profile_default;
 }
 
+int KITTY_SelectCoalesceGap(const char *env, int profile_default)
+{
+    if (env && *env) {
+        if (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
+            SDL_strcasecmp(env, "false") == 0 || SDL_strcasecmp(env, "no") == 0) {
+            return 0;
+        }
+        {
+            const int v = SDL_atoi(env);
+            if (v < 0) {
+                return 0;
+            }
+            if (v > 256) {
+                return 256;
+            }
+            return v;
+        }
+    }
+    if (profile_default < 0) {
+        return 0;
+    }
+    if (profile_default > 256) {
+        return 256;
+    }
+    return profile_default;
+}
+
 bool KITTY_SelectPingPong(const char *env, bool default_on)
 {
     if (!env || !*env) {

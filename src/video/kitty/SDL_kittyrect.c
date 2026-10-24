@@ -194,6 +194,94 @@ Uint64 KITTY_Fnv1a64(const Uint8 *data, size_t len)
     return h;
 }
 
+int KITTY_CoalesceRects(int fb_w, int fb_h, const SDL_Rect *in, int n_in,
+                        int gap_px, SDL_Rect *out, int max_out)
+{
+    SDL_Rect tmp[64];
+    int n = 0;
+    int i;
+    bool merged;
+
+    if (!in || !out || max_out <= 0 || fb_w <= 0 || fb_h <= 0 || n_in <= 0) {
+        return 0;
+    }
+    if (gap_px < 0) {
+        gap_px = 0;
+    }
+
+    for (i = 0; i < n_in && n < (int)(sizeof(tmp) / sizeof(tmp[0])); ++i) {
+        SDL_Rect fb = { 0, 0, fb_w, fb_h };
+        SDL_Rect clipped;
+        if (!SDL_GetRectIntersection(&in[i], &fb, &clipped) ||
+            clipped.w <= 0 || clipped.h <= 0) {
+            continue;
+        }
+        tmp[n++] = clipped;
+    }
+    if (n == 0) {
+        return 0;
+    }
+
+    /* Iteratively union near/overlapping pairs until stable. */
+    do {
+        merged = false;
+        for (i = 0; i < n; ++i) {
+            int j;
+            for (j = i + 1; j < n; ++j) {
+                SDL_Rect expanded = {
+                    tmp[i].x - gap_px,
+                    tmp[i].y - gap_px,
+                    tmp[i].w + 2 * gap_px,
+                    tmp[i].h + 2 * gap_px
+                };
+                if (SDL_HasRectIntersection(&expanded, &tmp[j])) {
+                    const int x0 = tmp[i].x < tmp[j].x ? tmp[i].x : tmp[j].x;
+                    const int y0 = tmp[i].y < tmp[j].y ? tmp[i].y : tmp[j].y;
+                    const int x1 = (tmp[i].x + tmp[i].w) > (tmp[j].x + tmp[j].w)
+                                       ? (tmp[i].x + tmp[i].w)
+                                       : (tmp[j].x + tmp[j].w);
+                    const int y1 = (tmp[i].y + tmp[i].h) > (tmp[j].y + tmp[j].h)
+                                       ? (tmp[i].y + tmp[i].h)
+                                       : (tmp[j].y + tmp[j].h);
+                    tmp[i].x = x0;
+                    tmp[i].y = y0;
+                    tmp[i].w = x1 - x0;
+                    tmp[i].h = y1 - y0;
+                    tmp[j] = tmp[n - 1];
+                    n--;
+                    merged = true;
+                    break;
+                }
+            }
+            if (merged) {
+                break;
+            }
+        }
+    } while (merged && n > 1);
+
+    if (n > max_out) {
+        /* Too many — fall back to single union of all remaining. */
+        SDL_Rect u = tmp[0];
+        for (i = 1; i < n; ++i) {
+            const int x0 = u.x < tmp[i].x ? u.x : tmp[i].x;
+            const int y0 = u.y < tmp[i].y ? u.y : tmp[i].y;
+            const int x1 = (u.x + u.w) > (tmp[i].x + tmp[i].w) ? (u.x + u.w) : (tmp[i].x + tmp[i].w);
+            const int y1 = (u.y + u.h) > (tmp[i].y + tmp[i].h) ? (u.y + u.h) : (tmp[i].y + tmp[i].h);
+            u.x = x0;
+            u.y = y0;
+            u.w = x1 - x0;
+            u.h = y1 - y0;
+        }
+        out[0] = u;
+        return 1;
+    }
+
+    for (i = 0; i < n; ++i) {
+        out[i] = tmp[i];
+    }
+    return n;
+}
+
 bool KITTY_SelectFbDiff(const char *env, bool default_on)
 {
     if (!env || !env[0]) {

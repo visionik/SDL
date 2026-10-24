@@ -41,6 +41,7 @@
     .pingpong = false,                                                         \
     .shm_unlink_after_send = false,                                            \
     .upload_skip = true,                                                       \
+    .coalesce_gap_px = 0,                                                      \
     .notes = NULL
 
 static const KITTY_TerminalProfile KITTY_profile_rex = {

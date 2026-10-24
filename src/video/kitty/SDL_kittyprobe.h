@@ -71,6 +71,9 @@ bool KITTY_SelectDirtyAT(const char *env, bool profile_default);
 /* SDL_KITTY_UPLOAD_SKIP: env forces on/off; else profile upload_skip. */
 bool KITTY_SelectUploadSkip(const char *env, bool profile_default);
 
+/* SDL_KITTY_COALESCE_GAP: unset → profile; "0" / off → 0; else atoi. */
+int KITTY_SelectCoalesceGap(const char *env, int profile_default);
+
 /* SDL_KITTY_PINGPONG=1 restores delete+swap presents; default is same-(i,p) replace. */
 bool KITTY_SelectPingPong(const char *env, bool default_on);
 

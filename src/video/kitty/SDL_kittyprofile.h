@@ -89,6 +89,12 @@ typedef struct KITTY_TerminalProfile
      */
     bool upload_skip;
 
+    /*
+     * Exp 5: merge dirty rects whose expanded boxes intersect (gap in pixels).
+     * 0 = off. Env SDL_KITTY_COALESCE_GAP overrides.
+     */
+    int coalesce_gap_px;
+
     /* Max raw size for SHM-fail → direct fallback when !prefer_direct. */
     size_t direct_fallback_max_bytes;
 

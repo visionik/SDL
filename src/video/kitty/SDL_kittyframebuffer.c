@@ -297,13 +297,34 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 size_t multi_total_px = 0;
                 int ri;
                 SDL_Rect fb = { 0, 0, surface->w, surface->h };
+                SDL_Rect coal_buf[32];
+                const SDL_Rect *af_rects = rects;
+                int af_n = numrects;
+                const int gap = KITTY_SelectCoalesceGap(
+                    SDL_getenv("SDL_KITTY_COALESCE_GAP"),
+                    vdata->term_profile ? vdata->term_profile->coalesce_gap_px : 0);
+
+                /* Exp 5: merge near/overlapping dirty rects before multi a=f. */
+                if (gap > 0) {
+                    const int cn = KITTY_CoalesceRects(
+                        surface->w, surface->h, rects, numrects, gap, coal_buf,
+                        (int)(sizeof(coal_buf) / sizeof(coal_buf[0])));
+                    if (cn > 0) {
+                        af_rects = coal_buf;
+                        af_n = cn;
+                        if (KITTY_DebugEnabled() && cn != numrects) {
+                            KITTY_DebugLog("kitty: coalesce %d -> %d rects (gap=%d)",
+                                           numrects, cn, gap);
+                        }
+                    }
+                }
 
                 /* Same af_max_* gates as the single-rect path: total pixels and
                  * union coverage. Per-rect-only caps allowed alpha_blit (~600k
                  * base64) to flood Kitty's PTY while each rect stayed under max. */
-                for (ri = 0; ri < numrects; ++ri) {
+                for (ri = 0; ri < af_n; ++ri) {
                     SDL_Rect clipped;
-                    if (!SDL_GetRectIntersection(&rects[ri], &fb, &clipped) ||
+                    if (!SDL_GetRectIntersection(&af_rects[ri], &fb, &clipped) ||
                         clipped.w <= 0 || clipped.h <= 0) {
                         continue;
                     }
@@ -313,13 +334,13 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     multi_ok = false;
                 }
 
-                for (ri = 0; multi_ok && ri < numrects; ++ri) {
+                for (ri = 0; multi_ok && ri < af_n; ++ri) {
                     SDL_Rect clipped;
                     size_t rpx;
                     size_t packed_len = 0;
                     bool pack_ok = false;
 
-                    if (!SDL_GetRectIntersection(&rects[ri], &fb, &clipped) ||
+                    if (!SDL_GetRectIntersection(&af_rects[ri], &fb, &clipped) ||
                         clipped.w <= 0 || clipped.h <= 0) {
                         continue;
                     }

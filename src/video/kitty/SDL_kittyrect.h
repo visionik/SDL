@@ -78,6 +78,13 @@ bool KITTY_FbPixelToCellCursor(int x, int y, int cell_w, int cell_h,
 Uint64 KITTY_Fnv1a64(const Uint8 *data, size_t len);
 
 /*
+ * Merge overlapping / near rects (expanded by gap_px). Writes up to max_out
+ * coalesced rects into out. Returns count (0 if nothing remains).
+ */
+int KITTY_CoalesceRects(int fb_w, int fb_h, const SDL_Rect *in, int n_in,
+                        int gap_px, SDL_Rect *out, int max_out);
+
+/*
  * 32x32 (or tile) memcmp of prev vs next tightly packed RGB/RGBA frames.
  * dirty_out receives the bounding box of changed tiles when RECT/FULL.
  * cover_limit: if bbox coverage >= limit → FULL (default caller uses ~0.45).
