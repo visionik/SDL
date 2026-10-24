@@ -79,6 +79,17 @@ typedef struct SDL_VideoData
     volatile sig_atomic_t got_winch;
     unsigned char tty_pending[KITTY_TTY_PENDING_MAX];
     size_t tty_pending_len;
+    /* Perf counters (SDL_KITTY_DEBUG present lines + kitty_perf_summary.py). */
+    size_t last_wire_bytes; /* APC bytes written on last successful upload */
+    size_t last_raw_bytes;  /* payload before b64 (zlib size or raw RGB) */
+    double last_ms_tx;      /* client compress+encode+write wall time */
+    double last_ms_ack;     /* host round-trip wait (-1 if not measured) */
+    Uint64 total_wire_bytes;
+    double total_ms_tx;
+    double total_ms_ack;
+    Uint32 wire_presents;
+    Uint32 ack_presents; /* presents where ms_ack was measured */
+    Uint32 skip_presents;
 } SDL_VideoData;
 
 /* Stacked a=T dirty overlays (dirty_at_overlays experiment). Ids 100+. */

@@ -137,6 +137,12 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         return SDL_SetError("kitty video/window data missing");
     }
 
+    /* Reset per-present perf fields (TransmitRGB / a=f refresh on success). */
+    vdata->last_wire_bytes = 0;
+    vdata->last_raw_bytes = 0;
+    vdata->last_ms_tx = 0.0;
+    vdata->last_ms_ack = -1.0;
+
     {
         const bool use_rgba = SDL_ISPIXELFORMAT_ALPHA(surface->format);
         const int bpp = use_rgba ? 4 : 3;
@@ -524,12 +530,18 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 mode_str = "diff_skip";
             }
             KITTY_DebugLog(
-                "kitty: present #%d %dx%d place=%d mode=%s rects=%d union=%dx%d coverage=%.2f convert_px=%zu upload_px=%zu live=%u pingpong=%d -> %s%s",
+                "kitty: present #%d %dx%d place=%d mode=%s rects=%d union=%dx%d coverage=%.2f "
+                "convert_px=%zu upload_px=%zu wire=%zu raw=%zu ms_tx=%.2f ms_ack=%.2f "
+                "live=%u pingpong=%d -> %s%s",
                 frames, surface->w, surface->h,
                 vdata->place_cells ? 1 : 0,
                 mode_str,
                 numrects, dirty.w, dirty.h, (double)cov,
                 convert_px, upload_px,
+                ok ? vdata->last_wire_bytes : (size_t)0,
+                ok ? vdata->last_raw_bytes : (size_t)0,
+                ok ? vdata->last_ms_tx : 0.0,
+                ok ? vdata->last_ms_ack : -1.0,
                 (unsigned)wdata->live_image_id,
                 KITTY_SelectPingPong(SDL_getenv("SDL_KITTY_PINGPONG"),
                                      vdata->term_profile && vdata->term_profile->pingpong)
@@ -537,6 +549,21 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     : 0,
                 ok ? "ok" : "FAIL ",
                 ok ? "" : SDL_GetError());
+            if (ok && (frames % 60) == 0 && vdata->wire_presents > 0) {
+                const double avg_tx = vdata->total_ms_tx / (double)vdata->wire_presents;
+                const double avg_ack =
+                    vdata->ack_presents
+                        ? (vdata->total_ms_ack / (double)vdata->ack_presents)
+                        : -1.0;
+                KITTY_DebugLog(
+                    "kitty: perf_summary presents=%u wire_total=%llu avg_wire=%llu "
+                    "avg_ms_tx=%.2f avg_ms_ack=%.2f ack_n=%u skips=%u",
+                    (unsigned)vdata->wire_presents,
+                    (unsigned long long)vdata->total_wire_bytes,
+                    (unsigned long long)(vdata->total_wire_bytes / vdata->wire_presents),
+                    avg_tx, avg_ack, (unsigned)vdata->ack_presents,
+                    (unsigned)vdata->skip_presents);
+            }
         }
         frames++;
     }

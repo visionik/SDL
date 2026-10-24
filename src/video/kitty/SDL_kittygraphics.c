@@ -106,10 +106,12 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
                                         const char *extra_keys,
                                         const Uint8 *payload, size_t payload_len,
                                         int kitty_f, bool home_cursor,
-                                        size_t chunk_bytes)
+                                        size_t chunk_bytes,
+                                        size_t *out_wire_bytes)
 {
     const size_t b64_len = ((payload_len + 2) / 3) * 4;
     const size_t chunk_cap = chunk_bytes > 0 ? chunk_bytes : KITTY_CHUNK_DEFAULT;
+    size_t wire = 0;
     char *b64 = (char *)SDL_malloc(b64_len + 1);
     if (!b64) {
         return false;
@@ -122,9 +124,12 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
 
     /* Homing every frame flashes some hosts during full a=T bursts; only home
      * when placing for the first time or when c/r place size changes. */
-    if (home_cursor && !KITTY_WriteAll(fd, "\033[H", 3)) {
-        SDL_free(b64);
-        return false;
+    if (home_cursor) {
+        if (!KITTY_WriteAll(fd, "\033[H", 3)) {
+            SDL_free(b64);
+            return false;
+        }
+        wire += 3;
     }
 
     size_t offset = 0;
@@ -163,16 +168,20 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
             SDL_free(b64);
             return false;
         }
+        wire += (size_t)header_len + chunk + 2;
         offset += chunk;
     }
 
     SDL_free(b64);
+    if (out_wire_bytes) {
+        *out_wire_bytes = wire;
+    }
     return true;
 }
 
 static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
                                      int place_cols, int place_rows, int kitty_f, bool home_cursor,
-                                     size_t chunk_bytes)
+                                     size_t chunk_bytes, size_t *out_wire_bytes, size_t *out_raw_bytes)
 {
     const int bpp = (kitty_f == 32) ? 4 : 3;
     const uLong raw_len = (uLong)w * (uLong)h * (uLong)bpp;
@@ -187,21 +196,29 @@ static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, 
         SDL_free(compressed);
         return SDL_SetError("zlib compress2 failed (%d)", zerr);
     }
-    const bool ok = KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows,
-                                                "o=z", compressed, (size_t)out_len, kitty_f,
-                                                home_cursor, chunk_bytes);
-    SDL_free(compressed);
-    return ok;
+    if (out_raw_bytes) {
+        *out_raw_bytes = (size_t)out_len; /* compressed payload size (pre-b64) */
+    }
+    {
+        const bool ok = KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows,
+                                                    "o=z", compressed, (size_t)out_len, kitty_f,
+                                                    home_cursor, chunk_bytes, out_wire_bytes);
+        SDL_free(compressed);
+        return ok;
+    }
 }
 
 static bool KITTY_TransmitDirectRaw(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
                                     int place_cols, int place_rows, int kitty_f, bool home_cursor,
-                                    size_t chunk_bytes)
+                                    size_t chunk_bytes, size_t *out_wire_bytes, size_t *out_raw_bytes)
 {
     const int bpp = (kitty_f == 32) ? 4 : 3;
     const size_t raw_len = (size_t)w * (size_t)h * (size_t)bpp;
+    if (out_raw_bytes) {
+        *out_raw_bytes = raw_len;
+    }
     return KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows, "", rgb, raw_len,
-                                       kitty_f, home_cursor, chunk_bytes);
+                                       kitty_f, home_cursor, chunk_bytes, out_wire_bytes);
 }
 
 /* POSIX SHM transmit. Unique names per call avoid reuse races when the host
@@ -887,10 +904,20 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
     }
 
     chunk_bytes = KITTY_ProfileApcChunkBytes(vdata->term_profile);
-    return KITTY_TransmitDirectPayload(vdata->tty_fd, image_id, rw, rh,
-                                       place_cols, place_rows, extra,
-                                       packed_rgb, payload_len, kitty_f,
-                                       false, chunk_bytes);
+    {
+        size_t wire = 0;
+        const bool ok = KITTY_TransmitDirectPayload(vdata->tty_fd, image_id, rw, rh,
+                                                   place_cols, place_rows, extra,
+                                                   packed_rgb, payload_len, kitty_f,
+                                                   false, chunk_bytes, &wire);
+        if (ok) {
+            vdata->last_wire_bytes = wire + (size_t)cup_len;
+            vdata->last_raw_bytes = payload_len;
+            vdata->total_wire_bytes += vdata->last_wire_bytes;
+            vdata->wire_presents += 1;
+        }
+        return ok;
+    }
 }
 
 bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
@@ -1046,6 +1073,9 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
             vdata->placed_cols != place_cols ||
             vdata->placed_rows != place_rows;
         bool ok = false;
+        size_t wire_bytes = 0;
+        size_t raw_bytes = 0;
+        const Uint64 t0 = SDL_GetTicksNS();
 
         {
             const int bpp = (kitty_f == 32) ? 4 : 3;
@@ -1063,12 +1093,17 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
                 if (KITTY_TransmitShm(vdata, image_id, rgb, w, h, place_cols, place_rows, kitty_f,
                                       home_cursor)) {
                     ok = true;
+                    raw_bytes = raw_len;
+                    /* SHM APC is path-sized; approximate from name+header ~200B. */
+                    wire_bytes = 256;
                 } else {
                     /* One retry with a fresh object name (seq bumps inside). */
                     SDL_ClearError();
                     if (KITTY_TransmitShm(vdata, image_id, rgb, w, h, place_cols, place_rows, kitty_f,
                                           home_cursor)) {
                         ok = true;
+                        raw_bytes = raw_len;
+                        wire_bytes = 256;
                     } else {
                         const bool prefer_direct =
                             vdata->term_profile && vdata->term_profile->prefer_direct;
@@ -1096,7 +1131,8 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
             if (!ok && vdata->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
                 if (KITTY_TransmitDirectZlib(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
                                              kitty_f, home_cursor,
-                                             KITTY_ProfileApcChunkBytes(vdata->term_profile))) {
+                                             KITTY_ProfileApcChunkBytes(vdata->term_profile),
+                                             &wire_bytes, &raw_bytes)) {
                     ok = true;
                 } else {
                     vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
@@ -1113,13 +1149,44 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
                 }
                 ok = KITTY_TransmitDirectRaw(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
                                              kitty_f, home_cursor,
-                                             KITTY_ProfileApcChunkBytes(vdata->term_profile));
+                                             KITTY_ProfileApcChunkBytes(vdata->term_profile),
+                                             &wire_bytes, &raw_bytes);
             }
+        }
+        {
+            const Uint64 t1 = SDL_GetTicksNS();
+            vdata->last_ms_tx = (double)(t1 - t0) / 1000000.0;
+            vdata->last_ms_ack = -1.0;
         }
         if (ok) {
             vdata->placed_cols = place_cols;
             vdata->placed_rows = place_rows;
             vdata->place_homed = true;
+            vdata->last_wire_bytes = wire_bytes;
+            vdata->last_raw_bytes = raw_bytes;
+            vdata->total_wire_bytes += wire_bytes;
+            vdata->total_ms_tx += vdata->last_ms_tx;
+            vdata->wire_presents += 1;
+
+            /* Optional host round-trip: wait for Gi=<id>;OK after a=T.
+             * Captures inflate+store latency zlib adds on the terminal side.
+             * Enable with SDL_KITTY_PERF_ACK=1 (slows presents to sync rate). */
+            {
+                const char *ack_env = SDL_getenv("SDL_KITTY_PERF_ACK");
+                if (ack_env && (ack_env[0] == '1' || SDL_strcasecmp(ack_env, "true") == 0 ||
+                                SDL_strcasecmp(ack_env, "yes") == 0 ||
+                                SDL_strcasecmp(ack_env, "on") == 0)) {
+                    const Uint64 a0 = SDL_GetTicksNS();
+                    const KITTY_GraphicsQueryStatus st =
+                        KITTY_AwaitGraphicsAck(vdata->tty_in, image_id, 100);
+                    const Uint64 a1 = SDL_GetTicksNS();
+                    if (st == KITTY_GQ_OK || st == KITTY_GQ_ERROR) {
+                        vdata->last_ms_ack = (double)(a1 - a0) / 1000000.0;
+                        vdata->total_ms_ack += vdata->last_ms_ack;
+                        vdata->ack_presents += 1;
+                    }
+                }
+            }
         }
         return ok;
     }

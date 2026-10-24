@@ -27,6 +27,9 @@ typedef enum KITTY_GraphicsQueryStatus
 /* Scan buf for APC reply ESC_Gi=<id>;OK|error ESC\ */
 KITTY_GraphicsQueryStatus KITTY_ParseGraphicsQueryReply(const char *buf, size_t len, Uint32 expect_id);
 
+/* Wait for Gi=<id>;OK|ERROR on fd (used for PERF_ACK present timing). */
+KITTY_GraphicsQueryStatus KITTY_AwaitGraphicsAck(int fd, Uint32 id, int timeout_ms);
+
 /*
  * Choose transmit mode from env + probe results.
  * force_env: SDL_KITTY_TRANSMIT value or NULL
@@ -42,8 +45,14 @@ typedef enum KITTY_TransmitMode
 } KITTY_TransmitMode;
 #endif
 
+/*
+ * force_env (SDL_KITTY_TRANSMIT) wins; else force_profile (TOML force_transmit);
+ * else prefer_direct / prefer_zlib / shm_ok.
+ */
 KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
+                                            const char *force_profile,
                                             bool prefer_direct,
+                                            bool prefer_zlib,
                                             bool shm_ok,
                                             bool direct_ok);
 

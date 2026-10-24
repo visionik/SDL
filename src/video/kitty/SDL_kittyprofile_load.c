@@ -39,6 +39,7 @@ typedef struct KITTY_ProfileEntry
     KITTY_TerminalProfile profile;
     char name_storage[64];
     char *notes_heap; /* owned; profile.notes points here when set */
+    char *force_transmit_heap; /* owned; profile.force_transmit points here */
     KITTY_StringList term_program;
     KITTY_StringList term_when_program_empty;
     KITTY_StringList term_substring;
@@ -113,6 +114,8 @@ static void KITTY_ClearEntry(KITTY_ProfileEntry *e)
     KITTY_FreeStringList(&e->term_substring);
     SDL_free(e->notes_heap);
     e->notes_heap = NULL;
+    SDL_free(e->force_transmit_heap);
+    e->force_transmit_heap = NULL;
     SDL_free(e->version_min);
     e->version_min = NULL;
     SDL_free(e->version_max);
@@ -345,6 +348,18 @@ static void KITTY_OverlayProfileFromTable(KITTY_TerminalProfile *p, toml_datum_t
 
     if (KITTY_TomlGetBool(tab, "prefer_direct", &b)) {
         p->prefer_direct = b;
+    }
+    if (KITTY_TomlGetBool(tab, "prefer_zlib", &b)) {
+        p->prefer_zlib = b;
+    }
+    if (entry && KITTY_TomlGetString(tab, "force_transmit", &s)) {
+        SDL_free(entry->force_transmit_heap);
+        entry->force_transmit_heap = NULL;
+        p->force_transmit = NULL;
+        if (s && *s && SDL_strcasecmp(s, "off") != 0 && SDL_strcasecmp(s, "none") != 0) {
+            entry->force_transmit_heap = SDL_strdup(s);
+            p->force_transmit = entry->force_transmit_heap;
+        }
     }
     if (KITTY_TomlGetString(tab, "default_fb_max", &s)) {
         int w = 0, h = 0;

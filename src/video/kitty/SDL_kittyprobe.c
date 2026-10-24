@@ -252,34 +252,48 @@ void KITTY_DebugLog(const char *fmt, ...)
     fflush(stderr);
 }
 
+static KITTY_TransmitMode KITTY_ParseTransmitForce(const char *force)
+{
+    if (!force || !*force) {
+        return KITTY_TRANSMIT_DIRECT; /* unused sentinel when caller checks NULL */
+    }
+    if (SDL_strcasecmp(force, "direct") == 0) {
+        return KITTY_TRANSMIT_DIRECT;
+    }
+    if (SDL_strcasecmp(force, "zlib") == 0) {
+        return KITTY_TRANSMIT_DIRECT_ZLIB;
+    }
+    if (SDL_strcasecmp(force, "shm") == 0) {
+        return KITTY_TRANSMIT_SHM;
+    }
+    return KITTY_TRANSMIT_DIRECT;
+}
+
 KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
+                                            const char *force_profile,
                                             bool prefer_direct,
+                                            bool prefer_zlib,
                                             bool shm_ok,
                                             bool direct_ok)
 {
     (void)direct_ok;
 
     if (force_env && *force_env) {
-        if (SDL_strcasecmp(force_env, "direct") == 0) {
-            return KITTY_TRANSMIT_DIRECT;
-        }
-        if (SDL_strcasecmp(force_env, "zlib") == 0) {
-            return KITTY_TRANSMIT_DIRECT_ZLIB;
-        }
-        if (SDL_strcasecmp(force_env, "shm") == 0) {
-            return KITTY_TRANSMIT_SHM;
-        }
+        return KITTY_ParseTransmitForce(force_env);
+    }
+    if (force_profile && *force_profile) {
+        return KITTY_ParseTransmitForce(force_profile);
     }
 
-    /* Host profile (e.g. Rex) may prefer direct even when SHM probes OK. */
+    /* Host profile (e.g. Rex/WezTerm) may skip SHM even when probe OK. */
     if (prefer_direct) {
-        return KITTY_TRANSMIT_DIRECT;
+        return prefer_zlib ? KITTY_TRANSMIT_DIRECT_ZLIB : KITTY_TRANSMIT_DIRECT;
     }
 
     if (shm_ok) {
         return KITTY_TRANSMIT_SHM;
     }
-    return KITTY_TRANSMIT_DIRECT;
+    return prefer_zlib ? KITTY_TRANSMIT_DIRECT_ZLIB : KITTY_TRANSMIT_DIRECT;
 }
 
 #ifndef KITTY_PROBE_STANDALONE
@@ -356,6 +370,22 @@ static KITTY_GraphicsQueryStatus KITTY_AwaitGraphicsQuery(int fd, Uint32 id, int
         }
     }
     return KITTY_GQ_NONE;
+}
+
+KITTY_GraphicsQueryStatus KITTY_AwaitGraphicsAck(int fd, Uint32 id, int timeout_ms)
+{
+    int attempts;
+    if (fd < 0 || id == 0) {
+        return KITTY_GQ_NONE;
+    }
+    if (timeout_ms <= 0) {
+        timeout_ms = 40;
+    }
+    attempts = (timeout_ms + 24) / 25;
+    if (attempts < 1) {
+        attempts = 1;
+    }
+    return KITTY_AwaitGraphicsQuery(fd, id, attempts);
 }
 
 static bool KITTY_ProbeDirectQuery(SDL_VideoData *data, Uint32 id)
@@ -513,7 +543,9 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
     const char *force = SDL_getenv("SDL_KITTY_TRANSMIT");
     const char *bw_env = SDL_getenv("SDL_KITTY_DIRTY_BW");
     const char *term_name = "unknown";
+    const char *force_profile = NULL;
     bool prefer_direct = false;
+    bool prefer_zlib = false;
     bool direct_ok = false;
     bool shm_ok = false;
     bool frame_ok = false;
@@ -527,6 +559,8 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
     data->frame_edit_ok = false;
     if (data->term_profile) {
         prefer_direct = data->term_profile->prefer_direct;
+        prefer_zlib = data->term_profile->prefer_zlib;
+        force_profile = data->term_profile->force_transmit;
         term_name = data->term_profile->name;
     }
 
@@ -535,19 +569,20 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
 
     direct_ok = KITTY_ProbeDirectQuery(data, id_direct);
     /* Skip SHM probe when the profile prefers direct (Rex) — SelectTransmitMode
-     * would ignore SHM anyway. Still probe if SDL_KITTY_TRANSMIT=shm. */
+     * would ignore SHM anyway. Still probe if env/profile forces shm. */
     {
-        const bool probe_shm =
-            (force && SDL_strcasecmp(force, "shm") == 0) || !prefer_direct;
+        const bool force_shm =
+            (force && SDL_strcasecmp(force, "shm") == 0) ||
+            (force_profile && SDL_strcasecmp(force_profile, "shm") == 0);
+        const bool probe_shm = force_shm || !prefer_direct;
         if (probe_shm) {
             shm_ok = KITTY_ProbeShmQuery(data, id_shm);
         }
 
-        data->transmit_mode =
-            KITTY_SelectTransmitMode(force, prefer_direct, shm_ok, direct_ok);
-        /* If mode is SHM (probe OK or SDL_KITTY_TRANSMIT=shm), clear the
-         * failure latch so the first present actually tries t=s. A failed
-         * a=q probe must not silently skip SHM when the user forced it. */
+        data->transmit_mode = KITTY_SelectTransmitMode(
+            force, force_profile, prefer_direct, prefer_zlib, shm_ok, direct_ok);
+        /* If mode is SHM (probe OK or forced), clear the failure latch so the
+         * first present actually tries t=s. */
         if (data->transmit_mode == KITTY_TRANSMIT_SHM) {
             data->shm_failed = false;
         } else {
@@ -566,13 +601,17 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
             } else if (data->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
                 mode = "zlib";
             }
-            KITTY_DebugLog("kitty: transmit_probe direct=%s shm=%s force=%s term=%s prefer_direct=%d -> %s",
-                           direct_ok ? "ok" : "fail",
-                           probe_shm ? (shm_ok ? "ok" : "fail") : "skip",
-                           force ? force : "(none)",
-                           term_name,
-                           prefer_direct ? 1 : 0,
-                           mode);
+            KITTY_DebugLog(
+                "kitty: transmit_probe direct=%s shm=%s force=%s profile_force=%s "
+                "term=%s prefer_direct=%d prefer_zlib=%d -> %s",
+                direct_ok ? "ok" : "fail",
+                probe_shm ? (shm_ok ? "ok" : "fail") : "skip",
+                force ? force : "(none)",
+                force_profile ? force_profile : "(none)",
+                term_name,
+                prefer_direct ? 1 : 0,
+                prefer_zlib ? 1 : 0,
+                mode);
             KITTY_DebugLog("kitty: frame_edit_probe %s -> dirty_bw=%s (env=%s)",
                            frame_ok ? "ok" : "fail",
                            bw ? "on" : "off",

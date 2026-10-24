@@ -39,6 +39,18 @@ typedef struct KITTY_TerminalProfile
     /* When both SHM and direct probe OK, prefer direct (Rex). */
     bool prefer_direct;
 
+    /*
+     * When not using SHM, prefer zlib-compressed direct (o=z) over raw base64.
+     * Env SDL_KITTY_TRANSMIT still wins. Exp 2 soak: wezterm true.
+     */
+    bool prefer_zlib;
+
+    /*
+     * Optional profile force of transmit medium: "direct", "zlib", "shm", or NULL.
+     * Applied after env. Ghostty zlib A/B without changing prefer_direct/SHM default.
+     */
+    const char *force_transmit;
+
     /* Default aspect-fit FB cap when SDL_KITTY_FB_MAX unset. 0 = no default cap. */
     int default_fb_max_w;
     int default_fb_max_h;
