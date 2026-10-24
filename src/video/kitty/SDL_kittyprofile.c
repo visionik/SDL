@@ -112,8 +112,8 @@ static const KITTY_TerminalProfile KITTY_profile_wezterm = {
     .silent_af_ok = false,
     .ignore_ioctl_pixels = false,
     .direct_af_when_shm = false,
-    /* Stacked a=T dirty rects until upstream invalidates ImageData.hash. */
-    .dirty_at_overlays = true,
+    /* dirty_at crashes WezTerm 20240203 (assign_image_to_cells overflow). */
+    .dirty_at_overlays = false,
     KITTY_PROFILE_TUNABLES
 };
 
