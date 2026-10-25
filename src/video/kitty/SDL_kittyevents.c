@@ -511,6 +511,7 @@ static SDL_Scancode KITTY_LegacyFinalToScancode(unsigned char final_byte, unsign
 /*
  * Handle a bare tty byte as a legacy text key press (no release report).
  * Applies event_type 1 with has_release false so min-hold schedules the up.
+ * Printable bytes also feed SDL text input when the app called StartTextInput.
  */
 static void KITTY_HandleAscii(SDL_VideoDevice *_this, unsigned char c)
 {
@@ -518,6 +519,12 @@ static void KITTY_HandleAscii(SDL_VideoDevice *_this, unsigned char c)
     (void)_this;
     /* Legacy text keys have no release; hold until next pump. */
     KITTY_ApplyKeyEvent(sc, 1, false);
+    if (c >= 32u && c < 127u) {
+        char text[2];
+        text[0] = (char)c;
+        text[1] = '\0';
+        SDL_SendKeyboardText(text);
+    }
 }
 
 /*
@@ -629,9 +636,11 @@ static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t 
 }
 
 /*
- * Parse Kitty CSI-u body (no leading '['), e.g. "97;1:3u", "27u", "97:65;5u".
- * Reads code, mods, and optional event subfield (1=press, 2=repeat, 3=release).
- * Sets SDL mod state and applies the key with has_release true (flag 2 path).
+ * Parse Kitty CSI-u body (no leading '['), e.g. "97;1:3u", "27u", "97:65;5u",
+ * or with associated text (flag 16): "97;1;65u" / "97;2:1;65u" / "97;1;72:105u".
+ * Reads code, mods, optional event subfield, optional text codepoints.
+ * Sets SDL mod state, applies the key (has_release), and on press/repeat with
+ * text + SDL text-input active, sends SDL_SendKeyboardText.
  * Returns false if the body does not end in 'u' or is too short.
  */
 static bool KITTY_ParseKittyKey(const char *seq, size_t len)
@@ -642,6 +651,10 @@ static bool KITTY_ParseKittyKey(const char *seq, size_t len)
     size_t i = 0;
     SDL_Scancode sc;
     bool has_event_field = false;
+    char textbuf[64];
+    size_t text_len = 0;
+
+    textbuf[0] = '\0';
 
     if (len < 2 || seq[len - 1] != 'u') {
         return false;
@@ -676,17 +689,48 @@ static bool KITTY_ParseKittyKey(const char *seq, size_t len)
         if (mods == 0) {
             mods = 1;
         }
+        /* Associated text: ;cp or ;cp:cp:… before final u (flag 16). */
+        if (i < len - 1 && seq[i] == ';') {
+            i++;
+            while (i < len - 1 && text_len + 4 < sizeof(textbuf)) {
+                unsigned cp = 0;
+                char *end;
+                if (seq[i] < '0' || seq[i] > '9') {
+                    break;
+                }
+                while (i < len - 1 && seq[i] >= '0' && seq[i] <= '9') {
+                    cp = cp * 10u + (unsigned)(seq[i] - '0');
+                    i++;
+                }
+                if (cp != 0) {
+                    end = SDL_UCS4ToUTF8(cp, textbuf + text_len);
+                    if (end) {
+                        text_len = (size_t)(end - textbuf);
+                        *end = '\0';
+                    }
+                }
+                if (i < len - 1 && seq[i] == ':') {
+                    i++;
+                    continue;
+                }
+                break;
+            }
+        }
     }
     /*
      * Kitty: omitted event-type subfield means press (1), not "no releases".
      * Rex sends digit presses as CSI 53 u and releases as CSI 53;1:3u.
-     * We always enable flag 2 (report event types), so CSI-u always has
-     * real releases — never arm the legacy min-hold auto-up path here.
+     * We enable flag 2 (report event types), so CSI-u has real releases when
+     * kitty_keyboard_ok — never arm the legacy min-hold auto-up path here.
      */
     (void)has_event_field;
     SDL_SetModState(KITTY_ModsToSDL(mods));
     sc = KITTY_CodeToScancode(code);
     KITTY_ApplyKeyEvent(sc, (int)event, true /* has_release */);
+    /* Text only on press/repeat; SDL_SendKeyboardText no-ops if input inactive. */
+    if (text_len > 0 && event != 3) {
+        SDL_SendKeyboardText(textbuf);
+    }
     return true;
 }
 

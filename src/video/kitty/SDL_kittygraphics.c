@@ -804,7 +804,7 @@ static bool KITTY_ModeRecognized(SDL_VideoData *data, int mode)
 }
 
 /*
- * Query whether the host honored Kitty keyboard push (CSI > 11 u).
+ * Query whether the host honored Kitty keyboard push (CSI > 27 u).
  * Sends CSI ? u and waits briefly for CSI ? <flags> u. WezTerm only replies
  * when enable_kitty_keyboard=true; otherwise the query is ignored.
  */
@@ -861,9 +861,9 @@ static bool KITTY_ProbeKittyKeyboard(SDL_VideoData *data)
 
 /*
  * Enter alt screen, hide cursor, home/clear, and request Kitty keyboard
- * (CSI > 11 u = disambiguate + event types + all keys as CSI). Then probe
- * with CSI ? u; sets data->kitty_keyboard_ok. Mouse is deferred to
- * KITTY_EnableMouse so reports do not flood size queries.
+ * (CSI > 27 u = flags 1|2|8|16: disambiguate, event types, all keys as CSI,
+ * associated text). Then probe with CSI ? u; sets data->kitty_keyboard_ok.
+ * Mouse is deferred to KITTY_EnableMouse so reports do not flood size queries.
  */
 bool KITTY_SetupTerminal(SDL_VideoData *data)
 {
@@ -872,7 +872,7 @@ bool KITTY_SetupTerminal(SDL_VideoData *data)
         "\033[?25l"
         "\033[H"
         "\033[2J"
-        "\033[>11u";
+        "\033[>27u";
 
     data->mouse_sgr_pixels = false;
     data->mouse_enabled = false;
