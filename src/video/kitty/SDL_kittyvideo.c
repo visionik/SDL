@@ -158,6 +158,8 @@ static SDL_VideoDevice *KITTY_CreateDevice(void)
     device->DestroyWindowFramebuffer = SDL_KITTY_DestroyWindowFramebuffer;
     device->CreateSDLWindow = KITTY_CreateWindow;
     device->DestroyWindow = KITTY_DestroyWindow;
+    device->ShowWindow = KITTY_ShowWindow;
+    device->HideWindow = KITTY_HideWindow;
     device->SetWindowSize = KITTY_SetWindowSize;
     device->free = KITTY_DeleteDevice;
 

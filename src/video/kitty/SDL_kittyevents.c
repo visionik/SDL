@@ -939,12 +939,12 @@ void KITTY_PumpEvents(SDL_VideoDevice *_this)
     KITTY_FlushDueKeyUps();
 
     /*
-     * CreateWindow emits FOCUS_GAINED before some apps (MAME) register the
-     * window id. Re-announce once from the pump so has_focus()/input poll works.
+     * Single focus announce on the first pump (not in CreateWindow). Late
+     * listeners (MAME) still see FOCUS_GAINED; early CreateWindow+re-announce
+     * pairs are avoided.
      */
     if (!data->focus_announced && data->focus_window) {
         data->focus_announced = true;
-        data->focus_window->flags &= ~SDL_WINDOW_INPUT_FOCUS;
         SDL_SetKeyboardFocus(data->focus_window);
         SDL_SetMouseFocus(data->focus_window);
     }

@@ -91,7 +91,7 @@ typedef struct SDL_VideoData
     int placed_rows;
     bool place_homed; /* CSI home already sent for current place; skip on replace */
     SDL_Window *focus_window;
-    bool focus_announced; /* re-emit FOCUS_GAINED once from PumpEvents for late listeners (e.g. MAME) */
+    bool focus_announced; /* SetKeyboardFocus once from first PumpEvents (deferred from CreateWindow) */
     volatile sig_atomic_t got_winch;
     unsigned char tty_pending[KITTY_TTY_PENDING_MAX];
     size_t tty_pending_len;

@@ -28,7 +28,6 @@
  */
 
 #include "../../events/SDL_keyboard_c.h"
-#include "../../events/SDL_mouse_c.h"
 #include "../../events/SDL_windowevents_c.h"
 #include "../SDL_sysvideo.h"
 #include "SDL_kittygraphics.h"
@@ -38,7 +37,8 @@
 /*
  * Create a terminal-filling window: refresh tty size, force w/h to CSI pixel
  * metrics (or profile fallback), allocate SDL_WindowData and dual Kitty image
- * ids, take keyboard/mouse focus, and post RESIZED/SHOWN events.
+ * ids, and post RESIZED. Focus waits for the first PumpEvents; SHOWN comes
+ * from FinishWindowCreation → SDL_ShowWindow → KITTY_ShowWindow.
  */
 bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_PropertiesID create_props)
 {
@@ -103,13 +103,19 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
     window->internal = data;
 
     vdata->focus_window = window;
-    vdata->focus_announced = false;
-    SDL_SetKeyboardFocus(window);
-    SDL_SetMouseFocus(window);
+    /* Do not clear focus_announced here: GetWindowSurface may RecreateWindow
+     * (texture-framebuffer probe → OpenGL/Metal reconfigure) and would otherwise
+     * re-announce FOCUS_GAINED on the next pump. calloc leaves it false once. */
+    if (vdata->focus_announced && SDL_GetKeyboardFocus() == window) {
+        /* RecreateWindow replaces window->flags and drops INPUT_FOCUS without a
+         * LOST event; restore the flag so we do not emit a second GAINED. */
+        window->flags |= SDL_WINDOW_INPUT_FOCUS;
+    }
+    /* Defer first SetKeyboardFocus / SetMouseFocus to PumpEvents so apps that
+     * register the window after CreateWindow (e.g. MAME) still see one
+     * FOCUS_GAINED. Leave HIDDEN set so FinishWindowCreation → ShowWindow runs
+     * our no-op KITTY_ShowWindow (avoids SDL's default SetKeyboardFocus). */
     SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
-    SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_SHOWN, 0, 0);
-    /* FOCUS_GAINED also comes from SetKeyboardFocus; PumpEvents re-announces
-     * once so late window registries (MAME) still see focus. */
     return true;
 }
 
@@ -146,6 +152,27 @@ void KITTY_SetWindowSize(SDL_VideoDevice *_this, SDL_Window *window)
 {
     (void)_this;
     SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->pending.w, window->pending.h);
+}
+
+/*
+ * Visibility is implicit in the tty framebuffer. Stub so SDL_ShowWindow does
+ * not call the default SetKeyboardFocus (PumpEvents owns the single announce).
+ */
+void KITTY_ShowWindow(SDL_VideoDevice *_this, SDL_Window *window)
+{
+    (void)_this;
+    (void)window;
+}
+
+/*
+ * Stub so SDL_HideWindow does not call the default SetKeyboardFocus(NULL),
+ * which produced FOCUS_LOST between CreateWindow/ShowWindow and the deferred
+ * PumpEvents FOCUS_GAINED.
+ */
+void KITTY_HideWindow(SDL_VideoDevice *_this, SDL_Window *window)
+{
+    (void)_this;
+    (void)window;
 }
 
 #endif // SDL_VIDEO_DRIVER_KITTY
