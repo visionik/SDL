@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 2026 Visionik <visionik@pobox.com>
 */
 #ifdef KITTY_PROFILE_STANDALONE
 #include <SDL3/SDL.h>
