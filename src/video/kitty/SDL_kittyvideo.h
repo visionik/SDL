@@ -66,6 +66,9 @@ typedef struct SDL_VideoData
     const struct KITTY_TerminalProfile *term_profile;
     bool terminal_owned;
     bool keyboard_enabled;
+    /* True when CSI ? u answered after CSI > 11 u (Kitty keyboard protocol
+     * active). WezTerm stays false unless enable_kitty_keyboard=true. */
+    bool kitty_keyboard_ok;
     bool mouse_enabled;
     bool mouse_sgr_pixels; /* true: DECSET 1016 (pixel coords); false: 1006 (cells) */
     bool place_cells;      /* true: Kitty c/r stretch to grid; scale mouse into FB */

@@ -74,6 +74,9 @@ static SDL_Window *KITTY_FocusWindow(SDL_VideoDevice *_this)
  * minimum time so at least one input poll sees them pressed.
  */
 #define KITTY_KEY_HOLD_MS_DEFAULT 80u
+/* Bridge typical macOS/Windows key-repeat delay when the host only sends
+ * press + OS autorepeat (no Kitty keyboard :3 releases). */
+#define KITTY_KEY_HOLD_MS_NO_RELEASE 400u
 #define KITTY_KEY_HOLD_MAX 64
 typedef struct KITTY_KeyHold
 {
@@ -100,6 +103,43 @@ static Uint32 KITTY_KeyHoldMs(void)
         }
     }
     return KITTY_KEY_HOLD_MS_DEFAULT;
+}
+
+/*
+ * Hold duration for a key that will use min-hold auto-up (has_release false).
+ * Navigation keys get a longer bridge so OS key-repeat delay does not feel like
+ * a dead stick when Kitty keyboard protocol is off.
+ */
+static Uint32 KITTY_KeyHoldMsFor(SDL_Scancode sc)
+{
+    Uint32 ms = KITTY_KeyHoldMs();
+    switch (sc) {
+    case SDL_SCANCODE_LEFT:
+    case SDL_SCANCODE_RIGHT:
+    case SDL_SCANCODE_UP:
+    case SDL_SCANCODE_DOWN:
+    case SDL_SCANCODE_HOME:
+    case SDL_SCANCODE_END:
+    case SDL_SCANCODE_PAGEUP:
+    case SDL_SCANCODE_PAGEDOWN:
+        if (ms < KITTY_KEY_HOLD_MS_NO_RELEASE) {
+            ms = KITTY_KEY_HOLD_MS_NO_RELEASE;
+        }
+        break;
+    default:
+        break;
+    }
+    return ms;
+}
+
+/* True when CSI > 11 u was acknowledged (press/release expected). */
+static bool KITTY_KittyKeyboardOk(void)
+{
+    SDL_VideoDevice *dev = SDL_GetVideoDevice();
+    if (dev && dev->internal) {
+        return ((SDL_VideoData *)dev->internal)->kitty_keyboard_ok;
+    }
+    return false;
 }
 
 /*
@@ -236,7 +276,7 @@ static void KITTY_ApplyKeyEvent(SDL_Scancode sc, int event_type, bool has_releas
         if (h) {
             h->down = true;
             h->want_up = false;
-            h->earliest_up_ms = now + KITTY_KeyHoldMs();
+            h->earliest_up_ms = now + (has_release ? KITTY_KeyHoldMs() : KITTY_KeyHoldMsFor(sc));
         }
         return;
     }
@@ -246,7 +286,7 @@ static void KITTY_ApplyKeyEvent(SDL_Scancode sc, int event_type, bool has_releas
     h = KITTY_FindHold(sc, true);
     if (h) {
         h->down = true;
-        h->earliest_up_ms = now + KITTY_KeyHoldMs();
+        h->earliest_up_ms = now + (has_release ? KITTY_KeyHoldMs() : KITTY_KeyHoldMsFor(sc));
         /* Legacy (no release reports): schedule up after min hold. */
         h->want_up = !has_release;
     }
@@ -697,13 +737,17 @@ static void KITTY_ParseLegacyCSIKey(const char *seq, size_t len, unsigned char f
             }
         }
     }
-    /* With flag 2, Rex sends CSI 1;1:1A / 1;1:3A — treat as release-capable
-     * whenever the event subfield is present; also when omitted after we
-     * requested event types, still expect a later :3 (same as CSI-u). */
+    /*
+     * When kitty_keyboard_ok (CSI ? u after CSI > 11 u), expect real :3
+     * releases even if press omits :event. Otherwise treat as press+OS-repeat
+     * only (WezTerm with enable_kitty_keyboard=false) and auto-up.
+     */
     SDL_SetModState(KITTY_ModsToSDL(mods));
     sc = KITTY_LegacyFinalToScancode(final_byte, number);
-    KITTY_ApplyKeyEvent(sc, (int)event, true /* has_release */);
-    (void)has_event_field;
+    {
+        const bool expect_release = KITTY_KittyKeyboardOk() || has_event_field;
+        KITTY_ApplyKeyEvent(sc, (int)event, expect_release);
+    }
 }
 
 /*

@@ -133,6 +133,7 @@ static SDL_VideoDevice *KITTY_CreateDevice(void)
                                                            : KITTY_TRANSMIT_SHM;
     data->shm_failed = false;
     data->frame_edit_ok = false;
+    data->kitty_keyboard_ok = false;
     /* Stretch FB to the cell grid by default (profile.place_cells); env overrides. */
     {
         const char *place = SDL_getenv("SDL_KITTY_PLACE_CELLS");

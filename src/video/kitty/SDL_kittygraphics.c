@@ -804,9 +804,66 @@ static bool KITTY_ModeRecognized(SDL_VideoData *data, int mode)
 }
 
 /*
- * Enter alt screen, hide cursor, home/clear, and enable Kitty keyboard
- * (CSI > 11 u = disambiguate + event types + all keys as CSI). Mouse is
- * deferred to KITTY_EnableMouse so reports do not flood size queries.
+ * Query whether the host honored Kitty keyboard push (CSI > 11 u).
+ * Sends CSI ? u and waits briefly for CSI ? <flags> u. WezTerm only replies
+ * when enable_kitty_keyboard=true; otherwise the query is ignored.
+ */
+static bool KITTY_ProbeKittyKeyboard(SDL_VideoData *data)
+{
+    static const char query[] = "\033[?u";
+    unsigned char buf[64];
+    size_t total = 0;
+
+    if (!data || data->tty_in < 0 || data->tty_out < 0) {
+        return false;
+    }
+    if (!KITTY_WriteAll(data->tty_out, query, sizeof(query) - 1)) {
+        return false;
+    }
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        fd_set fds;
+        struct timeval tv;
+        FD_ZERO(&fds);
+        FD_SET(data->tty_in, &fds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 25000;
+        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+            continue;
+        }
+        {
+            const ssize_t n = read(data->tty_in, buf + total, sizeof(buf) - 1 - total);
+            if (n <= 0) {
+                continue;
+            }
+            total += (size_t)n;
+            buf[total] = '\0';
+        }
+        for (size_t i = 0; i + 3 < total; ++i) {
+            unsigned flags = 0;
+            if (buf[i] == 0x1b && buf[i + 1] == '[' && buf[i + 2] == '?' &&
+                SDL_sscanf((char *)buf + i + 3, "%u", &flags) == 1) {
+                /* Reply is CSI ? <flags> u — confirm trailing 'u'. */
+                const char *p = (char *)buf + i + 3;
+                while (*p >= '0' && *p <= '9') {
+                    p++;
+                }
+                if (*p == 'u') {
+                    return true;
+                }
+            }
+        }
+        if (total >= sizeof(buf) - 1) {
+            break;
+        }
+    }
+    return false;
+}
+
+/*
+ * Enter alt screen, hide cursor, home/clear, and request Kitty keyboard
+ * (CSI > 11 u = disambiguate + event types + all keys as CSI). Then probe
+ * with CSI ? u; sets data->kitty_keyboard_ok. Mouse is deferred to
+ * KITTY_EnableMouse so reports do not flood size queries.
  */
 bool KITTY_SetupTerminal(SDL_VideoData *data)
 {
@@ -822,7 +879,26 @@ bool KITTY_SetupTerminal(SDL_VideoData *data)
     data->place_homed = false;
     data->placed_cols = 0;
     data->placed_rows = 0;
-    return KITTY_WriteAll(data->tty_out, setup, sizeof(setup) - 1);
+    data->kitty_keyboard_ok = false;
+    if (!KITTY_WriteAll(data->tty_out, setup, sizeof(setup) - 1)) {
+        return false;
+    }
+    data->kitty_keyboard_ok = KITTY_ProbeKittyKeyboard(data);
+    if (!data->kitty_keyboard_ok && data->term_profile && data->term_profile->name &&
+        SDL_strcasecmp(data->term_profile->name, "wezterm") == 0) {
+        /* Always warn (not RUNTIME_DEBUG): games need press/release. */
+        SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                    "kitty: WezTerm kitty keyboard inactive (CSI ? u unanswered). "
+                    "Set enable_kitty_keyboard = true in wezterm.lua for "
+                    "press/release keys; until then arrow holds use OS key-repeat.");
+    }
+#ifdef SDL_KITTY_RUNTIME_DEBUG
+    if (KITTY_DebugEnabled()) {
+        KITTY_DebugLog("kitty: keyboard_protocol %s",
+                       data->kitty_keyboard_ok ? "ok" : "off");
+    }
+#endif
+    return true;
 }
 
 /*
