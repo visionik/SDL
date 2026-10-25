@@ -18,6 +18,12 @@
      misrepresented as being the original software.
   3. This notice may not be removed or altered from any source distribution.
 */
+
+/*
+ * Implementation of dirty-rect / present helpers: union and coalesce,
+ * place_cells mapping, FNV-1a, tile-diff, convert-mode and FB-diff selectors,
+ * and surface→RGB/RGBA convert + pack for Kitty APC payloads.
+ */
 #ifdef KITTY_RECT_STANDALONE
 #include <SDL3/SDL.h>
 #else
@@ -29,6 +35,10 @@
 
 #include "SDL_kittyrect.h"
 
+/*
+ * Clamp rects to the FB and compute their axis-aligned union into *out.
+ * Empty/null rect list → full FB. Returns false if nothing remains in-bounds.
+ */
 bool KITTY_UnionRects(int fb_w, int fb_h, const SDL_Rect *rects, int numrects, SDL_Rect *out)
 {
     SDL_Rect fb;
@@ -82,6 +92,10 @@ bool KITTY_UnionRects(int fb_w, int fb_h, const SDL_Rect *rects, int numrects, S
     return true;
 }
 
+/*
+ * area(union_rect) / (fb_w*fb_h), clamped to [0,1]. Returns 1.0 if FB size
+ * is invalid; 0.0 if union_rect is empty/NULL.
+ */
 float KITTY_CoverageRatio(int fb_w, int fb_h, const SDL_Rect *union_rect)
 {
     const float denom = (float)fb_w * (float)fb_h;
@@ -99,6 +113,10 @@ float KITTY_CoverageRatio(int fb_w, int fb_h, const SDL_Rect *union_rect)
     return area / denom;
 }
 
+/*
+ * Map an FB pixel rect onto the cols×rows place_cells grid (ceil on the
+ * far edges). Writes 0-based col/row and place span; false on bad args.
+ */
 bool KITTY_FbRectToPlaceCells(int fb_w, int fb_h, const SDL_Rect *fb_rect,
                               int cols, int rows,
                               int *out_col0, int *out_row0,
@@ -165,6 +183,10 @@ bool KITTY_FbRectToPlaceCells(int fb_w, int fb_h, const SDL_Rect *fb_rect,
     return *out_place_cols > 0 && *out_place_rows > 0;
 }
 
+/*
+ * Map FB pixel (x,y) to 0-based cell indices and in-cell offsets for 1:1
+ * place. Requires non-negative x/y and positive cell size.
+ */
 bool KITTY_FbPixelToCellCursor(int x, int y, int cell_w, int cell_h,
                                int *out_col0, int *out_row0,
                                int *out_X, int *out_Y)
@@ -180,6 +202,9 @@ bool KITTY_FbPixelToCellCursor(int x, int y, int cell_w, int cell_h,
     return true;
 }
 
+/*
+ * FNV-1a 64-bit hash over len bytes. NULL data returns the offset basis.
+ */
 Uint64 KITTY_Fnv1a64(const Uint8 *data, size_t len)
 {
     Uint64 h = 14695981039346656037ULL;
@@ -194,6 +219,10 @@ Uint64 KITTY_Fnv1a64(const Uint8 *data, size_t len)
     return h;
 }
 
+/*
+ * True if the place box touches any screen edge (or dims are non-positive).
+ * Used by Exp 3 to skip edge-touching union overlays.
+ */
 bool KITTY_PlaceCellsTouchesEdge(int col0, int row0, int place_cols, int place_rows,
                                  int cols, int rows)
 {
@@ -209,6 +238,11 @@ bool KITTY_PlaceCellsTouchesEdge(int col0, int row0, int place_cols, int place_r
     return false;
 }
 
+/*
+ * Clip in[] to the FB, then iteratively union pairs whose gap_px-expanded
+ * boxes intersect (tmp cap 64). If more than max_out remain, collapse to
+ * one union. Returns written count (0 on bad args / empty).
+ */
 int KITTY_CoalesceRects(int fb_w, int fb_h, const SDL_Rect *in, int n_in,
                         int gap_px, SDL_Rect *out, int max_out)
 {
@@ -297,6 +331,9 @@ int KITTY_CoalesceRects(int fb_w, int fb_h, const SDL_Rect *in, int n_in,
     return n;
 }
 
+/*
+ * SDL_KITTY_FB_DIFF: unset → default_on; "0"/off/false/no → false; else true.
+ */
 bool KITTY_SelectFbDiff(const char *env, bool default_on)
 {
     if (!env || !env[0]) {
@@ -309,6 +346,10 @@ bool KITTY_SelectFbDiff(const char *env, bool default_on)
     return true;
 }
 
+/*
+ * SDL_KITTY_FB_DIFF_TILE: env atoi overrides default_tile (or 32); clamp
+ * to [8, 128].
+ */
 int KITTY_SelectFbDiffTile(const char *env, int default_tile)
 {
     int tile = default_tile > 0 ? default_tile : 32;
@@ -324,6 +365,10 @@ int KITTY_SelectFbDiffTile(const char *env, int default_tile)
     return tile;
 }
 
+/*
+ * SDL_KITTY_FB_DIFF_COVER: env atof overrides default_cover (or 0.45);
+ * clamp to [0.05, 1.0].
+ */
 float KITTY_SelectFbDiffCover(const char *env, float default_cover)
 {
     float cover = default_cover > 0.0f ? default_cover : 0.45f;
@@ -339,6 +384,11 @@ float KITTY_SelectFbDiffCover(const char *env, float default_cover)
     return cover;
 }
 
+/*
+ * Compare prev/next by tile×tile memcmp (bpp 3 or 4). NONE if identical;
+ * RECT with dirty_out bbox if coverage < cover_limit; FULL if coverage
+ * high or args invalid (dirty_out defaults to full FB then).
+ */
 KITTY_DiffOutcome KITTY_TileDiffBBox(const Uint8 *prev, const Uint8 *next,
                                      int fb_w, int fb_h, int bpp, int tile,
                                      float cover_limit, SDL_Rect *dirty_out)
@@ -409,6 +459,10 @@ KITTY_DiffOutcome KITTY_TileDiffBBox(const Uint8 *prev, const Uint8 *next,
     return KITTY_DIFF_RECT;
 }
 
+/*
+ * FULL if SDL_KITTY_DIRTY disables dirty, scratch invalid, or union empty;
+ * else DIRTY with dirty_out = union (no coverage threshold).
+ */
 KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
                                                  const SDL_Rect *rects, int numrects,
                                                  bool scratch_valid, SDL_Rect *dirty_out)
@@ -446,6 +500,10 @@ KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
     return KITTY_CONVERT_DIRTY;
 }
 
+/*
+ * Copy a clipped rect from a full-frame RGB24 scratch into tightly packed
+ * out (rw*rh*3). Fails if out_cap is too small.
+ */
 bool KITTY_PackRGBRect(const Uint8 *rgb_scratch, int fb_w, int fb_h,
                        const SDL_Rect *rect, Uint8 *out, size_t out_cap, size_t *out_len)
 {
@@ -479,6 +537,10 @@ bool KITTY_PackRGBRect(const Uint8 *rgb_scratch, int fb_w, int fb_h,
     return true;
 }
 
+/*
+ * Convert a clipped XRGB8888 (32-bit) surface rect into RGB24 rows inside
+ * a full-size rgb_scratch (w*h*3). Only the rect's pixels are written.
+ */
 bool KITTY_ConvertSurfaceRectToRGB(SDL_Surface *surface, const SDL_Rect *rect, Uint8 *rgb_scratch)
 {
     SDL_Rect area;
@@ -513,6 +575,10 @@ bool KITTY_ConvertSurfaceRectToRGB(SDL_Surface *surface, const SDL_Rect *rect, U
     return true;
 }
 
+/*
+ * Convert a clipped ARGB8888 surface rect into RGBA32 (R,G,B,A) rows inside
+ * a full-size rgba_scratch for Kitty f=32.
+ */
 bool KITTY_ConvertSurfaceRectToRGBA(SDL_Surface *surface, const SDL_Rect *rect, Uint8 *rgba_scratch)
 {
     SDL_Rect area;
@@ -549,6 +615,10 @@ bool KITTY_ConvertSurfaceRectToRGBA(SDL_Surface *surface, const SDL_Rect *rect, 
     return true;
 }
 
+/*
+ * Copy a clipped rect from a full-frame RGBA32 scratch into tightly packed
+ * out (rw*rh*4). Fails if out_cap is too small.
+ */
 bool KITTY_PackRGBARect(const Uint8 *rgba_scratch, int fb_w, int fb_h,
                         const SDL_Rect *rect, Uint8 *out, size_t out_cap, size_t *out_len)
 {

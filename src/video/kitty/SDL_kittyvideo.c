@@ -22,6 +22,11 @@
 
 #ifdef SDL_VIDEO_DRIVER_KITTY
 
+/*
+ * SDL video device bootstrap for SDL_VIDEO_DRIVER=kitty: create the device,
+ * open the tty, load terminal profiles, and wire window/FB/event hooks.
+ */
+
 #include "../../events/SDL_events_c.h"
 #include "../SDL_pixels_c.h"
 #include "../SDL_sysvideo.h"
@@ -37,12 +42,25 @@
 #include <signal.h>
 #include <unistd.h>
 
+/*
+ * Enter raw mode, size the pane, probe APC transmit modes, optionally enable
+ * mouse, and register the SDL display from CSI/tty metrics.
+ */
 static bool KITTY_VideoInit(SDL_VideoDevice *_this);
+
+/*
+ * Restore the previous SIGWINCH handler and leave owned terminal modes
+ * (keyboard/mouse/APC state) before the video device is torn down.
+ */
 static void KITTY_VideoQuit(SDL_VideoDevice *_this);
 
 static SDL_VideoData *KITTY_winch_data = NULL;
 static void (*KITTY_prev_winch)(int) = SIG_DFL;
 
+/*
+ * SIGWINCH handler: mark the active SDL_VideoData so PumpEvents/VideoInit can
+ * re-query tty size. Does not write the tty or post SDL events itself.
+ */
 static void KITTY_HandleSIGWINCH(int sig)
 {
     (void)sig;
@@ -51,6 +69,10 @@ static void KITTY_HandleSIGWINCH(int sig)
     }
 }
 
+/*
+ * True only when SDL_HINT_VIDEO_DRIVER names "kitty" and KITTY_ProbeSupport
+ * succeeds. Never auto-selects this driver.
+ */
 static bool KITTY_Available(void)
 {
     const char *hint = SDL_GetHint(SDL_HINT_VIDEO_DRIVER);
@@ -61,6 +83,9 @@ static bool KITTY_Available(void)
     return KITTY_ProbeSupport();
 }
 
+/*
+ * Free the SDL_VideoData and the SDL_VideoDevice allocated by KITTY_CreateDevice.
+ */
 static void KITTY_DeleteDevice(SDL_VideoDevice *device)
 {
     if (device->internal) {
@@ -70,6 +95,11 @@ static void KITTY_DeleteDevice(SDL_VideoDevice *device)
     SDL_free(device);
 }
 
+/*
+ * Allocate SDL_VideoDevice + SDL_VideoData, detect the terminal profile, bind
+ * tty in/out fds, set initial transmit/place defaults, and hook window, FB,
+ * and event entry points. Returns NULL if the driver is unavailable.
+ */
 static SDL_VideoDevice *KITTY_CreateDevice(void)
 {
     SDL_VideoDevice *device;
@@ -133,6 +163,9 @@ static SDL_VideoDevice *KITTY_CreateDevice(void)
     return device;
 }
 
+/*
+ * SDL VideoBootStrap entry for the kitty driver; CreateDevice is the factory.
+ */
 VideoBootStrap KITTY_bootstrap = {
     KITTYVID_DRIVER_NAME, "SDL Kitty graphics protocol video driver",
     KITTY_CreateDevice,
@@ -140,6 +173,11 @@ VideoBootStrap KITTY_bootstrap = {
     false
 };
 
+/*
+ * Enter raw mode, size the pane (with stub-WINCH wait), probe APC transmit
+ * modes, optionally enable mouse, and register the SDL display from CSI/tty
+ * metrics. On failure restores the terminal and clears terminal_owned.
+ */
 static bool KITTY_VideoInit(SDL_VideoDevice *_this)
 {
     SDL_VideoData *data = (SDL_VideoData *)_this->internal;
@@ -258,6 +296,10 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
     return true;
 }
 
+/*
+ * Restore the previous SIGWINCH handler and leave owned terminal modes
+ * (keyboard/mouse/APC state) before the video device is torn down.
+ */
 static void KITTY_VideoQuit(SDL_VideoDevice *_this)
 {
     SDL_VideoData *data = (SDL_VideoData *)_this->internal;

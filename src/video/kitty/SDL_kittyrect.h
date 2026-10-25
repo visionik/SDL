@@ -18,6 +18,12 @@
      misrepresented as being the original software.
   3. This notice may not be removed or altered from any source distribution.
 */
+
+/*
+ * Dirty-rect and present helpers for the Kitty video driver: union/coalesce
+ * rects, place_cells / cell-cursor mapping, FNV fingerprint, tile-diff bbox,
+ * convert-mode / FB-diff env selectors, and XRGB/ARGB → RGB24/RGBA32 pack.
+ */
 #ifdef KITTY_RECT_STANDALONE
 #include <SDL3/SDL.h>
 #else
@@ -52,10 +58,16 @@ typedef enum KITTY_DiffOutcome
     KITTY_DIFF_FULL      /* bbox coverage too high — full present */
 } KITTY_DiffOutcome;
 
-/* Clamp and union rects into the FB. Returns false if nothing remains. */
+/*
+ * Clamp rects to the FB and compute their axis-aligned union into *out.
+ * Empty/null rect list → full FB. Returns false if nothing remains in-bounds.
+ */
 bool KITTY_UnionRects(int fb_w, int fb_h, const SDL_Rect *rects, int numrects, SDL_Rect *out);
 
-/* area(union) / (fb_w*fb_h); 1 if fb empty. */
+/*
+ * area(union_rect) / (fb_w*fb_h), clamped to [0,1]. Returns 1 if the FB
+ * dimensions are invalid/empty.
+ */
 float KITTY_CoverageRatio(int fb_w, int fb_h, const SDL_Rect *union_rect);
 
 /*
@@ -74,61 +86,85 @@ bool KITTY_FbPixelToCellCursor(int x, int y, int cell_w, int cell_h,
                                int *out_col0, int *out_row0,
                                int *out_X, int *out_Y);
 
-/* FNV-1a 64-bit over bytes (upload_skip fingerprint). */
+/*
+ * FNV-1a 64-bit hash over bytes (upload_skip fingerprint). NULL data →
+ * the FNV offset basis with no mixing.
+ */
 Uint64 KITTY_Fnv1a64(const Uint8 *data, size_t len);
 
 /*
  * Merge overlapping / near rects (expanded by gap_px). Writes up to max_out
- * coalesced rects into out. Returns count (0 if nothing remains).
+ * coalesced rects into out; if more remain, collapses to a single union.
+ * Returns count (0 if nothing remains).
  */
 int KITTY_CoalesceRects(int fb_w, int fb_h, const SDL_Rect *in, int n_in,
                         int gap_px, SDL_Rect *out, int max_out);
 
-/* True if the place_cells box touches the screen edge (Exp 3 skip). */
+/*
+ * True if the place_cells box touches the screen edge (Exp 3 skip), or if
+ * any dimension is non-positive.
+ */
 bool KITTY_PlaceCellsTouchesEdge(int col0, int row0, int place_cols, int place_rows,
                                  int cols, int rows);
 
 /*
- * 32x32 (or tile) memcmp of prev vs next tightly packed RGB/RGBA frames.
- * dirty_out receives the bounding box of changed tiles when RECT/FULL.
- * cover_limit: if bbox coverage >= limit → FULL (default caller uses ~0.45).
+ * Tile memcmp of prev vs next tightly packed RGB/RGBA frames (bpp 3 or 4).
+ * dirty_out gets the changed-tile bbox when RECT/FULL. cover_limit: if bbox
+ * coverage >= limit → FULL. NONE when identical; FULL on bad args.
  */
 KITTY_DiffOutcome KITTY_TileDiffBBox(const Uint8 *prev, const Uint8 *next,
                                      int fb_w, int fb_h, int bpp, int tile,
                                      float cover_limit, SDL_Rect *dirty_out);
 
-/* SDL_KITTY_FB_DIFF: env overrides; default_on from profile (usually true). */
+/*
+ * SDL_KITTY_FB_DIFF: env "0"/off/false/no → false; non-empty otherwise →
+ * true; unset → default_on (usually from profile).
+ */
 bool KITTY_SelectFbDiff(const char *env, bool default_on);
 
-/* SDL_KITTY_FB_DIFF_TILE: env overrides; default_tile from profile (usually 32). */
+/*
+ * SDL_KITTY_FB_DIFF_TILE: env overrides atoi; else default_tile (or 32).
+ * Result clamped to [8, 128].
+ */
 int KITTY_SelectFbDiffTile(const char *env, int default_tile);
 
-/* SDL_KITTY_FB_DIFF_COVER: env overrides; default_cover from profile (usually 0.45). */
+/*
+ * SDL_KITTY_FB_DIFF_COVER: env overrides atof; else default_cover (or 0.45).
+ * Result clamped to [0.05, 1.0].
+ */
 float KITTY_SelectFbDiffCover(const char *env, float default_cover);
 
 /*
- * Decide full vs dirty convert. dirty_out set when mode is DIRTY (union of rects).
- * SDL_KITTY_DIRTY=0 forces FULL. First present / invalid scratch → FULL.
- * No coverage threshold: stay dirty for any non-empty union so a=f can stay sparse.
+ * Decide full vs dirty convert. dirty_out set when mode is DIRTY (union of
+ * rects). SDL_KITTY_DIRTY=0 forces FULL. First present / invalid scratch →
+ * FULL. No coverage threshold: any non-empty union stays DIRTY for a=f.
  */
 KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
                                                  const SDL_Rect *rects, int numrects,
                                                  bool scratch_valid, SDL_Rect *dirty_out);
 
-/* XRGB8888 (or compatible 32-bit) surface rect → RGB24 scratch (full w*h*3 buffer). */
+/*
+ * XRGB8888 (or compatible 32-bit) surface rect → RGB24 scratch rows in a
+ * full w*h*3 buffer (only the clipped rect is written).
+ */
 bool KITTY_ConvertSurfaceRectToRGB(SDL_Surface *surface, const SDL_Rect *rect, Uint8 *rgb_scratch);
 
-/* ARGB8888 (or compatible) surface rect → RGBA32 scratch (full w*h*4, R,G,B,A). */
+/*
+ * ARGB8888 surface rect → RGBA32 scratch (full w*h*4, byte order R,G,B,A
+ * for Kitty f=32).
+ */
 bool KITTY_ConvertSurfaceRectToRGBA(SDL_Surface *surface, const SDL_Rect *rect, Uint8 *rgba_scratch);
 
 /*
  * Pack a rect from a full-frame RGB24 scratch into a tightly packed buffer
- * (rw*rh*3). out must be large enough.
+ * (rw*rh*3). out must hold at least that many bytes; out_len optional.
  */
 bool KITTY_PackRGBRect(const Uint8 *rgb_scratch, int fb_w, int fb_h,
                        const SDL_Rect *rect, Uint8 *out, size_t out_cap, size_t *out_len);
 
-/* Pack from full-frame RGBA32 scratch into tightly packed rw*rh*4. */
+/*
+ * Pack a rect from a full-frame RGBA32 scratch into tightly packed rw*rh*4.
+ */
 bool KITTY_PackRGBARect(const Uint8 *rgba_scratch, int fb_w, int fb_h,
                         const SDL_Rect *rect, Uint8 *out, size_t out_cap, size_t *out_len);
 

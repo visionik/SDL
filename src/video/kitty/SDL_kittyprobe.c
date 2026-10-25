@@ -2,6 +2,13 @@
   Simple DirectMedia Layer
   Copyright (C) 2026 Visionik <visionik@pobox.com>
 */
+
+/*
+ * Implementation of Kitty graphics probe helpers: APC reply parsing,
+ * env/profile policy selectors, a=T header formatting, resize classification,
+ * optional runtime debug / PERF_ACK waits, and (non-standalone) tty a=q /
+ * SHM / a=f capability probes that fill SDL_VideoData transmit fields.
+ */
 #ifdef KITTY_PROBE_STANDALONE
 #include <SDL3/SDL.h>
 #include <string.h>
@@ -26,6 +33,11 @@
 #include <unistd.h>
 #endif
 
+/*
+ * Scan buf for an APC graphics reply ESC_G i=<expect_id>…;OK|error ST
+ * (ST is ESC\ or BEL). Skips optional ,key=value pairs before ';'.
+ * Returns OK, ERROR (non-empty non-OK payload), or NONE.
+ */
 KITTY_GraphicsQueryStatus KITTY_ParseGraphicsQueryReply(const char *buf, size_t len, Uint32 expect_id)
 {
     size_t i;
@@ -89,6 +101,10 @@ KITTY_GraphicsQueryStatus KITTY_ParseGraphicsQueryReply(const char *buf, size_t 
     return KITTY_GQ_NONE;
 }
 
+/*
+ * SDL_KITTY_FB_ALPHA=1/true/yes/on → true (ARGB8888 + Kitty f=32).
+ * Unset or any other value → false.
+ */
 bool KITTY_SelectFbAlpha(const char *env)
 {
     if (!env || !env[0]) {
@@ -103,6 +119,12 @@ bool KITTY_SelectFbAlpha(const char *env)
     return false;
 }
 
+/*
+ * Format first-chunk a=T APC key string (no ESC_G / payload). medium 'd'
+ * or 's'; includes KITTY_AT_PLACE_KEYS, optional c/r when place_cols/rows
+ * > 0, optional extra (comma-prefixed), and m=1 when more. Returns snprintf
+ * length or -1 on bad args. Invalid kitty_f falls back to 24.
+ */
 int KITTY_FormatTransmitHeader(char *buf, size_t cap,
                                char medium, Uint32 image_id,
                                int w, int h, int place_cols, int place_rows,
@@ -158,6 +180,11 @@ int KITTY_FormatTransmitHeader(char *buf, size_t cap,
                         more ? ",m=1" : "");
 }
 
+/*
+ * Classify a pane/FB size change: FULL if new pixels invalid or FB size
+ * changed; REPLACE when place_cells stretch keeps FB pixels but c/r changed
+ * with a live image; NONE when grid+FB unchanged or 1:1 FB unchanged.
+ */
 KITTY_ResizeAction KITTY_ClassifyResize(bool place_cells, bool has_live_image,
                                         int old_pw, int old_ph, int new_pw, int new_ph,
                                         int old_cols, int old_rows, int new_cols, int new_rows)
@@ -182,6 +209,10 @@ KITTY_ResizeAction KITTY_ClassifyResize(bool place_cells, bool has_live_image,
     return KITTY_RESIZE_FULL;
 }
 
+/*
+ * Dirty-BW policy: non-empty env forces off ("0"/off/false/no) or on;
+ * otherwise return frame_edit_ok from the a=f probe.
+ */
 bool KITTY_SelectDirtyBW(const char *env, bool frame_edit_ok)
 {
     if (env && *env) {
@@ -194,6 +225,9 @@ bool KITTY_SelectDirtyBW(const char *env, bool frame_edit_ok)
     return frame_edit_ok;
 }
 
+/*
+ * Dirty-AT overlays: non-empty env forces off/on; else profile_default.
+ */
 bool KITTY_SelectDirtyAT(const char *env, bool profile_default)
 {
     if (env && *env) {
@@ -206,6 +240,9 @@ bool KITTY_SelectDirtyAT(const char *env, bool profile_default)
     return profile_default;
 }
 
+/*
+ * Dirty-union a=T overlays: non-empty env forces off/on; else profile_default.
+ */
 bool KITTY_SelectDirtyUnionAT(const char *env, bool profile_default)
 {
     if (env && *env) {
@@ -218,6 +255,9 @@ bool KITTY_SelectDirtyUnionAT(const char *env, bool profile_default)
     return profile_default;
 }
 
+/*
+ * Upload-skip (FNV fingerprint): non-empty env forces off/on; else profile_default.
+ */
 bool KITTY_SelectUploadSkip(const char *env, bool profile_default)
 {
     if (env && *env) {
@@ -230,6 +270,10 @@ bool KITTY_SelectUploadSkip(const char *env, bool profile_default)
     return profile_default;
 }
 
+/*
+ * Coalesce gap in pixels: unset → profile_default (clamped); "0"/off → 0;
+ * else atoi clamped to [0, 256].
+ */
 int KITTY_SelectCoalesceGap(const char *env, int profile_default)
 {
     if (env && *env) {
@@ -257,6 +301,10 @@ int KITTY_SelectCoalesceGap(const char *env, int profile_default)
     return profile_default;
 }
 
+/*
+ * Ping-pong delete+swap presents: unset → default_on; "0"/off → false;
+ * else true.
+ */
 bool KITTY_SelectPingPong(const char *env, bool default_on)
 {
     if (!env || !*env) {
@@ -270,6 +318,11 @@ bool KITTY_SelectPingPong(const char *env, bool default_on)
 }
 
 #ifdef SDL_KITTY_RUNTIME_DEBUG
+/*
+ * True when SDL_KITTY_DEBUG is set and not "0". Caches the getenv result;
+ * on first enable, raises VIDEO log priority (non-standalone) and
+ * line-buffers stderr for macOS os_log-friendly output.
+ */
 bool KITTY_DebugEnabled(void)
 {
     static int cached = -1;
@@ -287,6 +340,10 @@ bool KITTY_DebugEnabled(void)
     return cached != 0;
 }
 
+/*
+ * Printf-style debug line to SDL_LogDebug (non-standalone) and stderr when
+ * KITTY_DebugEnabled(). No-op if debug is off or fmt is NULL.
+ */
 void KITTY_DebugLog(const char *fmt, ...)
 {
     va_list ap;
@@ -305,6 +362,10 @@ void KITTY_DebugLog(const char *fmt, ...)
 }
 #endif /* SDL_KITTY_RUNTIME_DEBUG */
 
+/*
+ * Map a force string ("direct" / "zlib" / "shm", case-insensitive) to a
+ * transmit mode. Empty/NULL or unknown → KITTY_TRANSMIT_DIRECT.
+ */
 static KITTY_TransmitMode KITTY_ParseTransmitForce(const char *force)
 {
     if (!force || !*force) {
@@ -322,6 +383,11 @@ static KITTY_TransmitMode KITTY_ParseTransmitForce(const char *force)
     return KITTY_TRANSMIT_DIRECT;
 }
 
+/*
+ * Select SHM / zlib / direct: force_env then force_profile win; else
+ * prefer_direct skips SHM; else shm_ok → SHM; else zlib or raw direct.
+ * direct_ok is ignored (kept for API symmetry with probes).
+ */
 KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
                                             const char *force_profile,
                                             bool prefer_direct,
@@ -351,6 +417,9 @@ KITTY_TransmitMode KITTY_SelectTransmitMode(const char *force_env,
 
 #ifndef KITTY_PROBE_STANDALONE
 
+/*
+ * Write all of buf to fd, retrying on EINTR. Returns false on other write errors.
+ */
 static bool KITTY_WriteAllProbe(int fd, const void *buf, size_t len)
 {
     const char *p = (const char *)buf;
@@ -368,6 +437,10 @@ static bool KITTY_WriteAllProbe(int fd, const void *buf, size_t len)
     return true;
 }
 
+/*
+ * Standard base64 encode of in into out (NUL-terminated). Returns encoded
+ * length excluding NUL, or 0 if out_cap is too small.
+ */
 static size_t KITTY_B64EncodeLocal(const Uint8 *in, size_t in_len, char *out, size_t out_cap)
 {
     static const char tbl[] =
@@ -391,6 +464,10 @@ static size_t KITTY_B64EncodeLocal(const Uint8 *in, size_t in_len, char *out, si
     return o;
 }
 
+/*
+ * Poll fd up to attempts times (25ms select each), accumulating reads, until
+ * ParseGraphicsQueryReply finds OK/ERROR for id, or the buffer fills / times out.
+ */
 static KITTY_GraphicsQueryStatus KITTY_AwaitGraphicsQuery(int fd, Uint32 id, int attempts)
 {
     unsigned char buf[512];
@@ -426,6 +503,10 @@ static KITTY_GraphicsQueryStatus KITTY_AwaitGraphicsQuery(int fd, Uint32 id, int
 }
 
 #ifdef SDL_KITTY_PERF_ACK
+/*
+ * Wait up to timeout_ms (default 40) for Gi=<id> OK/ERROR on fd by converting
+ * the budget into 25ms AwaitGraphicsQuery attempts. Invalid fd/id → NONE.
+ */
 KITTY_GraphicsQueryStatus KITTY_AwaitGraphicsAck(int fd, Uint32 id, int timeout_ms)
 {
     int attempts;
@@ -443,6 +524,10 @@ KITTY_GraphicsQueryStatus KITTY_AwaitGraphicsAck(int fd, Uint32 id, int timeout_
 }
 #endif /* SDL_KITTY_PERF_ACK */
 
+/*
+ * Send a=q t=d 1x1 RGB query (base64 "AAAA") and wait for OK. Used to test
+ * direct transmit support.
+ */
 static bool KITTY_ProbeDirectQuery(SDL_VideoData *data, Uint32 id)
 {
     /* 1x1 RGB black: 3 bytes → base64 "AAAA" */
@@ -457,6 +542,10 @@ static bool KITTY_ProbeDirectQuery(SDL_VideoData *data, Uint32 id)
                                     KITTY_ProfileProbeAttempts(data->term_profile)) == KITTY_GQ_OK;
 }
 
+/*
+ * Create a tiny POSIX SHM object with 1 RGB pixel, send a=q t=s with the
+ * base64 path, and wait for OK. Unlinks the object on failure.
+ */
 static bool KITTY_ProbeShmQuery(SDL_VideoData *data, Uint32 id)
 {
     char name[64];
@@ -514,6 +603,10 @@ done:
     return ok;
 }
 
+/*
+ * Non-blocking drain of readable bytes on fd (select timeout 0) until empty
+ * or read fails. Clears stale CSI/APC noise before probes.
+ */
 static void KITTY_DrainTty(int fd)
 {
     unsigned char junk[256];
@@ -533,9 +626,11 @@ static void KITTY_DrainTty(int fd)
     }
 }
 
-/* Transmit-only 2x2 image, then a=f edit one pixel; delete. No on-screen place.
- * Hosts with silent_af_ok (Rex) may apply a=f without an APC OK — treat ERROR
- * as fail and OK or silent (NONE) as success. Strict hosts require OK. */
+/*
+ * Transmit-only 2x2 image (a=t), then a=f edit one pixel on root frame r=1;
+ * delete with a=d. No on-screen place. Hosts with silent_af_ok (Rex) treat
+ * OK or silent NONE as success and ERROR as fail; strict hosts require OK.
+ */
 static bool KITTY_ProbeFrameEdit(SDL_VideoData *data, Uint32 id)
 {
     const Uint8 rgb2x2[12] = { 0 };
@@ -593,6 +688,11 @@ cleanup:
     return ok;
 }
 
+/*
+ * Drain tty, probe direct a=q (and SHM unless prefer_direct), select
+ * transmit_mode / shm_failed, then probe or force frame_edit_ok from
+ * SDL_KITTY_DIRTY_BW. Logs outcomes when runtime debug is on.
+ */
 bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
 {
     const char *force = SDL_getenv("SDL_KITTY_TRANSMIT");

@@ -18,6 +18,11 @@
      misrepresented as being the original software.
   3. This notice may not be removed or altered from any source distribution.
 */
+
+/*
+ * Kitty graphics protocol over the tty: raw mode, CSI sizing, SGR mouse,
+ * and APC image transmit (POSIX SHM, zlib, or chunked base64 direct).
+ */
 #include "SDL_internal.h"
 
 #ifdef SDL_VIDEO_DRIVER_KITTY
@@ -50,6 +55,10 @@ static bool KITTY_termios_saved = false;
 static const char KITTY_b64_table[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/*
+ * Encode src as standard base64 into dst (NUL-terminated when capacity
+ * allows). Returns bytes written excluding the terminator.
+ */
 static size_t KITTY_Base64Encode(const Uint8 *src, size_t src_len, char *dst, size_t dst_cap)
 {
     size_t i = 0, o = 0;
@@ -84,6 +93,9 @@ static size_t KITTY_Base64Encode(const Uint8 *src, size_t src_len, char *dst, si
     return o;
 }
 
+/*
+ * Write the full buffer to fd, retrying on EINTR. Sets SDL error on failure.
+ */
 static bool KITTY_WriteAll(int fd, const void *buf, size_t len)
 {
     const char *p = (const char *)buf;
@@ -101,6 +113,11 @@ static bool KITTY_WriteAll(int fd, const void *buf, size_t len)
     return true;
 }
 
+/*
+ * Chunked direct (t=d) a=T transmit: base64-encode payload, optionally
+ * home with CSI CUP, then write APC chunks sized by chunk_bytes.
+ * extra_keys may add o=z or overlay z/X/Y. out_wire_bytes gets bytes sent.
+ */
 static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
                                         int place_cols, int place_rows,
                                         const char *extra_keys,
@@ -179,6 +196,10 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
     return true;
 }
 
+/*
+ * zlib-compress RGB/RGBA then transmit as direct a=T with o=z.
+ * out_raw_bytes receives compressed payload size (pre-base64).
+ */
 static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
                                      int place_cols, int place_rows, int kitty_f, bool home_cursor,
                                      size_t chunk_bytes, size_t *out_wire_bytes, size_t *out_raw_bytes)
@@ -208,6 +229,10 @@ static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, 
     }
 }
 
+/*
+ * Transmit uncompressed RGB/RGBA as direct a=T (no o=z).
+ * out_raw_bytes receives the raw pixel byte count.
+ */
 static bool KITTY_TransmitDirectRaw(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
                                     int place_cols, int place_rows, int kitty_f, bool home_cursor,
                                     size_t chunk_bytes, size_t *out_wire_bytes, size_t *out_raw_bytes)
@@ -221,8 +246,11 @@ static bool KITTY_TransmitDirectRaw(int fd, Uint32 image_id, const Uint8 *rgb, i
                                        kitty_f, home_cursor, chunk_bytes, out_wire_bytes);
 }
 
-/* POSIX SHM transmit. Unique names per call avoid reuse races when the host
- * is slow to drop the previous object (seen as mid-run SHM→direct base64). */
+/*
+ * POSIX SHM transmit (t=s): unique /sdl-kitty-* name per call, mmap+copy
+ * pixels, send base64 path in one APC. Unlink on failure or when the
+ * profile sets shm_unlink_after_send; otherwise the host unlinks.
+ */
 static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, int w, int h,
                               int place_cols, int place_rows, int kitty_f, bool home_cursor)
 {
@@ -311,6 +339,10 @@ done:
     return ok;
 }
 
+/*
+ * Return true when stdout is a tty and the host looks like a Kitty-protocol
+ * terminal (SDL_HINT_VIDEO_DRIVER, loaded profile match, or builtin env).
+ */
 bool KITTY_ProbeSupport(void)
 {
     /* Need a tty for graphics out; keyboard prefers stdin when available. */
@@ -333,6 +365,10 @@ bool KITTY_ProbeSupport(void)
     return KITTY_BuiltinEnvLooksLikeKittyHost();
 }
 
+/*
+ * Non-blocking drain of tty_in and clear the pending CSI/APC carry buffer.
+ * Used before size queries so stale replies are not misparsed.
+ */
 static void KITTY_DrainTTY(SDL_VideoData *data)
 {
     unsigned char junk[256];
@@ -353,10 +389,12 @@ static void KITTY_DrainTTY(SDL_VideoData *data)
     data->tty_pending_len = 0;
 }
 
+/*
+ * Query cell size (CSI 16 t → 6;h;w t) and text-area pixels (CSI 14 t →
+ * 4;h;w t). Prefer 14t for pixel_w/h; derive cells from area/grid if needed.
+ */
 static bool KITTY_QueryPixelSizeCSI(SDL_VideoData *data)
 {
-    // CSI 16 t → cell size report CSI 6 ; height ; width t
-    // CSI 14 t → text-area pixels  CSI 4 ; height ; width t
     static const char query[] = "\033[16t\033[14t";
     unsigned char buf[512];
     size_t total = 0;
@@ -431,9 +469,12 @@ static bool KITTY_QueryPixelSizeCSI(SDL_VideoData *data)
     return data->pixel_w > 0 && data->pixel_h > 0 && data->cell_w > 0 && data->cell_h > 0;
 }
 
+/*
+ * Set mouse_coord_w/h from cols×cell when known; else fall back to pixel_w/h.
+ * Used if SGR-pixels (1016) ever disagree with CSI 14t.
+ */
 static void KITTY_UpdateMouseCoordSpace(SDL_VideoData *data)
 {
-    /* Track cols×cell for a safety scale if 1016 ever disagrees with CSI 14t. */
     if (data->cols > 0 && data->rows > 0 && data->cell_w > 0 && data->cell_h > 0) {
         data->mouse_coord_w = data->cols * data->cell_w;
         data->mouse_coord_h = data->rows * data->cell_h;
@@ -443,14 +484,16 @@ static void KITTY_UpdateMouseCoordSpace(SDL_VideoData *data)
     }
 }
 
-/* Optional size policy so a single-chunk texture fits hosts that drop huge
+/*
+ * Optional size policy so a single-chunk texture fits hosts that drop huge
  * multi-chunk direct RGB (observed blank on Rex at ~2800×2000).
  * With place_cells, c/r stretch fills the pane; without it the image is
  * native 1:1 at the chosen size.
  *
  * SDL_KITTY_FB_FIXED=WxH — exact FB size (resize keeps pixels; a=p re-stretch).
  * SDL_KITTY_FB_MAX=W[xH] — aspect-fit into a max box (e.g. 800 or 800x600).
- * Unset → host profile default_fb_max_* (see docs/terminals.md). */
+ * Unset → host profile default_fb_max_* (see docs/terminals.md).
+ */
 static void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
 {
     const char *fixed;
@@ -523,6 +566,10 @@ static void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
     data->pixel_h = h;
 }
 
+/*
+ * Refresh cols/rows via TIOCGWINSZ; fill pixels from ioctl, CSI 14t/16t,
+ * or scaled prior size; then apply FB caps and mouse coord space.
+ */
 bool KITTY_QueryTerminalSize(SDL_VideoData *data)
 {
     struct winsize ws;
@@ -604,6 +651,10 @@ bool KITTY_QueryTerminalSize(SDL_VideoData *data)
     return true;
 }
 
+/*
+ * Put tty_in into raw mode (cfmakeraw) while keeping ISIG for Ctrl+C/Z.
+ * Saves prior termios for KITTY_LeaveRawMode; VMIN/VTIME are non-blocking.
+ */
 bool KITTY_EnterRawMode(SDL_VideoData *data)
 {
     struct termios raw;
@@ -625,6 +676,9 @@ bool KITTY_EnterRawMode(SDL_VideoData *data)
     return true;
 }
 
+/*
+ * Restore saved termios on tty_in if KITTY_EnterRawMode succeeded earlier.
+ */
 void KITTY_LeaveRawMode(SDL_VideoData *data)
 {
     if (KITTY_termios_saved && data) {
@@ -633,8 +687,11 @@ void KITTY_LeaveRawMode(SDL_VideoData *data)
     }
 }
 
-/* Swallow unread APC/CSI (e.g. Gi=1,p=1;OK) so the next shell prompt
- * does not treat graphics replies as typed input. */
+/*
+ * Swallow unread APC/CSI (e.g. Gi=1,p=1;OK) so the next shell prompt
+ * does not treat graphics replies as typed input. Quiet waits and pass
+ * count come from the terminal profile (defaults 8×15ms).
+ */
 static void KITTY_DrainInput(SDL_VideoData *data)
 {
     unsigned char junk[512];
@@ -685,9 +742,12 @@ static void KITTY_DrainInput(SDL_VideoData *data)
     }
 }
 
+/*
+ * Default true (SGR-pixels / 1016). SDL_KITTY_MOUSE_PIXELS=0|false|no|off|cell|1006
+ * forces cell SGR (1006).
+ */
 static bool KITTY_WantMousePixels(void)
 {
-    /* Default on: SGR-pixels (1016). Set SDL_KITTY_MOUSE_PIXELS=0 for cell SGR (1006). */
     const char *env = SDL_getenv("SDL_KITTY_MOUSE_PIXELS");
     if (!env || !*env) {
         return true;
@@ -700,10 +760,12 @@ static bool KITTY_WantMousePixels(void)
     return true;
 }
 
+/*
+ * DECRQM probe: CSI ? mode $ p → CSI ? mode ; value $ y.
+ * Returns true when value is non-zero (recognized set/reset/permanent).
+ */
 static bool KITTY_ModeRecognized(SDL_VideoData *data, int mode)
 {
-    /* DECRQM: CSI ? mode $ p  →  CSI ? mode ; value $ y
-     * value 0 = unknown; 1/2/3/4 = recognized (set/reset/permanent). */
     char query[32];
     unsigned char buf[64];
     size_t total = 0;
@@ -741,13 +803,13 @@ static bool KITTY_ModeRecognized(SDL_VideoData *data, int mode)
     return false;
 }
 
+/*
+ * Enter alt screen, hide cursor, home/clear, and enable Kitty keyboard
+ * (CSI > 11 u = disambiguate + event types + all keys as CSI). Mouse is
+ * deferred to KITTY_EnableMouse so reports do not flood size queries.
+ */
 bool KITTY_SetupTerminal(SDL_VideoData *data)
 {
-    /* Alt screen + hide cursor + Kitty keyboard.
-     * Flags 1|2|8 = disambiguate + report press/repeat/release + report all
-     * keys as CSI (needed for held game keys; plain UTF-8 has no releases).
-     * Mouse is enabled later (KITTY_EnableMouse) after CSI 14t/16t sizing so
-     * any-event reports do not flood the size-query read. */
     static const char setup[] =
         "\033[?1049h"
         "\033[?25l"
@@ -763,12 +825,12 @@ bool KITTY_SetupTerminal(SDL_VideoData *data)
     return KITTY_WriteAll(data->tty_out, setup, sizeof(setup) - 1);
 }
 
+/*
+ * Enable SGR mouse tracking (1000/1002/1003). Prefer SGR-pixels (1016)
+ * when DECRQM recognizes it and WantMousePixels is true; else 1006.
+ */
 bool KITTY_EnableMouse(SDL_VideoData *data)
 {
-    /* Prefer SGR-pixels (1016) whenever the host recognizes it. Probe on
-     * Ghostty and Rex showed 1016 matches CSI 14t (FB / c/r text area), so
-     * pixel mouse works with place_cells stretch and with 1:1 placement.
-     * Set SDL_KITTY_MOUSE_PIXELS=0 to force cell SGR (1006). */
     static const char tracking[] =
         "\033[?1000h"
         "\033[?1002h"
@@ -793,6 +855,10 @@ bool KITTY_EnableMouse(SDL_VideoData *data)
     return true;
 }
 
+/*
+ * Delete all images, disable mouse/keyboard modes, leave alt screen,
+ * drain late APC replies, and restore cooked termios.
+ */
 void KITTY_RestoreTerminal(SDL_VideoData *data)
 {
     static const char restore[] =
@@ -815,12 +881,18 @@ void KITTY_RestoreTerminal(SDL_VideoData *data)
     KITTY_LeaveRawMode(data);
 }
 
+/*
+ * Delete every Kitty image on fd (a=d,d=A,q=2).
+ */
 bool KITTY_DeleteAllImages(int fd)
 {
     static const char del[] = "\033_Ga=d,d=A,q=2\033\\";
     return KITTY_WriteAll(fd, del, sizeof(del) - 1);
 }
 
+/*
+ * Delete one Kitty image by id on fd (a=d,d=I,q=2).
+ */
 bool KITTY_DeleteImage(int fd, Uint32 image_id)
 {
     char cmd[64];
@@ -831,6 +903,9 @@ bool KITTY_DeleteImage(int fd, Uint32 image_id)
     return KITTY_WriteAll(fd, cmd, (size_t)n);
 }
 
+/*
+ * Delete active dirty_at overlay images and clear wdata->overlay_count.
+ */
 void KITTY_ClearOverlays(SDL_VideoData *vdata, SDL_WindowData *wdata)
 {
     int i;
@@ -847,6 +922,11 @@ void KITTY_ClearOverlays(SDL_VideoData *vdata, SDL_WindowData *wdata)
     wdata->overlay_count = 0;
 }
 
+/*
+ * Transmit+place a packed rect as its own a=T image at a 1-based CSI CUP
+ * cell. DECSC/DECRC bracket CUP; place_cols/rows 0 = natural size; z/X/Y
+ * go in extra APC keys. Refuses payloads above profile max_direct_bytes.
+ */
 bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
                                 const Uint8 *packed_rgb, int rw, int rh,
                                 int place_col, int place_row,
@@ -928,6 +1008,10 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
     }
 }
 
+/*
+ * Edit root frame (r=1) in place with packed RGB/RGBA for rectangle
+ * x,y,s,v (Kitty a=f, t=d only). Chunked base64; does not home or re-place.
+ */
 bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                                const Uint8 *packed_rgb, int x, int y, int rw, int rh, int kitty_f)
 {
@@ -1036,6 +1120,10 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     return true;
 }
 
+/*
+ * Re-place an existing image with new c/r (a=p only; no pixel upload).
+ * Homes the cursor and updates placed_cols/rows / place_homed.
+ */
 bool KITTY_PlaceExistingImage(SDL_VideoData *vdata, Uint32 image_id,
                               int place_cols, int place_rows)
 {
@@ -1069,6 +1157,11 @@ bool KITTY_PlaceExistingImage(SDL_VideoData *vdata, Uint32 image_id,
     return true;
 }
 
+/*
+ * Full-frame transmit+place (a=T): try SHM, then zlib direct, then raw
+ * base64 per transmit_mode / SDL_KITTY_TRANSMIT. place_cells stretches to
+ * the grid; homes only when place size changes. Tracks wire timing stats.
+ */
 bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, int w, int h, int kitty_f)
 {
     if (!vdata || !rgb || w <= 0 || h <= 0) {

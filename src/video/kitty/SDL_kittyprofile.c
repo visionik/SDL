@@ -2,6 +2,12 @@
   Simple DirectMedia Layer
   Copyright (C) 2026 Visionik <visionik@pobox.com>
 */
+
+/*
+ * Builtin KITTY_TerminalProfile tables (rex/kitty/ghostty/wezterm/unknown)
+ * and env-based detect helpers. TOML overlays live in SDL_kittyprofile_load.c;
+ * DetectTerminalProfile prefers a loaded match, else DetectBuiltinTerminalProfile.
+ */
 #ifdef KITTY_PROFILE_STANDALONE
 #include <SDL3/SDL.h>
 #include <string.h>
@@ -145,11 +151,18 @@ static const KITTY_TerminalProfile KITTY_profile_unknown = {
     KITTY_PROFILE_TUNABLES
 };
 
-/* Filled by SDL_kittyprofile_load.c when a TOML file loads. */
+/*
+ * Declared in SDL_kittyprofile_load.c: TOML-backed detect, lazy load, and
+ * human-readable source string for the active profile table.
+ */
 extern const KITTY_TerminalProfile *KITTY_DetectLoadedTerminalProfile(void);
 extern void KITTY_EnsureTerminalProfilesLoaded(void);
 extern const char *KITTY_TerminalProfilesSource(void);
 
+/*
+ * Map TERM_PROGRAM (rex/kitty/ghostty/WezTerm) or TERM=xterm-kitty to a
+ * builtin profile pointer. Unrecognized → KITTY_profile_unknown.
+ */
 static const KITTY_TerminalProfile *KITTY_DetectBuiltinTerminalProfile(void)
 {
     const char *tp = SDL_getenv("TERM_PROGRAM");
@@ -178,6 +191,10 @@ static const KITTY_TerminalProfile *KITTY_DetectBuiltinTerminalProfile(void)
     return &KITTY_profile_unknown;
 }
 
+/*
+ * Ensure TOML profiles are loaded, return a loaded matcher hit if any,
+ * otherwise the builtin env heuristic profile. Never NULL.
+ */
 const KITTY_TerminalProfile *KITTY_DetectTerminalProfile(void)
 {
     const KITTY_TerminalProfile *loaded;
@@ -190,12 +207,18 @@ const KITTY_TerminalProfile *KITTY_DetectTerminalProfile(void)
     return KITTY_DetectBuiltinTerminalProfile();
 }
 
-/* Builtin [defaults]-shaped seed for the TOML loader. */
+/*
+ * Builtin [defaults]-shaped seed for the TOML loader (unknown profile).
+ */
 const KITTY_TerminalProfile *KITTY_BuiltinDefaultsProfile(void)
 {
     return &KITTY_profile_unknown;
 }
 
+/*
+ * True if TERM_PROGRAM is a known Kitty-protocol host, KITTY_WINDOW_ID is
+ * set, or TERM contains "kitty"/"ghostty".
+ */
 bool KITTY_BuiltinEnvLooksLikeKittyHost(void)
 {
     const char *term_program = SDL_getenv("TERM_PROGRAM");

@@ -2,6 +2,13 @@
   Simple DirectMedia Layer
   Copyright (C) 2026 Visionik <visionik@pobox.com>
 */
+
+/*
+ * Per-host terminal profiles for the Kitty video driver: KITTY_TerminalProfile
+ * policy/tunables, TOML load/reset API, env-based detect helpers, and small
+ * inline accessors for APC chunk / direct-fallback / probe-timeout defaults.
+ * Canonical data: config/terminals.toml (see docs/terminal-profiles.md).
+ */
 #ifdef KITTY_PROFILE_STANDALONE
 #include <SDL3/SDL.h>
 #else
@@ -130,38 +137,69 @@ typedef struct KITTY_TerminalProfile
     const char *notes;
 } KITTY_TerminalProfile;
 
-/* Load TOML overlays (search paths / SDL_KITTY_PROFILES). Idempotent. */
+/*
+ * Load TOML overlays from SDL_KITTY_PROFILES or default search paths.
+ * Idempotent after the first attempt (success or not).
+ */
 void KITTY_EnsureTerminalProfilesLoaded(void);
 
-/* Overlay or replace from an explicit path. Returns true on success. */
+/*
+ * Overlay or replace profiles from an explicit TOML path. First successful
+ * load replaces builtins; later loads overlay. Returns true on success.
+ */
 bool KITTY_LoadTerminalProfiles(const char *path);
 
-/* Drop loaded table; next Ensure/Detect uses builtins only. */
+/*
+ * Drop the loaded table and clear the load-attempted latch so the next
+ * Ensure/Detect uses builtins only until TOML is loaded again.
+ */
 void KITTY_ResetTerminalProfilesToBuiltin(void);
 
-/* Detect from TERM_PROGRAM / TERM (+ loaded matchers). Never returns NULL. */
+/*
+ * Detect the active profile: ensure TOML loaded, then match env against
+ * loaded [[terminal]] rows, else builtin TERM_PROGRAM/TERM heuristics.
+ * Never returns NULL.
+ */
 const KITTY_TerminalProfile *KITTY_DetectTerminalProfile(void);
 
-/* "builtin" or path of last successful load (for DEBUG). Never NULL. */
+/*
+ * "builtin" or semicolon-joined path(s) of the last successful TOML load
+ * (for DEBUG). Never returns NULL.
+ */
 const char *KITTY_TerminalProfilesSource(void);
 
-/* True when a loaded [[terminal]] matcher hits the current env (ProbeSupport). */
+/*
+ * True when a loaded [[terminal]] matcher hits the current env (used by
+ * ProbeSupport). Ensures profiles are loaded first.
+ */
 bool KITTY_EnvMatchesLoadedProfile(void);
 
-/* Builtin TERM_PROGRAM / TERM / KITTY_WINDOW_ID heuristics when no TOML loaded. */
+/*
+ * Builtin TERM_PROGRAM / TERM / KITTY_WINDOW_ID heuristics for "looks like a
+ * Kitty-protocol host" when no TOML match is required.
+ */
 bool KITTY_BuiltinEnvLooksLikeKittyHost(void);
 
+/*
+ * APC payload chunk size from profile, or 2 MiB when unset/zero.
+ */
 static inline size_t KITTY_ProfileApcChunkBytes(const KITTY_TerminalProfile *p)
 {
     return (p && p->apc_chunk_bytes > 0) ? p->apc_chunk_bytes : ((size_t)2 * 1024 * 1024);
 }
 
+/*
+ * Max raw bytes for SHM-fail → direct fallback, or 256 KiB when unset/zero.
+ */
 static inline size_t KITTY_ProfileDirectFallbackBytes(const KITTY_TerminalProfile *p)
 {
     return (p && p->direct_fallback_max_bytes > 0) ? p->direct_fallback_max_bytes
                                                    : ((size_t)256 * 1024);
 }
 
+/*
+ * Probe wait budget (attempts) from profile probe_timeout_ms, or 40.
+ */
 static inline int KITTY_ProfileProbeAttempts(const KITTY_TerminalProfile *p)
 {
     return (p && p->probe_timeout_ms > 0) ? p->probe_timeout_ms : 40;

@@ -18,6 +18,15 @@
      misrepresented as being the original software.
   3. This notice may not be removed or altered from any source distribution.
 */
+
+/*
+ * Kitty video driver window framebuffer: create/update/destroy the SDL
+ * software surface and present it over the Kitty graphics protocol.
+ * Update path prefers sparse dirty BW a=f edits, tile-diff / upload_skip
+ * elision, optional dirty_at overlays, then full a=T (SHM or direct, with
+ * optional pingpong image ids). Scratch RGB(A) buffers hold the last frame
+ * for diffing and packing.
+ */
 #include "SDL_internal.h"
 
 #ifdef SDL_VIDEO_DRIVER_KITTY
@@ -32,6 +41,10 @@
 
 #define KITTY_SURFACE "SDL.internal.window.surface"
 
+/*
+ * Free rgb_scratch/rgb_back and reset present state on wdata: dimensions,
+ * live_image_id, overlay_count, and last_upload_hash. Safe if wdata is NULL.
+ */
 static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
 {
     if (!wdata) {
@@ -51,6 +64,11 @@ static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
     wdata->last_upload_hash_valid = false;
 }
 
+/*
+ * Ensure paired rgb_scratch and rgb_back buffers exist for w×h at bpp 3 or 4.
+ * Reuses existing buffers when size/bpp match; otherwise frees and mallocs.
+ * Clears rgb_valid and live_image_id on realloc. Returns false on OOM/bad args.
+ */
 static bool KITTY_EnsureRGBScratch(SDL_WindowData *wdata, int w, int h, int bpp)
 {
     const size_t need = (size_t)w * (size_t)h * (size_t)bpp;
@@ -76,6 +94,10 @@ static bool KITTY_EnsureRGBScratch(SDL_WindowData *wdata, int w, int h, int bpp)
     return true;
 }
 
+/*
+ * Swap rgb_scratch and rgb_back pointers so the newly converted frame becomes
+ * the reference for the next tile-diff. No-op if wdata is NULL.
+ */
 static void KITTY_SwapRGBScratch(SDL_WindowData *wdata)
 {
     Uint8 *tmp;
@@ -87,6 +109,11 @@ static void KITTY_SwapRGBScratch(SDL_WindowData *wdata)
     wdata->rgb_back = tmp;
 }
 
+/*
+ * Create the window's software framebuffer surface (ARGB8888 or XRGB8888 per
+ * SDL_KITTY_FB_ALPHA / KITTY_SelectFbAlpha). Stores it under KITTY_SURFACE,
+ * frees any prior RGB scratch, and returns format, pixels, and pitch to SDL.
+ */
 bool SDL_KITTY_CreateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window, SDL_PixelFormat *format, void **pixels, int *pitch)
 {
     SDL_WindowData *wdata = window ? (SDL_WindowData *)window->internal : NULL;
@@ -116,6 +143,13 @@ bool SDL_KITTY_CreateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
     return true;
 }
 
+/*
+ * Present window surface dirty rects over Kitty graphics. Converts to RGB(A)
+ * scratch; may tile-diff (identical → early out), upload_skip on matching
+ * FNV hash, sparse multi/single a=f (dirty BW, q=2 quiet edits), dirty_at /
+ * dirty_union a=T overlays, or full a=T with optional pingpong image swap.
+ * Updates live_image_id, rgb_valid, overlays, and perf counters on success.
+ */
 bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window, const SDL_Rect *rects, int numrects)
 {
     SDL_VideoData *vdata = (SDL_VideoData *)_this->internal;
@@ -737,6 +771,11 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
     return ok;
 }
 
+/*
+ * Tear down the window framebuffer: free RGB scratch/back buffers and clear
+ * the KITTY_SURFACE property (releases the SDL_Surface). Does not delete
+ * Kitty image ids on the tty (caller/quit path handles graphics teardown).
+ */
 void SDL_KITTY_DestroyWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window)
 {
     SDL_WindowData *wdata = window ? (SDL_WindowData *)window->internal : NULL;

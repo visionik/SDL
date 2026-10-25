@@ -22,6 +22,11 @@
 
 #ifdef SDL_VIDEO_DRIVER_KITTY
 
+/*
+ * SDL window lifecycle for the kitty driver: size to the tty pixel pane,
+ * allocate SDL_WindowData / Kitty image ids, and tear down APC images.
+ */
+
 #include "../../events/SDL_keyboard_c.h"
 #include "../../events/SDL_mouse_c.h"
 #include "../../events/SDL_windowevents_c.h"
@@ -30,6 +35,11 @@
 #include "SDL_kittyprofile.h"
 #include "SDL_kittywindow.h"
 
+/*
+ * Create a terminal-filling window: refresh tty size, force w/h to CSI pixel
+ * metrics (or profile fallback), allocate SDL_WindowData and dual Kitty image
+ * ids, take keyboard/mouse focus, and post RESIZED/SHOWN events.
+ */
 bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_PropertiesID create_props)
 {
     SDL_VideoData *vdata = (SDL_VideoData *)_this->internal;
@@ -103,6 +113,10 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
     return true;
 }
 
+/*
+ * Clear focus if this was the focus window, delete all Kitty images on the
+ * tty, free RGB scratch buffers and SDL_WindowData, and null window->internal.
+ */
 void KITTY_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
 {
     SDL_VideoData *vdata = (SDL_VideoData *)_this->internal;
@@ -124,6 +138,10 @@ void KITTY_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
     window->internal = NULL;
 }
 
+/*
+ * Apply a pending SDL window size by posting SDL_EVENT_WINDOW_RESIZED.
+ * Does not rewrite tty geometry; WINCH/query paths own real pane size.
+ */
 void KITTY_SetWindowSize(SDL_VideoDevice *_this, SDL_Window *window)
 {
     (void)_this;

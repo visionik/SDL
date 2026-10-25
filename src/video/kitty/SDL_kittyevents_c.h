@@ -25,8 +25,16 @@
 #ifndef SDL_kittyevents_c_h_
 #define SDL_kittyevents_c_h_
 
+/*
+ * Event pump entry for the kitty SDL video driver (tty CSI/keyboard/mouse).
+ */
+
 #include "SDL_kittyvideo.h"
 
+/*
+ * Read tty_in, parse Kitty keyboard / SGR mouse / CSI, handle SIGWINCH-sized
+ * panes, flush deferred key-ups, and post SDL keyboard, mouse, and window events.
+ */
 extern void KITTY_PumpEvents(SDL_VideoDevice *_this);
 
 #endif // SDL_kittyevents_c_h_

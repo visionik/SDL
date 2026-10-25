@@ -18,6 +18,14 @@
      misrepresented as being the original software.
   3. This notice may not be removed or altered from any source distribution.
 */
+
+/*
+ * Kitty video driver event pump: tty keyboard (CSI-u / legacy CSI / SS3),
+ * SGR mouse (1006 cells or 1016 pixels), and SIGWINCH resize handling.
+ * Reads from the terminal, parses escape sequences, and emits SDL keyboard,
+ * mouse, and window events. Key-hold tracking keeps short press/release
+ * pairs visible to apps that drain the queue then sample key state (e.g. MAME).
+ */
 #include "SDL_internal.h"
 
 #ifdef SDL_VIDEO_DRIVER_KITTY
@@ -34,8 +42,14 @@
 #include <errno.h>
 #include <unistd.h>
 
+/* Forward: SIGWINCH / got_winch → resize FB and re-place or full present. */
 static void KITTY_HandleWinch(SDL_VideoDevice *_this);
 
+/*
+ * Resolve the window that should receive keyboard/mouse input.
+ * Prefers VideoData->focus_window, then SDL keyboard focus, then the first
+ * window from SDL_GetWindows (frees that list). Returns NULL if none.
+ */
 static SDL_Window *KITTY_FocusWindow(SDL_VideoDevice *_this)
 {
     SDL_VideoData *data = (SDL_VideoData *)_this->internal;
@@ -72,6 +86,10 @@ typedef struct KITTY_KeyHold
 static KITTY_KeyHold KITTY_key_holds[KITTY_KEY_HOLD_MAX];
 static int KITTY_key_hold_n;
 
+/*
+ * Minimum key-down duration in ms before a deferred key-up may fire.
+ * Uses term_profile->key_hold_ms when set; otherwise KITTY_KEY_HOLD_MS_DEFAULT.
+ */
 static Uint32 KITTY_KeyHoldMs(void)
 {
     SDL_VideoDevice *dev = SDL_GetVideoDevice();
@@ -84,6 +102,11 @@ static Uint32 KITTY_KeyHoldMs(void)
     return KITTY_KEY_HOLD_MS_DEFAULT;
 }
 
+/*
+ * Look up a key-hold slot for scancode. If create is true and the table is
+ * not full, appends a new zeroed entry. Returns NULL if missing and not
+ * creating, or if KITTY_KEY_HOLD_MAX is reached.
+ */
 static KITTY_KeyHold *KITTY_FindHold(SDL_Scancode sc, bool create)
 {
     int i;
@@ -102,6 +125,10 @@ static KITTY_KeyHold *KITTY_FindHold(SDL_Scancode sc, bool create)
     return &KITTY_key_holds[KITTY_key_hold_n++];
 }
 
+/*
+ * Remove the key-hold entry at idx by swapping with the last slot and
+ * shrinking KITTY_key_hold_n. No-op if idx is out of range.
+ */
 static void KITTY_RemoveHoldAt(int idx)
 {
     if (idx < 0 || idx >= KITTY_key_hold_n) {
@@ -111,6 +138,11 @@ static void KITTY_RemoveHoldAt(int idx)
     KITTY_key_hold_n--;
 }
 
+/*
+ * Emit SDL key-up for any held key whose earliest_up_ms has elapsed and
+ * want_up is set; removes those slots. Called each pump so min-hold releases
+ * land even when no tty bytes arrive.
+ */
 static void KITTY_FlushDueKeyUps(void)
 {
     const Uint64 now = SDL_GetTicks();
@@ -126,6 +158,10 @@ static void KITTY_FlushDueKeyUps(void)
     }
 }
 
+/*
+ * Send one SDL keyboard key event for scancode (press or release) via
+ * SDL_SendKeyboardKey on SDL_GLOBAL_KEYBOARD_ID. Ignores UNKNOWN.
+ */
 static void KITTY_SendKey(SDL_Scancode scancode, bool pressed)
 {
     if (scancode == SDL_SCANCODE_UNKNOWN) {
@@ -134,6 +170,10 @@ static void KITTY_SendKey(SDL_Scancode scancode, bool pressed)
     SDL_SendKeyboardKey(0, SDL_GLOBAL_KEYBOARD_ID, 0, scancode, pressed);
 }
 
+/*
+ * Optional key-path debug log when built with SDL_KITTY_RUNTIME_DEBUG and
+ * SDL_KITTY_KEY_DEBUG is set. No-op otherwise (arguments unused).
+ */
 static void KITTY_LogKey(SDL_Scancode sc, int event_type, const char *via)
 {
 #ifdef SDL_KITTY_RUNTIME_DEBUG
@@ -150,7 +190,13 @@ static void KITTY_LogKey(SDL_Scancode sc, int event_type, const char *via)
 #endif
 }
 
-/* Kitty event-type subfield: 1=press (default), 2=repeat, 3=release. */
+/*
+ * Apply a Kitty key event: event_type 1=press, 2=repeat, 3=release.
+ * Tracks min-hold so MAME-style poll-after-drain sees presses. On release,
+ * defers SDL key-up until earliest_up_ms if still within the hold window.
+ * has_release false (legacy) schedules auto-up after the hold; CSI-u/flag-2
+ * paths pass true and wait for a real :3 release.
+ */
 static void KITTY_ApplyKeyEvent(SDL_Scancode sc, int event_type, bool has_release)
 {
     KITTY_KeyHold *h;
@@ -206,6 +252,10 @@ static void KITTY_ApplyKeyEvent(SDL_Scancode sc, int event_type, bool has_releas
     }
 }
 
+/*
+ * Map a raw ASCII/control byte to SDL_Scancode (a–z/A–Z, 0–9, Esc, Return,
+ * Space, Tab, Backspace). Returns SDL_SCANCODE_UNKNOWN for unmapped bytes.
+ */
 static SDL_Scancode KITTY_AsciiToScancode(unsigned char c)
 {
     if (c >= 'a' && c <= 'z') {
@@ -238,7 +288,10 @@ static SDL_Scancode KITTY_AsciiToScancode(unsigned char c)
     }
 }
 
-/* Kitty mods field is (1 + bitmask). Bit0=shift … see keyboard protocol. */
+/*
+ * Convert Kitty keyboard protocol mods field (1 + bitmask: shift/alt/ctrl/
+ * gui/caps/num) into SDL_Keymod. mods_field 0 or 1 yields SDL_KMOD_NONE.
+ */
 static SDL_Keymod KITTY_ModsToSDL(unsigned mods_field)
 {
     const unsigned bits = (mods_field > 0) ? (mods_field - 1u) : 0u;
@@ -264,6 +317,11 @@ static SDL_Keymod KITTY_ModsToSDL(unsigned mods_field)
     return m;
 }
 
+/*
+ * Map Kitty CSI-u codepoint / functional PUA code to SDL_Scancode.
+ * Covers ASCII letters/digits, arrows, locks, menu, modifiers (flag 8),
+ * and F13–F24 PUA range. F1–F12 often arrive via legacy CSI instead.
+ */
 static SDL_Scancode KITTY_CodeToScancode(unsigned code)
 {
     if (code >= 'a' && code <= 'z') {
@@ -337,6 +395,10 @@ static SDL_Scancode KITTY_CodeToScancode(unsigned code)
     return SDL_SCANCODE_UNKNOWN;
 }
 
+/*
+ * Map legacy CSI/SS3 final byte and optional ~ number to SDL_Scancode
+ * (arrows A–D, Home/End H/F, F1–F4 P–S, and ~ insert/delete/page/F-keys).
+ */
 static SDL_Scancode KITTY_LegacyFinalToScancode(unsigned char final_byte, unsigned number)
 {
     switch (final_byte) {
@@ -406,6 +468,10 @@ static SDL_Scancode KITTY_LegacyFinalToScancode(unsigned char final_byte, unsign
     }
 }
 
+/*
+ * Handle a bare tty byte as a legacy text key press (no release report).
+ * Applies event_type 1 with has_release false so min-hold schedules the up.
+ */
 static void KITTY_HandleAscii(SDL_VideoDevice *_this, unsigned char c)
 {
     SDL_Scancode sc = KITTY_AsciiToScancode(c);
@@ -414,6 +480,12 @@ static void KITTY_HandleAscii(SDL_VideoDevice *_this, unsigned char c)
     KITTY_ApplyKeyEvent(sc, 1, false);
 }
 
+/*
+ * Parse SGR mouse CSI body "<b;x;yM" or "<b;x;ym" (no ESC[). Maps 1016
+ * pixel or 1006 cell coords into framebuffer space (place_cells stretch or
+ * 1:1), then emits SDL mouse motion, wheel (64/65), or button press/release.
+ * Returns false if the sequence is malformed; true if handled or ignored.
+ */
 static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t len)
 {
     // seq is like "<b;x;yM" or "<b;x;ym" (without ESC[)
@@ -518,7 +590,9 @@ static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t 
 
 /*
  * Parse Kitty CSI-u body (no leading '['), e.g. "97;1:3u", "27u", "97:65;5u".
- * Event types (when flag 2 is on): 1=press, 2=repeat, 3=release.
+ * Reads code, mods, and optional event subfield (1=press, 2=repeat, 3=release).
+ * Sets SDL mod state and applies the key with has_release true (flag 2 path).
+ * Returns false if the body does not end in 'u' or is too short.
  */
 static bool KITTY_ParseKittyKey(const char *seq, size_t len)
 {
@@ -576,7 +650,11 @@ static bool KITTY_ParseKittyKey(const char *seq, size_t len)
     return true;
 }
 
-/* CSI 1;mods:event A  /  CSI A  /  CSI 15;mods~  etc. */
+/*
+ * Parse legacy CSI key body such as "1;mods:eventA", "A", or "15;mods~".
+ * Extracts number, mods, and optional event subfield; maps final_byte via
+ * KITTY_LegacyFinalToScancode; sets mod state and applies with has_release true.
+ */
 static void KITTY_ParseLegacyCSIKey(const char *seq, size_t len, unsigned char final_byte)
 {
     unsigned number = 1;
@@ -628,6 +706,11 @@ static void KITTY_ParseLegacyCSIKey(const char *seq, size_t len, unsigned char f
     (void)has_event_field;
 }
 
+/*
+ * Consume one complete CSI from buf (buf[0] is '['). Dispatches SGR mouse
+ * ('<'), Kitty CSI-u ('u'), or legacy finals (A–D, H/F, P–S, ~). Returns
+ * bytes consumed including the final; 0 if the sequence is still incomplete.
+ */
 static size_t KITTY_HandleCSI(SDL_VideoDevice *_this, const unsigned char *buf, size_t len)
 {
     // buf[0] is '['; find final byte
@@ -661,6 +744,12 @@ static size_t KITTY_HandleCSI(SDL_VideoDevice *_this, const unsigned char *buf, 
     return 0; // incomplete
 }
 
+/*
+ * Handle a pending SIGWINCH (got_winch). Re-queries terminal pixel/grid size,
+ * classifies NONE / REPLACE / FULL via KITTY_ClassifyResize. REPLACE only
+ * updates Kitty c/r stretch (PlaceExistingImage); FULL updates desktop mode,
+ * SDL_SetWindowSize, and SDL_EVENT_WINDOW_RESIZED so the app recreates the FB.
+ */
 static void KITTY_HandleWinch(SDL_VideoDevice *_this)
 {
     SDL_VideoData *data = (SDL_VideoData *)_this->internal;
@@ -742,6 +831,12 @@ static void KITTY_HandleWinch(SDL_VideoDevice *_this)
     SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, data->pixel_w, data->pixel_h);
 }
 
+/*
+ * SDL event pump entry for the Kitty driver. Flushes due key-ups, announces
+ * keyboard/mouse focus once, handles WINCH, then non-blocking-reads tty_in
+ * into a carry buffer and parses ASCII, CSI (keys/mouse), SS3 arrows/F-keys,
+ * and APC/PM/SOS (graphics OK replies drained, not treated as keys).
+ */
 void KITTY_PumpEvents(SDL_VideoDevice *_this)
 {
     SDL_VideoData *data = (SDL_VideoData *)_this->internal;

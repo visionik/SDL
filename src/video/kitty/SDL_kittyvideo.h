@@ -25,6 +25,11 @@
 #ifndef SDL_kittyvideo_h_
 #define SDL_kittyvideo_h_
 
+/*
+ * Shared types for the kitty SDL video driver: per-device tty/APC state
+ * (SDL_VideoData) and per-window image/scratch buffers (SDL_WindowData).
+ */
+
 #include "../SDL_sysvideo.h"
 
 #include <signal.h>
@@ -34,6 +39,10 @@
 /* Carry incomplete CSI/APC across read() calls in KITTY_PumpEvents. */
 #define KITTY_TTY_PENDING_MAX 4096
 
+/*
+ * How full-frame RGB is sent over the Kitty graphics protocol: POSIX SHM,
+ * zlib-compressed direct APC, or raw direct APC.
+ */
 typedef enum KITTY_TransmitMode
 {
     KITTY_TRANSMIT_SHM = 0,
@@ -43,6 +52,10 @@ typedef enum KITTY_TransmitMode
 
 struct KITTY_TerminalProfile; /* SDL_kittyprofile.h */
 
+/*
+ * Driver-private state for one kitty SDL_VideoDevice: tty fds, terminal
+ * profile, cell/pixel geometry, mouse mode, transmit path, and pending CSI.
+ */
 typedef struct SDL_VideoData
 {
     /* Rex (and some hosts) deliver keyboard on stdin while APC/CSI go out
@@ -96,6 +109,10 @@ typedef struct SDL_VideoData
 #define KITTY_OVERLAY_MAX 16
 #define KITTY_OVERLAY_ID_BASE 100u
 
+/*
+ * Driver-private state for one SDL_Window: Kitty image ids, retained RGB
+ * scratch/back buffers for dirty present, and optional overlay stack.
+ */
 typedef struct SDL_WindowData
 {
     SDL_Window *sdl_window;

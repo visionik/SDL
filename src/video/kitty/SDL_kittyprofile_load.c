@@ -1,9 +1,13 @@
 /*
   Simple DirectMedia Layer
   Copyright (C) 2026 Visionik <visionik@pobox.com>
-
-  Load config/terminals.toml (tomlc17) into KITTY_TerminalProfile entries.
 */
+
+/*
+ * TOML loader for terminal profiles (tomlc17): parse config/terminals.toml
+ * (or SDL_KITTY_PROFILES / search paths) into KITTY_ProfileEntry rows with
+ * matchers and policy overlays; detect the active loaded profile from env.
+ */
 #ifdef KITTY_PROFILE_STANDALONE
 #include <SDL3/SDL.h>
 #include <stdio.h>
@@ -66,6 +70,10 @@ static bool g_load_attempted;
 static bool g_have_loaded; /* true when at least one TOML file applied */
 static char g_source[KITTY_SOURCE_MAX] = "builtin";
 
+/*
+ * Debug log for profile load/match when SDL_KITTY_RUNTIME_DEBUG is built and
+ * SDL_KITTY_DEBUG is set. Uses KITTY_DebugLog non-standalone; else stderr.
+ */
 static void KITTY_ProfileDebug(const char *fmt, ...)
 {
 #ifdef SDL_KITTY_RUNTIME_DEBUG
@@ -95,6 +103,9 @@ static void KITTY_ProfileDebug(const char *fmt, ...)
 #endif /* SDL_KITTY_RUNTIME_DEBUG */
 }
 
+/*
+ * Free all strdup'd strings in list and reset count to 0.
+ */
 static void KITTY_FreeStringList(KITTY_StringList *list)
 {
     int i;
@@ -108,6 +119,9 @@ static void KITTY_FreeStringList(KITTY_StringList *list)
     list->count = 0;
 }
 
+/*
+ * Release owned heap fields and string lists on e, then zero the entry.
+ */
 static void KITTY_ClearEntry(KITTY_ProfileEntry *e)
 {
     if (!e) {
@@ -127,6 +141,9 @@ static void KITTY_ClearEntry(KITTY_ProfileEntry *e)
     SDL_zerop(e);
 }
 
+/*
+ * Clear every loaded entry, mark unloaded, and reset g_source to "builtin".
+ */
 static void KITTY_ClearAllEntries(void)
 {
     int i;
@@ -138,6 +155,10 @@ static void KITTY_ClearAllEntries(void)
     SDL_strlcpy(g_source, "builtin", sizeof(g_source));
 }
 
+/*
+ * Map a [[terminal]] id string (and kitty-/ghostty-/wezterm- prefixes) to
+ * KITTY_TerminalKind. Unknown or empty → KITTY_TERM_UNKNOWN.
+ */
 static KITTY_TerminalKind KITTY_KindFromId(const char *id)
 {
     if (!id || !id[0]) {
@@ -158,9 +179,11 @@ static KITTY_TerminalKind KITTY_KindFromId(const char *id)
     return KITTY_TERM_UNKNOWN;
 }
 
-/* Parse leading major[.minor[.patch]] from TERM_PROGRAM_VERSION / match bounds.
- * Accepts prefixes like "ghostty 1.3.1" by skipping to the first digit.
- * Pre-release: "1.3.2-main+abc" → 1.3.2 has_pre=true. */
+/*
+ * Parse leading major[.minor[.patch]] from TERM_PROGRAM_VERSION / match
+ * bounds. Skips a non-digit prefix (e.g. "ghostty 1.3.1"). A '-' after the
+ * numeric core sets has_pre (pre-release sorts below a plain release).
+ */
 static bool KITTY_ParseVersion(const char *s, KITTY_ParsedVersion *out)
 {
     const char *p;
@@ -206,7 +229,10 @@ static bool KITTY_ParseVersion(const char *s, KITTY_ParsedVersion *out)
     return true;
 }
 
-/* Semver-ish: major/minor/patch first; when equal, release (no pre) > pre-release. */
+/*
+ * Compare parsed versions: major/minor/patch first; when equal, a plain
+ * release sorts above a pre-release (has_pre). Returns -1 / 0 / 1.
+ */
 static int KITTY_CmpParsedVersion(const KITTY_ParsedVersion *a, const KITTY_ParsedVersion *b)
 {
     if (a->major != b->major) {
@@ -224,6 +250,10 @@ static int KITTY_CmpParsedVersion(const KITTY_ParsedVersion *a, const KITTY_Pars
     return 0;
 }
 
+/*
+ * True if actual is within optional [min_s, max_s] inclusive. No bounds →
+ * true; constrained row with missing/unparseable actual → false.
+ */
 static bool KITTY_VersionInRange(const char *actual,
                                  const char *min_s,
                                  const char *max_s)
@@ -258,6 +288,9 @@ static bool KITTY_VersionInRange(const char *actual,
     return true;
 }
 
+/*
+ * Parse "WxH" (case-insensitive x) into positive width and height outputs.
+ */
 static bool KITTY_ParseWxH(const char *s, int *w, int *h)
 {
     int aw = 0, ah = 0;
@@ -275,6 +308,9 @@ static bool KITTY_ParseWxH(const char *s, int *w, int *h)
     return true;
 }
 
+/*
+ * Read a TOML boolean key into *out. Returns false if missing or wrong type.
+ */
 static bool KITTY_TomlGetBool(toml_datum_t tab, const char *key, bool *out)
 {
     toml_datum_t v = toml_get(tab, key);
@@ -285,6 +321,9 @@ static bool KITTY_TomlGetBool(toml_datum_t tab, const char *key, bool *out)
     return true;
 }
 
+/*
+ * Read a TOML int64 key into *out. Returns false if missing or wrong type.
+ */
 static bool KITTY_TomlGetInt(toml_datum_t tab, const char *key, int64_t *out)
 {
     toml_datum_t v = toml_get(tab, key);
@@ -295,6 +334,10 @@ static bool KITTY_TomlGetInt(toml_datum_t tab, const char *key, int64_t *out)
     return true;
 }
 
+/*
+ * Read a TOML float key into *out; int64 values are widened. Returns false
+ * if missing or neither FP64 nor INT64.
+ */
 static bool KITTY_TomlGetFloat(toml_datum_t tab, const char *key, double *out)
 {
     toml_datum_t v = toml_get(tab, key);
@@ -309,6 +352,10 @@ static bool KITTY_TomlGetFloat(toml_datum_t tab, const char *key, double *out)
     return false;
 }
 
+/*
+ * Read a TOML string key into *out (points into the parse tree). Returns
+ * false if missing, wrong type, or null.
+ */
 static bool KITTY_TomlGetString(toml_datum_t tab, const char *key, const char **out)
 {
     toml_datum_t v = toml_get(tab, key);
@@ -319,6 +366,10 @@ static bool KITTY_TomlGetString(toml_datum_t tab, const char *key, const char **
     return true;
 }
 
+/*
+ * Replace out with strdup'd strings from a TOML string array (up to
+ * KITTY_MATCH_MAX). Returns true if at least one string was copied.
+ */
 static bool KITTY_CopyStringListFromToml(KITTY_StringList *out, toml_datum_t arr)
 {
     int i;
@@ -342,6 +393,10 @@ static bool KITTY_CopyStringListFromToml(KITTY_StringList *out, toml_datum_t arr
     return out->count > 0;
 }
 
+/*
+ * Sparse-overlay policy/tunable keys from a TOML table onto *p. When entry
+ * is non-NULL, owns heap for force_transmit and notes strings.
+ */
 static void KITTY_OverlayProfileFromTable(KITTY_TerminalProfile *p, toml_datum_t tab,
                                           KITTY_ProfileEntry *entry)
 {
@@ -474,6 +529,10 @@ static void KITTY_OverlayProfileFromTable(KITTY_TerminalProfile *p, toml_datum_t
     }
 }
 
+/*
+ * Read match.* keys from tab into entry (term_program lists, kitty_window_id,
+ * version min/max). Sets has_matchers when any matcher is present.
+ */
 static void KITTY_OverlayMatchers(KITTY_ProfileEntry *entry, toml_datum_t tab)
 {
     toml_datum_t a;
@@ -517,6 +576,9 @@ static void KITTY_OverlayMatchers(KITTY_ProfileEntry *entry, toml_datum_t tab)
     }
 }
 
+/*
+ * Case-insensitive exact match of s against any item in list.
+ */
 static bool KITTY_ListContainsCI(const KITTY_StringList *list, const char *s)
 {
     int i;
@@ -531,6 +593,9 @@ static bool KITTY_ListContainsCI(const KITTY_StringList *list, const char *s)
     return false;
 }
 
+/*
+ * True if any list item occurs as a substring of s (case-sensitive strstr).
+ */
 static bool KITTY_ListSubstring(const KITTY_StringList *list, const char *s)
 {
     int i;
@@ -545,6 +610,10 @@ static bool KITTY_ListSubstring(const KITTY_StringList *list, const char *s)
     return false;
 }
 
+/*
+ * True if e's identity matchers hit tp/term/KITTY_WINDOW_ID and optional
+ * TERM_PROGRAM_VERSION lies in [version_min, version_max].
+ */
 static bool KITTY_EntryMatches(const KITTY_ProfileEntry *e, const char *tp, const char *term)
 {
     bool identity = false;
@@ -571,6 +640,9 @@ static bool KITTY_EntryMatches(const KITTY_ProfileEntry *e, const char *tp, cons
     return KITTY_VersionInRange(tpv, e->version_min, e->version_max);
 }
 
+/*
+ * Find a loaded entry whose name_storage matches name (case-insensitive).
+ */
 static KITTY_ProfileEntry *KITTY_FindEntryByName(const char *name)
 {
     int i;
@@ -585,6 +657,10 @@ static KITTY_ProfileEntry *KITTY_FindEntryByName(const char *name)
     return NULL;
 }
 
+/*
+ * Append a new entry cloned from defaults (or BuiltinDefaultsProfile), with
+ * kind/name from id. Returns NULL if the table is full or id is empty.
+ */
 static KITTY_ProfileEntry *KITTY_AddEntryFromDefaults(const KITTY_TerminalProfile *defaults,
                                                      const char *id)
 {
@@ -604,6 +680,11 @@ static KITTY_ProfileEntry *KITTY_AddEntryFromDefaults(const KITTY_TerminalProfil
     return e;
 }
 
+/*
+ * Apply a parsed TOML result: overlay [defaults], optionally replace all
+ * entries, then merge each [[terminal]] row (policy + matchers). Sets
+ * g_have_loaded on success.
+ */
 static bool KITTY_ApplyTomlResult(toml_result_t result, bool replace)
 {
     toml_datum_t defaults_tab;
@@ -707,6 +788,11 @@ static bool KITTY_ApplyTomlResult(toml_result_t result, bool replace)
     return g_have_loaded;
 }
 
+/*
+ * Parse path with tomlc17 and ApplyTomlResult. On success, record path in
+ * g_source (append with ';' if already loaded). Returns false on I/O/parse
+ * failure.
+ */
 static bool KITTY_LoadProfilesFile(const char *path, bool replace)
 {
     toml_result_t result;
@@ -739,6 +825,10 @@ static bool KITTY_LoadProfilesFile(const char *path, bool replace)
     return ok;
 }
 
+/*
+ * If path is readable, strdup it into paths[*n] and increment *n (no-op if
+ * full, empty, or fopen fails).
+ */
 static void KITTY_AppendPathIfExists(char **paths, int *n, int cap, const char *path)
 {
     FILE *fp;
@@ -756,6 +846,10 @@ static void KITTY_AppendPathIfExists(char **paths, int *n, int cap, const char *
     }
 }
 
+/*
+ * Fill paths with existing profile files: SDL_KITTY_PROFILES (colon list,
+ * exclusive) else pref/base-path terminals.toml and KITTY_DEFAULT_PROFILES_PATH.
+ */
 static void KITTY_CollectSearchPaths(char **paths, int *n, int cap)
 {
     const char *env = SDL_getenv("SDL_KITTY_PROFILES");
@@ -814,6 +908,10 @@ static void KITTY_CollectSearchPaths(char **paths, int *n, int cap)
 #endif
 }
 
+/*
+ * Drop loaded entries and clear g_load_attempted so the next Ensure will
+ * search again (builtins until a TOML load succeeds).
+ */
 void KITTY_ResetTerminalProfilesToBuiltin(void)
 {
     KITTY_ClearAllEntries();
@@ -821,6 +919,10 @@ void KITTY_ResetTerminalProfilesToBuiltin(void)
     g_have_loaded = false;
 }
 
+/*
+ * Load profiles from an explicit path. First successful load replaces;
+ * later calls overlay. Marks load attempted on success.
+ */
 bool KITTY_LoadTerminalProfiles(const char *path)
 {
     bool ok;
@@ -832,6 +934,10 @@ bool KITTY_LoadTerminalProfiles(const char *path)
     return ok;
 }
 
+/*
+ * One-shot search/load of profile TOML via CollectSearchPaths. Configures
+ * tomlc17 to use SDL allocators. Idempotent after the first call.
+ */
 void KITTY_EnsureTerminalProfilesLoaded(void)
 {
     char *paths[8];
@@ -867,6 +973,11 @@ void KITTY_EnsureTerminalProfilesLoaded(void)
     }
 }
 
+/*
+ * Among loaded entries, return the first env matcher hit; else the
+ * "unknown" no-matcher row; else first entry without matchers; else
+ * g_entries[0]. NULL if nothing loaded.
+ */
 const KITTY_TerminalProfile *KITTY_DetectLoadedTerminalProfile(void)
 {
     const char *tp;
@@ -900,11 +1011,18 @@ const KITTY_TerminalProfile *KITTY_DetectLoadedTerminalProfile(void)
     return &g_entries[0].profile;
 }
 
+/*
+ * Return g_source ("builtin" or loaded path list). Never NULL.
+ */
 const char *KITTY_TerminalProfilesSource(void)
 {
     return g_source[0] ? g_source : "builtin";
 }
 
+/*
+ * Ensure profiles loaded; true if any loaded entry's matchers hit the
+ * current TERM_PROGRAM/TERM env (ProbeSupport).
+ */
 bool KITTY_EnvMatchesLoadedProfile(void)
 {
     const char *tp;

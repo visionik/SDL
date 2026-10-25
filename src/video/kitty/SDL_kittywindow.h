@@ -25,10 +25,27 @@
 #ifndef SDL_kittywindow_h_
 #define SDL_kittywindow_h_
 
+/*
+ * Window create/destroy/resize hooks for the kitty SDL video driver.
+ */
+
 #include "SDL_kittyvideo.h"
 
+/*
+ * Create a terminal-filling window: size to CSI pixels, allocate
+ * SDL_WindowData / Kitty image ids, take focus, and post RESIZED/SHOWN.
+ */
 extern bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_PropertiesID create_props);
+
+/*
+ * Delete Kitty images on the tty, free SDL_WindowData / RGB scratch, and
+ * clear focus if this window owned it.
+ */
 extern void KITTY_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window);
+
+/*
+ * Post SDL_EVENT_WINDOW_RESIZED from window->pending; does not change tty size.
+ */
 extern void KITTY_SetWindowSize(SDL_VideoDevice *_this, SDL_Window *window);
 
 #endif // SDL_kittywindow_h_
