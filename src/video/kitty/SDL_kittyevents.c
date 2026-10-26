@@ -926,8 +926,12 @@ static void KITTY_HandleWinch(SDL_VideoDevice *_this)
     }
 
     if (action == KITTY_RESIZE_REPLACE) {
-        /* Same FB pixels: only update Kitty c/r stretch. Skip SDL surface recreate. */
-        if (!KITTY_PlaceExistingImage(data, wdata->live_image_id, data->cols, data->rows)) {
+        /* Same FB pixels: only update Kitty c/r stretch. Skip SDL surface recreate.
+         * Card mode: stretch to viewport c×r, not the full pane (WINCH must not
+         * blow a VIEWPORT image out to cols×rows). */
+        int place_cols = 0, place_rows = 0;
+        KITTY_GetPlaceCells(data, &place_cols, &place_rows);
+        if (!KITTY_PlaceExistingImage(data, wdata->live_image_id, place_cols, place_rows)) {
             action = KITTY_RESIZE_FULL; /* fall through to full resize path */
         } else {
             return;
