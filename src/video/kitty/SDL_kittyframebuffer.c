@@ -173,6 +173,26 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         return SDL_SetError("kitty video/window data missing");
     }
 
+    /* Card viewport still clamped to a stub grid (e.g. 80×24 while req is
+     * 76×38): skip presents so the first paint lands after WINCH grows the
+     * pane. Avoids the first-click jump where a=p leaves the image off-chrome. */
+    if (vdata->vp_cols_req > 0 && vdata->vp_rows_req > 0 &&
+        vdata->vp_rows > 0 && vdata->vp_rows < vdata->vp_rows_req) {
+#ifdef SDL_KITTY_RUNTIME_DEBUG
+        if (KITTY_DebugEnabled()) {
+            static int skip_n;
+            if ((skip_n++ % 60) == 0) {
+                SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                             "kitty: defer present until viewport fits (live %dx%d req %dx%d grid %dx%d)",
+                             vdata->vp_cols, vdata->vp_rows,
+                             vdata->vp_cols_req, vdata->vp_rows_req,
+                             vdata->cols, vdata->rows);
+            }
+        }
+#endif
+        return true;
+    }
+
     /* Reset per-present perf fields (TransmitRGB / a=f refresh on success). */
     vdata->last_wire_bytes = 0;
     vdata->last_raw_bytes = 0;

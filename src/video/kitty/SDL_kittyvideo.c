@@ -235,8 +235,18 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
             (data->term_profile && data->term_profile->stub_rows > 0)
                 ? data->term_profile->stub_rows
                 : 24;
+        /* Card viewports taller than the stub grid need a real WINCH before
+         * the first paint; wait for rows to fit vp_row_req+vp_rows_req. */
+        const int need_rows =
+            (data->vp_rows_req > 0 && data->vp_row_req > 0)
+                ? (data->vp_row_req + data->vp_rows_req)
+                : 0;
         for (int i = 0; i < stub_iters; ++i) {
-            if (!(data->cols == stub_cols && data->rows == stub_rows)) {
+            const bool still_stub =
+                (data->cols == stub_cols && data->rows == stub_rows);
+            const bool vp_fits =
+                (need_rows <= 0) || (data->rows >= need_rows);
+            if (!still_stub && vp_fits) {
                 break;
             }
             SDL_Delay(stub_delay);
@@ -249,6 +259,11 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
                 (void)KITTY_QueryTerminalSize(data);
             }
         }
+    }
+
+    /* Card chrome after size is known (and again on WINCH replace). */
+    if (!data->use_alt_screen) {
+        (void)KITTY_DrawViewportChrome(data);
     }
 
     /* a=q probe: pick SHM vs direct (Rex stays direct unless forced). */

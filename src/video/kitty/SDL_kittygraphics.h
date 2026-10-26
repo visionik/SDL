@@ -66,6 +66,10 @@ void KITTY_GetPlaceCells(const SDL_VideoData *data, int *out_cols, int *out_rows
 /* CUP to viewport origin, or home if no viewport. */
 bool KITTY_WritePlaceOrigin(SDL_VideoData *data);
 
+/* ASCII border one cell outside the live viewport (card chrome). No-op if
+ * no viewport or no room for a border. Safe to call again after WINCH. */
+bool KITTY_DrawViewportChrome(SDL_VideoData *data);
+
 /*
  * Put tty_in into raw mode (cfmakeraw) while keeping ISIG for Ctrl+C/Z.
  * Saves prior termios for KITTY_LeaveRawMode.

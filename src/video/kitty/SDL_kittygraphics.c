@@ -591,6 +591,10 @@ void KITTY_ApplyViewportEnv(SDL_VideoData *data)
     if (!data) {
         return;
     }
+    data->vp_col_req = 0;
+    data->vp_row_req = 0;
+    data->vp_cols_req = 0;
+    data->vp_rows_req = 0;
     data->vp_col = 0;
     data->vp_row = 0;
     data->vp_cols = 0;
@@ -600,6 +604,10 @@ void KITTY_ApplyViewportEnv(SDL_VideoData *data)
     vp = SDL_getenv("SDL_KITTY_VIEWPORT");
     if (vp && *vp && SDL_sscanf(vp, "%d,%d,%d,%d", &col, &row, &w, &h) == 4 &&
         col > 0 && row > 0 && w > 0 && h > 0) {
+        data->vp_col_req = col;
+        data->vp_row_req = row;
+        data->vp_cols_req = w;
+        data->vp_rows_req = h;
         data->vp_col = col;
         data->vp_row = row;
         data->vp_cols = w;
@@ -621,9 +629,14 @@ void KITTY_ApplyViewportEnv(SDL_VideoData *data)
 
 void KITTY_ClampViewport(SDL_VideoData *data)
 {
-    if (!data || data->vp_cols <= 0 || data->vp_rows <= 0) {
+    if (!data || data->vp_cols_req <= 0 || data->vp_rows_req <= 0) {
         return;
     }
+    /* Always restart from the requested env rect, then fit the live grid. */
+    data->vp_col = data->vp_col_req;
+    data->vp_row = data->vp_row_req;
+    data->vp_cols = data->vp_cols_req;
+    data->vp_rows = data->vp_rows_req;
     if (data->cols > 0 && data->vp_col > data->cols) {
         data->vp_col = data->cols;
     }
@@ -680,6 +693,61 @@ bool KITTY_WritePlaceOrigin(SDL_VideoData *data)
         return false;
     }
     return KITTY_WriteAll(data->tty_fd, buf, (size_t)n);
+}
+
+bool KITTY_DrawViewportChrome(SDL_VideoData *data)
+{
+    char buf[64];
+    int x0, y0, x1, y1, n, r, i, w;
+    int fd;
+
+    if (!data || data->vp_cols <= 0 || data->vp_rows <= 0 ||
+        data->vp_col < 2 || data->vp_row < 2) {
+        return true;
+    }
+    fd = data->tty_out >= 0 ? data->tty_out : data->tty_fd;
+    if (fd < 0) {
+        return false;
+    }
+
+    x0 = data->vp_col - 1;
+    y0 = data->vp_row - 1;
+    x1 = data->vp_col + data->vp_cols;
+    y1 = data->vp_row + data->vp_rows;
+    w = data->vp_cols;
+
+    n = SDL_snprintf(buf, sizeof(buf), "\033[%d;%dH+", y0, x0);
+    if (n <= 0 || !KITTY_WriteAll(fd, buf, (size_t)n)) {
+        return false;
+    }
+    for (i = 0; i < w; ++i) {
+        if (!KITTY_WriteAll(fd, "-", 1)) {
+            return false;
+        }
+    }
+    if (!KITTY_WriteAll(fd, "+", 1)) {
+        return false;
+    }
+    for (r = 0; r < data->vp_rows; ++r) {
+        n = SDL_snprintf(buf, sizeof(buf), "\033[%d;%dH|\033[%d;%dH|",
+                         data->vp_row + r, x0, data->vp_row + r, x1);
+        if (n <= 0 || !KITTY_WriteAll(fd, buf, (size_t)n)) {
+            return false;
+        }
+    }
+    n = SDL_snprintf(buf, sizeof(buf), "\033[%d;%dH+", y1, x0);
+    if (n <= 0 || !KITTY_WriteAll(fd, buf, (size_t)n)) {
+        return false;
+    }
+    for (i = 0; i < w; ++i) {
+        if (!KITTY_WriteAll(fd, "-", 1)) {
+            return false;
+        }
+    }
+    if (!KITTY_WriteAll(fd, "+", 1)) {
+        return false;
+    }
+    return true;
 }
 
 /*
@@ -1009,6 +1077,8 @@ bool KITTY_SetupTerminal(SDL_VideoData *data)
     } else if (!KITTY_WriteAll(data->tty_out, setup_card, sizeof(setup_card) - 1)) {
         return false;
     }
+    /* Viewport ASCII chrome is drawn after QueryTerminalSize / stub WINCH
+     * wait in VideoInit, and again on resize replace. */
     data->kitty_keyboard_ok = KITTY_ProbeKittyKeyboard(data);
     if (!data->kitty_keyboard_ok && data->term_profile && data->term_profile->name &&
         SDL_strcasecmp(data->term_profile->name, "wezterm") == 0) {
@@ -1060,6 +1130,8 @@ bool KITTY_EnableMouse(SDL_VideoData *data)
 /*
  * Delete all images, disable mouse/keyboard modes, leave alt screen,
  * drain late APC replies, and restore cooked termios.
+ * Card mode: park the cursor on the row below the viewport chrome so the
+ * next shell prompt does not sit inside the card.
  */
 void KITTY_RestoreTerminal(SDL_VideoData *data)
 {
@@ -1076,6 +1148,29 @@ void KITTY_RestoreTerminal(SDL_VideoData *data)
     KITTY_WriteAll(data->tty_out, restore_modes, sizeof(restore_modes) - 1);
     if (data->use_alt_screen) {
         KITTY_WriteAll(data->tty_out, leave_alt, sizeof(leave_alt) - 1);
+    } else if (data->vp_cols > 0 && data->vp_rows > 0 && data->vp_row > 0) {
+        /* Bottom chrome border is at vp_row+vp_rows; next row is below it.
+         * Without a border (origin too tight), land just under the viewport.
+         * Do not ED-clear here — on a short stub grid that would wipe the
+         * bottom border when below is clamped to the last row. */
+        char cup[40];
+        int below = data->vp_row + data->vp_rows;
+        int n;
+        if (data->vp_col >= 2 && data->vp_row >= 2) {
+            below += 1;
+        }
+        if (below < 1) {
+            below = 1;
+        }
+        if (data->rows > 0 && below > data->rows) {
+            /* No room under the card: sit on the last row and scroll one line. */
+            n = SDL_snprintf(cup, sizeof(cup), "\033[%d;1H\n", data->rows);
+        } else {
+            n = SDL_snprintf(cup, sizeof(cup), "\033[%d;1H", below);
+        }
+        if (n > 0) {
+            KITTY_WriteAll(data->tty_out, cup, (size_t)n);
+        }
     }
     /* Rex omits q=2 on a=T/SHM, so hosts reply with APC OK. Drain before
      * cooked mode or the next prompt shows Gi=1,p=1;OK as typed text. */

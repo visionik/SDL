@@ -74,7 +74,13 @@ typedef struct SDL_VideoData
     bool place_cells;      /* true: Kitty c/r stretch to grid; scale mouse into FB */
     bool use_alt_screen;   /* false: TUI card mode — no smcup/clear (SDL_KITTY_ALTSCREEN=0) */
     /* Optional cell viewport for card mode (docs/tui-card.md). 1-based origin;
-     * vp_cols/vp_rows > 0 enables. Place uses this c×r; CUP to (vp_row,vp_col). */
+     * vp_cols/vp_rows > 0 enables. Place uses this c×r; CUP to (vp_row,vp_col).
+     * *_req are the env values; ClampViewport copies them then fits the grid so
+     * a stub 80×24 ioctl cannot permanently shrink a taller card across WINCH. */
+    int vp_col_req;
+    int vp_row_req;
+    int vp_cols_req;
+    int vp_rows_req;
     int vp_col;
     int vp_row;
     int vp_cols;

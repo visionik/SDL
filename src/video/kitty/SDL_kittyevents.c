@@ -922,18 +922,64 @@ static void KITTY_HandleWinch(SDL_VideoDevice *_this)
 #endif /* SDL_KITTY_RUNTIME_DEBUG */
 
     if (action == KITTY_RESIZE_NONE) {
+        /* Deferred card presents leave live=0, so ClassifyResize returns NONE
+         * on stub→real WINCH. Still redraw chrome to the unclamped viewport. */
+        if (data->vp_cols_req > 0 && data->vp_rows_req > 0 &&
+            (old_cols != data->cols || old_rows != data->rows)) {
+            (void)KITTY_DrawViewportChrome(data);
+#ifdef SDL_KITTY_RUNTIME_DEBUG
+            if (KITTY_DebugEnabled()) {
+                SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                             "kitty: card chrome redraw after grid %dx%d→%dx%d (no live image)",
+                             old_cols, old_rows, data->cols, data->rows);
+            }
+#endif
+        }
         return;
     }
 
     if (action == KITTY_RESIZE_REPLACE) {
         /* Same FB pixels: only update Kitty c/r stretch. Skip SDL surface recreate.
-         * Card mode: stretch to viewport c×r, not the full pane (WINCH must not
-         * blow a VIEWPORT image out to cols×rows). */
+         * Card mode: a=p across stub→real grid is unreliable on Rex (image jumps
+         * off the chrome while mouse clip stays on the viewport → dead clicks).
+         * Drop the live image and let the next present do a clean a=T + CUP. */
         int place_cols = 0, place_rows = 0;
         KITTY_GetPlaceCells(data, &place_cols, &place_rows);
+#ifdef SDL_KITTY_RUNTIME_DEBUG
+        if (KITTY_DebugEnabled()) {
+            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                         "kitty: resize replace place=%dx%d viewport_req=%d,%d,%d,%d live_vp=%d,%d,%d,%d",
+                         place_cols, place_rows,
+                         data->vp_col_req, data->vp_row_req, data->vp_cols_req, data->vp_rows_req,
+                         data->vp_col, data->vp_row, data->vp_cols, data->vp_rows);
+        }
+#endif
+        if (data->vp_cols_req > 0 && data->vp_rows_req > 0) {
+            if (wdata->live_image_id != 0) {
+                (void)KITTY_DeleteImage(data->tty_out, wdata->live_image_id);
+                wdata->live_image_id = 0;
+            }
+            wdata->placed = false;
+            wdata->overlay_count = 0;
+            wdata->rgb_valid = false;
+            wdata->last_upload_hash_valid = false;
+            data->place_homed = false;
+            data->placed_cols = 0;
+            data->placed_rows = 0;
+            (void)KITTY_DrawViewportChrome(data);
+#ifdef SDL_KITTY_RUNTIME_DEBUG
+            if (KITTY_DebugEnabled()) {
+                SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                             "kitty: card resize → drop live image, await full present into %dx%d",
+                             place_cols, place_rows);
+            }
+#endif
+            return;
+        }
         if (!KITTY_PlaceExistingImage(data, wdata->live_image_id, place_cols, place_rows)) {
             action = KITTY_RESIZE_FULL; /* fall through to full resize path */
         } else {
+            (void)KITTY_DrawViewportChrome(data);
             return;
         }
     }
