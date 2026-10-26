@@ -62,6 +62,16 @@ typedef struct KITTY_TerminalProfile
     int default_fb_max_w;
     int default_fb_max_h;
 
+    /*
+     * Transport-aware soft-maxes (source-backed; see config/terminals.toml notes).
+     * 0 = fall back to default_fb_max_*. Applied from KITTY_ApplyFramebufferCap
+     * using transmit_mode after probe (SHM vs direct/zlib).
+     */
+    int default_fb_max_shm_w;
+    int default_fb_max_shm_h;
+    int default_fb_max_direct_w;
+    int default_fb_max_direct_h;
+
     /* Refuse direct a=T / fallback above this many raw bytes. */
     size_t max_direct_bytes;
 

@@ -45,6 +45,13 @@ bool KITTY_ProbeSupport(void);
 bool KITTY_QueryTerminalSize(SDL_VideoData *data);
 
 /*
+ * Aspect-fit pixel_w/h into the active soft-max box: env FB_MAX/FIXED, else
+ * profile default_fb_max_shm_* when transmit is SHM, else default_fb_max_direct_*,
+ * else default_fb_max_*. Call again after ProbeTransmitModes.
+ */
+void KITTY_ApplyFramebufferCap(SDL_VideoData *data);
+
+/*
  * Put tty_in into raw mode (cfmakeraw) while keeping ISIG for Ctrl+C/Z.
  * Saves prior termios for KITTY_LeaveRawMode.
  */

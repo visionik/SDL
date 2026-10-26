@@ -253,6 +253,10 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
     /* a=q probe: pick SHM vs direct (Rex stays direct unless forced). */
     (void)KITTY_ProbeTransmitModes(data);
 
+    /* Cap used profile preference before probe; re-fit now that transmit_mode
+     * is known (shm vs direct soft-maxes differ on Kitty/Ghostty). */
+    KITTY_ApplyFramebufferCap(data);
+
     {
         const char *no_mouse = SDL_getenv("SDL_KITTY_MOUSE");
         const bool want_mouse = !(no_mouse && (no_mouse[0] == '0' ||

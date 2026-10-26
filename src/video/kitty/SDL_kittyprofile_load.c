@@ -431,6 +431,28 @@ static void KITTY_OverlayProfileFromTable(KITTY_TerminalProfile *p, toml_datum_t
             p->default_fb_max_h = 0;
         }
     }
+    if (KITTY_TomlGetString(tab, "default_fb_max_shm", &s)) {
+        int w = 0, h = 0;
+        if (KITTY_ParseWxH(s, &w, &h)) {
+            p->default_fb_max_shm_w = w;
+            p->default_fb_max_shm_h = h;
+        } else if (SDL_strcmp(s, "0") == 0 || SDL_strcasecmp(s, "off") == 0 ||
+                   SDL_strcasecmp(s, "none") == 0 || s[0] == '\0') {
+            p->default_fb_max_shm_w = 0;
+            p->default_fb_max_shm_h = 0;
+        }
+    }
+    if (KITTY_TomlGetString(tab, "default_fb_max_direct", &s)) {
+        int w = 0, h = 0;
+        if (KITTY_ParseWxH(s, &w, &h)) {
+            p->default_fb_max_direct_w = w;
+            p->default_fb_max_direct_h = h;
+        } else if (SDL_strcmp(s, "0") == 0 || SDL_strcasecmp(s, "off") == 0 ||
+                   SDL_strcasecmp(s, "none") == 0 || s[0] == '\0') {
+            p->default_fb_max_direct_w = 0;
+            p->default_fb_max_direct_h = 0;
+        }
+    }
     if (KITTY_TomlGetInt(tab, "max_direct_bytes", &i64) && i64 > 0) {
         p->max_direct_bytes = (size_t)i64;
     }

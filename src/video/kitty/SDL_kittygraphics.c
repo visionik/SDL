@@ -492,12 +492,13 @@ static void KITTY_UpdateMouseCoordSpace(SDL_VideoData *data)
  *
  * SDL_KITTY_FB_FIXED=WxH — exact FB size (resize keeps pixels; a=p re-stretch).
  * SDL_KITTY_FB_MAX=W[xH] — aspect-fit into a max box (e.g. 800 or 800x600).
- * Unset → host profile default_fb_max_* (see docs/terminals.md).
+ * Unset → transport-aware profile soft-max (shm vs direct; docs/terminals.md).
  */
-static void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
+void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
 {
     const char *fixed;
     const char *env;
+    const KITTY_TerminalProfile *prof;
     int max_w = 0, max_h = 0;
     int w, h;
 
@@ -517,6 +518,7 @@ static void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
         if (fw >= 16 && fh >= 16) {
             data->pixel_w = fw;
             data->pixel_h = fh;
+            KITTY_UpdateMouseCoordSpace(data);
             return;
         }
     }
@@ -531,14 +533,27 @@ static void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
             max_w = (int)SDL_strtol(env, NULL, 10);
             max_h = max_w;
         }
-    } else if (data->term_profile &&
-               data->term_profile->default_fb_max_w > 0 &&
-               data->term_profile->default_fb_max_h > 0) {
-        /* Per-host default — Kitty/Ghostty allow 1080p; Rex/unknown stay 720p. */
-        max_w = data->term_profile->default_fb_max_w;
-        max_h = data->term_profile->default_fb_max_h;
     } else {
-        return; /* profile says no default cap */
+        prof = data->term_profile;
+        if (prof) {
+            const bool use_shm =
+                (data->transmit_mode == KITTY_TRANSMIT_SHM && !data->shm_failed);
+            if (use_shm && prof->default_fb_max_shm_w > 0 &&
+                prof->default_fb_max_shm_h > 0) {
+                max_w = prof->default_fb_max_shm_w;
+                max_h = prof->default_fb_max_shm_h;
+            } else if (!use_shm && prof->default_fb_max_direct_w > 0 &&
+                       prof->default_fb_max_direct_h > 0) {
+                max_w = prof->default_fb_max_direct_w;
+                max_h = prof->default_fb_max_direct_h;
+            } else if (prof->default_fb_max_w > 0 && prof->default_fb_max_h > 0) {
+                max_w = prof->default_fb_max_w;
+                max_h = prof->default_fb_max_h;
+            }
+        }
+        if (max_w < 16 || max_h < 16) {
+            return; /* profile says no default cap */
+        }
     }
     if (max_w < 16 || max_h < 16) {
         return;
@@ -564,6 +579,7 @@ static void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
     }
     data->pixel_w = w;
     data->pixel_h = h;
+    KITTY_UpdateMouseCoordSpace(data);
 }
 
 /*
