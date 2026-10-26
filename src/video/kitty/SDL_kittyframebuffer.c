@@ -487,12 +487,24 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     bool mapped = false;
                     bool edge = true;
 
-                    if (vdata->place_cells && vdata->cols > 0 && vdata->rows > 0) {
-                        mapped = KITTY_FbRectToPlaceCells(surface->w, surface->h, &dirty,
-                                                         vdata->cols, vdata->rows,
-                                                         &col0, &row0, &place_c, &place_r);
-                        edge = KITTY_PlaceCellsTouchesEdge(col0, row0, place_c, place_r,
-                                                          vdata->cols, vdata->rows);
+                    if (vdata->place_cells) {
+                        int grid_c = 0, grid_r = 0;
+                        int origin_c = 0, origin_r = 0;
+                        KITTY_GetPlaceCells(vdata, &grid_c, &grid_r);
+                        if (vdata->vp_cols > 0 && vdata->vp_rows > 0 &&
+                            vdata->vp_col > 0 && vdata->vp_row > 0) {
+                            origin_c = vdata->vp_col - 1;
+                            origin_r = vdata->vp_row - 1;
+                        }
+                        if (grid_c > 0 && grid_r > 0) {
+                            mapped = KITTY_FbRectToPlaceCells(surface->w, surface->h, &dirty,
+                                                             grid_c, grid_r,
+                                                             &col0, &row0, &place_c, &place_r);
+                            edge = KITTY_PlaceCellsTouchesEdge(col0, row0, place_c, place_r,
+                                                              grid_c, grid_r);
+                            col0 += origin_c;
+                            row0 += origin_r;
+                        }
                     } else if (vdata->cell_w > 0 && vdata->cell_h > 0) {
                         mapped = KITTY_FbPixelToCellCursor(dirty.x, dirty.y,
                                                           vdata->cell_w, vdata->cell_h,
@@ -595,13 +607,24 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                             break;
                         }
 
-                        if (vdata->place_cells && vdata->cols > 0 && vdata->rows > 0) {
-                            if (!KITTY_FbRectToPlaceCells(surface->w, surface->h, &clipped,
-                                                         vdata->cols, vdata->rows,
+                        if (vdata->place_cells) {
+                            int grid_c = 0, grid_r = 0;
+                            int origin_c = 0, origin_r = 0;
+                            KITTY_GetPlaceCells(vdata, &grid_c, &grid_r);
+                            if (vdata->vp_cols > 0 && vdata->vp_rows > 0 &&
+                                vdata->vp_col > 0 && vdata->vp_row > 0) {
+                                origin_c = vdata->vp_col - 1;
+                                origin_r = vdata->vp_row - 1;
+                            }
+                            if (grid_c <= 0 || grid_r <= 0 ||
+                                !KITTY_FbRectToPlaceCells(surface->w, surface->h, &clipped,
+                                                         grid_c, grid_r,
                                                          &col0, &row0, &place_c, &place_r)) {
                                 at_ok = false;
                                 break;
                             }
+                            col0 += origin_c;
+                            row0 += origin_r;
                         } else if (vdata->cell_w > 0 && vdata->cell_h > 0) {
                             if (!KITTY_FbPixelToCellCursor(clipped.x, clipped.y,
                                                           vdata->cell_w, vdata->cell_h,

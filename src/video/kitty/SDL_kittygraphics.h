@@ -52,6 +52,21 @@ bool KITTY_QueryTerminalSize(SDL_VideoData *data);
 void KITTY_ApplyFramebufferCap(SDL_VideoData *data);
 
 /*
+ * Parse SDL_KITTY_VIEWPORT=col,row,w,h (1-based cells) and SDL_KITTY_ALTSCREEN.
+ * Viewport set ⇒ default use_alt_screen false unless ALTSCREEN explicitly on.
+ */
+void KITTY_ApplyViewportEnv(SDL_VideoData *data);
+
+/* Clamp viewport to current cols/rows after size query. */
+void KITTY_ClampViewport(SDL_VideoData *data);
+
+/* place_cells size: viewport when active, else full grid; 0,0 if not stretching. */
+void KITTY_GetPlaceCells(const SDL_VideoData *data, int *out_cols, int *out_rows);
+
+/* CUP to viewport origin, or home if no viewport. */
+bool KITTY_WritePlaceOrigin(SDL_VideoData *data);
+
+/*
  * Put tty_in into raw mode (cfmakeraw) while keeping ISIG for Ctrl+C/Z.
  * Saves prior termios for KITTY_LeaveRawMode.
  */

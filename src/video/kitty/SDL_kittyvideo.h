@@ -72,6 +72,13 @@ typedef struct SDL_VideoData
     bool mouse_enabled;
     bool mouse_sgr_pixels; /* true: DECSET 1016 (pixel coords); false: 1006 (cells) */
     bool place_cells;      /* true: Kitty c/r stretch to grid; scale mouse into FB */
+    bool use_alt_screen;   /* false: TUI card mode — no smcup/clear (SDL_KITTY_ALTSCREEN=0) */
+    /* Optional cell viewport for card mode (docs/tui-card.md). 1-based origin;
+     * vp_cols/vp_rows > 0 enables. Place uses this c×r; CUP to (vp_row,vp_col). */
+    int vp_col;
+    int vp_row;
+    int vp_cols;
+    int vp_rows;
     bool shm_failed;
     Uint32 shm_seq; /* unique POSIX SHM object names (avoid reuse races) */
     bool frame_edit_ok; /* a=f root-frame edit probe; gates dirty BW default */

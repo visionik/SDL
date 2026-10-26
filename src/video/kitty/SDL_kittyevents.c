@@ -558,6 +558,39 @@ static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t 
         return true;
     }
 
+    /* Card viewport: ignore pointer outside the reserved cell rect. */
+    if (data->vp_cols > 0 && data->vp_rows > 0 && data->vp_col > 0 && data->vp_row > 0) {
+        if (data->mouse_sgr_pixels && data->cell_w > 0 && data->cell_h > 0) {
+            const int vx0 = (data->vp_col - 1) * data->cell_w;
+            const int vy0 = (data->vp_row - 1) * data->cell_h;
+            const int vx1 = vx0 + data->vp_cols * data->cell_w;
+            const int vy1 = vy0 + data->vp_rows * data->cell_h;
+            const int rx = cell_x > 0 ? cell_x - 1 : 0;
+            const int ry = cell_y > 0 ? cell_y - 1 : 0;
+            if (rx < vx0 || ry < vy0 || rx >= vx1 || ry >= vy1) {
+                return true;
+            }
+            data->mouse_raw_x = rx - vx0;
+            data->mouse_raw_y = ry - vy0;
+            px = ((float)data->mouse_raw_x + 0.5f) * (float)data->pixel_w /
+                 (float)(data->vp_cols * data->cell_w);
+            py = ((float)data->mouse_raw_y + 0.5f) * (float)data->pixel_h /
+                 (float)(data->vp_rows * data->cell_h);
+            goto mouse_emit;
+        }
+        if (cell_x < data->vp_col || cell_y < data->vp_row ||
+            cell_x >= data->vp_col + data->vp_cols ||
+            cell_y >= data->vp_row + data->vp_rows) {
+            return true;
+        }
+        /* 1006 cells relative to viewport → FB. */
+        data->mouse_raw_x = cell_x - data->vp_col;
+        data->mouse_raw_y = cell_y - data->vp_row;
+        px = ((float)data->mouse_raw_x + 0.5f) * (float)data->pixel_w / (float)data->vp_cols;
+        py = ((float)data->mouse_raw_y + 0.5f) * (float)data->pixel_h / (float)data->vp_rows;
+        goto mouse_emit;
+    }
+
     /* 1016: 1-based pixels in the CSI 14t text-area space.
      * 1006: 1-based cells — map into FB via pixel_w/cols. */
     data->mouse_raw_x = cell_x > 0 ? cell_x - 1 : 0;
@@ -584,6 +617,9 @@ static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t 
         px = ((float)data->mouse_raw_x + 0.5f) * (float)data->pixel_w / (float)data->cols;
         py = ((float)data->mouse_raw_y + 0.5f) * (float)data->pixel_h / (float)data->rows;
     }
+
+mouse_emit:
+    (void)0;
 #ifdef SDL_KITTY_RUNTIME_DEBUG
     if (SDL_getenv("SDL_KITTY_MOUSE_DEBUG")) {
         static int dbg_n;

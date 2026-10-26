@@ -139,8 +139,8 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
         return SDL_SetError("base64 encode failed");
     }
 
-    /* Homing every frame flashes some hosts during full a=T bursts; only home
-     * when placing for the first time or when c/r place size changes. */
+    /* Prefer KITTY_WritePlaceOrigin at the call site (viewport CUP). This
+     * fallback homes to 1;1 when a caller still passes home_cursor. */
     if (home_cursor) {
         if (!KITTY_WriteAll(fd, "\033[H", 3)) {
             SDL_free(b64);
@@ -298,7 +298,7 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
             SDL_SetError("shm name base64 failed");
             goto done;
         }
-        if (home_cursor && !KITTY_WriteAll(fd, "\033[H", 3)) {
+        if (home_cursor && !KITTY_WritePlaceOrigin(vdata)) {
             goto done;
         }
         {
@@ -582,6 +582,106 @@ void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
     KITTY_UpdateMouseCoordSpace(data);
 }
 
+void KITTY_ApplyViewportEnv(SDL_VideoData *data)
+{
+    const char *vp;
+    const char *alt;
+    int col = 0, row = 0, w = 0, h = 0;
+
+    if (!data) {
+        return;
+    }
+    data->vp_col = 0;
+    data->vp_row = 0;
+    data->vp_cols = 0;
+    data->vp_rows = 0;
+    data->use_alt_screen = true;
+
+    vp = SDL_getenv("SDL_KITTY_VIEWPORT");
+    if (vp && *vp && SDL_sscanf(vp, "%d,%d,%d,%d", &col, &row, &w, &h) == 4 &&
+        col > 0 && row > 0 && w > 0 && h > 0) {
+        data->vp_col = col;
+        data->vp_row = row;
+        data->vp_cols = w;
+        data->vp_rows = h;
+        /* Card mode: leave primary buffer for TUI chrome unless forced on. */
+        data->use_alt_screen = false;
+    }
+
+    alt = SDL_getenv("SDL_KITTY_ALTSCREEN");
+    if (alt && *alt) {
+        if (alt[0] == '0' || SDL_strcasecmp(alt, "false") == 0 ||
+            SDL_strcasecmp(alt, "off") == 0 || SDL_strcasecmp(alt, "no") == 0) {
+            data->use_alt_screen = false;
+        } else {
+            data->use_alt_screen = true;
+        }
+    }
+}
+
+void KITTY_ClampViewport(SDL_VideoData *data)
+{
+    if (!data || data->vp_cols <= 0 || data->vp_rows <= 0) {
+        return;
+    }
+    if (data->cols > 0 && data->vp_col > data->cols) {
+        data->vp_col = data->cols;
+    }
+    if (data->rows > 0 && data->vp_row > data->rows) {
+        data->vp_row = data->rows;
+    }
+    if (data->cols > 0 && data->vp_col + data->vp_cols - 1 > data->cols) {
+        data->vp_cols = data->cols - data->vp_col + 1;
+    }
+    if (data->rows > 0 && data->vp_row + data->vp_rows - 1 > data->rows) {
+        data->vp_rows = data->rows - data->vp_row + 1;
+    }
+    if (data->vp_cols < 1) {
+        data->vp_cols = 1;
+    }
+    if (data->vp_rows < 1) {
+        data->vp_rows = 1;
+    }
+}
+
+void KITTY_GetPlaceCells(const SDL_VideoData *data, int *out_cols, int *out_rows)
+{
+    int pc = 0, pr = 0;
+    if (data && data->place_cells) {
+        if (data->vp_cols > 0 && data->vp_rows > 0) {
+            pc = data->vp_cols;
+            pr = data->vp_rows;
+        } else if (data->cols > 0 && data->rows > 0) {
+            pc = data->cols;
+            pr = data->rows;
+        }
+    }
+    if (out_cols) {
+        *out_cols = pc;
+    }
+    if (out_rows) {
+        *out_rows = pr;
+    }
+}
+
+bool KITTY_WritePlaceOrigin(SDL_VideoData *data)
+{
+    char buf[32];
+    int n;
+    if (!data) {
+        return false;
+    }
+    if (data->vp_cols > 0 && data->vp_rows > 0 && data->vp_col > 0 && data->vp_row > 0) {
+        n = SDL_snprintf(buf, sizeof(buf), "\033[%d;%dH", data->vp_row, data->vp_col);
+    } else {
+        n = SDL_snprintf(buf, sizeof(buf), "\033[H");
+    }
+    if (n <= 0) {
+        return false;
+    }
+    return KITTY_WriteAll(data->tty_fd, buf, (size_t)n);
+}
+
 /*
  * Refresh cols/rows via TIOCGWINSZ; fill pixels from ioctl, CSI 14t/16t,
  * or scaled prior size; then apply FB caps and mouse coord space.
@@ -603,6 +703,7 @@ bool KITTY_QueryTerminalSize(SDL_VideoData *data)
     data->rows = ws.ws_row > 0 ? ws.ws_row : 24;
     data->pixel_w = ws.ws_xpixel;
     data->pixel_h = ws.ws_ypixel;
+    KITTY_ClampViewport(data);
 
     /* Some hosts fill ws_xpixel/ws_ypixel with cell*grid (HiDPI), which is much
      * larger than the CSI 14t drawable area and produces frames the host drops.
@@ -883,11 +984,16 @@ static bool KITTY_ProbeKittyKeyboard(SDL_VideoData *data)
  */
 bool KITTY_SetupTerminal(SDL_VideoData *data)
 {
-    static const char setup[] =
+    /* Full-pane: alt screen + clear. Card mode (use_alt_screen=false): keep
+     * primary buffer so a host TUI can draw chrome around the viewport. */
+    static const char setup_alt[] =
         "\033[?1049h"
         "\033[?25l"
         "\033[H"
         "\033[2J"
+        "\033[>27u";
+    static const char setup_card[] =
+        "\033[?25l"
         "\033[>27u";
 
     data->mouse_sgr_pixels = false;
@@ -896,7 +1002,11 @@ bool KITTY_SetupTerminal(SDL_VideoData *data)
     data->placed_cols = 0;
     data->placed_rows = 0;
     data->kitty_keyboard_ok = false;
-    if (!KITTY_WriteAll(data->tty_out, setup, sizeof(setup) - 1)) {
+    if (data->use_alt_screen) {
+        if (!KITTY_WriteAll(data->tty_out, setup_alt, sizeof(setup_alt) - 1)) {
+            return false;
+        }
+    } else if (!KITTY_WriteAll(data->tty_out, setup_card, sizeof(setup_card) - 1)) {
         return false;
     }
     data->kitty_keyboard_ok = KITTY_ProbeKittyKeyboard(data);
@@ -953,17 +1063,20 @@ bool KITTY_EnableMouse(SDL_VideoData *data)
  */
 void KITTY_RestoreTerminal(SDL_VideoData *data)
 {
-    static const char restore[] =
+    static const char restore_modes[] =
         "\033[?1016l"
         "\033[?1006l"
         "\033[?1003l"
         "\033[?1002l"
         "\033[?1000l"
         "\033[<u"
-        "\033[?25h"
-        "\033[?1049l";
+        "\033[?25h";
+    static const char leave_alt[] = "\033[?1049l";
     KITTY_DeleteAllImages(data->tty_out);
-    KITTY_WriteAll(data->tty_out, restore, sizeof(restore) - 1);
+    KITTY_WriteAll(data->tty_out, restore_modes, sizeof(restore_modes) - 1);
+    if (data->use_alt_screen) {
+        KITTY_WriteAll(data->tty_out, leave_alt, sizeof(leave_alt) - 1);
+    }
     /* Rex omits q=2 on a=T/SHM, so hosts reply with APC OK. Drain before
      * cooked mode or the next prompt shows Gi=1,p=1;OK as typed text. */
     KITTY_DrainInput(data);
@@ -1225,7 +1338,7 @@ bool KITTY_PlaceExistingImage(SDL_VideoData *vdata, Uint32 image_id,
     if (!vdata || image_id == 0) {
         return SDL_SetError("invalid place-existing args");
     }
-    if (!KITTY_WriteAll(vdata->tty_fd, "\033[H", 3)) {
+    if (!KITTY_WritePlaceOrigin(vdata)) {
         return false;
     }
     if (place_cols > 0 && place_rows > 0) {
@@ -1275,17 +1388,26 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
     }
 
     {
-        /* place_cells (default): stretch to full grid. Else 1:1 pixels. */
-        const int place_cols = vdata->place_cells && vdata->cols > 0 ? vdata->cols : 0;
-        const int place_rows = vdata->place_cells && vdata->rows > 0 ? vdata->rows : 0;
-        const bool home_cursor =
-            !vdata->place_homed ||
-            vdata->placed_cols != place_cols ||
-            vdata->placed_rows != place_rows;
+        /* place_cells: stretch to viewport (card) or full grid. Else 1:1. */
+        int place_cols = 0, place_rows = 0;
+        bool home_cursor;
         bool ok = false;
         size_t wire_bytes = 0;
         size_t raw_bytes = 0;
         const Uint64 t0 = SDL_GetTicksNS();
+
+        KITTY_GetPlaceCells(vdata, &place_cols, &place_rows);
+        home_cursor =
+            !vdata->place_homed ||
+            vdata->placed_cols != place_cols ||
+            vdata->placed_rows != place_rows;
+        if (home_cursor) {
+            if (!KITTY_WritePlaceOrigin(vdata)) {
+                return false;
+            }
+            /* Lower helpers must not emit a second CUP/home. */
+            home_cursor = false;
+        }
 
         {
             const int bpp = (kitty_f == 32) ? 4 : 3;

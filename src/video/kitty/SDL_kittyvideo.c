@@ -148,6 +148,7 @@ static SDL_VideoDevice *KITTY_CreateDevice(void)
             data->place_cells = true;
         }
     }
+    KITTY_ApplyViewportEnv(data);
     device->internal = data;
 
     device->VideoInit = KITTY_VideoInit;
