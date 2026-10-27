@@ -600,6 +600,8 @@ void KITTY_ApplyViewportEnv(SDL_VideoData *data)
     data->vp_cols = 0;
     data->vp_rows = 0;
     data->use_alt_screen = true;
+    data->leave_images = false;
+    data->card_chrome = false;
 
     vp = SDL_getenv("SDL_KITTY_VIEWPORT");
     if (vp && *vp && SDL_sscanf(vp, "%d,%d,%d,%d", &col, &row, &w, &h) == 4 &&
@@ -623,6 +625,25 @@ void KITTY_ApplyViewportEnv(SDL_VideoData *data)
             data->use_alt_screen = false;
         } else {
             data->use_alt_screen = true;
+        }
+    }
+
+    {
+        const char *leave = SDL_getenv("SDL_KITTY_LEAVE_IMAGES");
+        if (leave && *leave && leave[0] != '0' &&
+            SDL_strcasecmp(leave, "false") != 0 &&
+            SDL_strcasecmp(leave, "off") != 0 &&
+            SDL_strcasecmp(leave, "no") != 0) {
+            data->leave_images = true;
+        }
+    }
+    {
+        const char *chrome = SDL_getenv("SDL_KITTY_CARD_CHROME");
+        if (chrome && *chrome && chrome[0] != '0' &&
+            SDL_strcasecmp(chrome, "false") != 0 &&
+            SDL_strcasecmp(chrome, "off") != 0 &&
+            SDL_strcasecmp(chrome, "no") != 0) {
+            data->card_chrome = true;
         }
     }
 }
@@ -701,7 +722,7 @@ bool KITTY_DrawViewportChrome(SDL_VideoData *data)
     int x0, y0, x1, y1, n, r, i, w;
     int fd;
 
-    if (!data || data->vp_cols <= 0 || data->vp_rows <= 0 ||
+    if (!data || !data->card_chrome || data->vp_cols <= 0 || data->vp_rows <= 0 ||
         data->vp_col < 2 || data->vp_row < 2) {
         return true;
     }
@@ -1128,10 +1149,11 @@ bool KITTY_EnableMouse(SDL_VideoData *data)
 }
 
 /*
- * Delete all images, disable mouse/keyboard modes, leave alt screen,
+ * Optionally delete all images, disable mouse/keyboard modes, leave alt screen,
  * drain late APC replies, and restore cooked termios.
  * Card mode: park the cursor on the row below the viewport chrome so the
  * next shell prompt does not sit inside the card.
+ * SDL_KITTY_LEAVE_IMAGES=1 skips a=d,d=A so the last place remains visible.
  */
 void KITTY_RestoreTerminal(SDL_VideoData *data)
 {
@@ -1144,7 +1166,9 @@ void KITTY_RestoreTerminal(SDL_VideoData *data)
         "\033[<u"
         "\033[?25h";
     static const char leave_alt[] = "\033[?1049l";
-    KITTY_DeleteAllImages(data->tty_out);
+    if (!data->leave_images) {
+        KITTY_DeleteAllImages(data->tty_out);
+    }
     KITTY_WriteAll(data->tty_out, restore_modes, sizeof(restore_modes) - 1);
     if (data->use_alt_screen) {
         KITTY_WriteAll(data->tty_out, leave_alt, sizeof(leave_alt) - 1);

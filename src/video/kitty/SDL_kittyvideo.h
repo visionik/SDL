@@ -73,6 +73,11 @@ typedef struct SDL_VideoData
     bool mouse_sgr_pixels; /* true: DECSET 1016 (pixel coords); false: 1006 (cells) */
     bool place_cells;      /* true: Kitty c/r stretch to grid; scale mouse into FB */
     bool use_alt_screen;   /* false: TUI card mode — no smcup/clear (SDL_KITTY_ALTSCREEN=0) */
+    /* When true (SDL_KITTY_LEAVE_IMAGES=1), skip a=d,d=A on DestroyWindow /
+     * RestoreTerminal so the last place stays on the tty after quit. */
+    bool leave_images;
+    /* When true (SDL_KITTY_CARD_CHROME=1), draw ASCII box around VIEWPORT. */
+    bool card_chrome;
     /* Optional cell viewport for card mode (docs/tui-card.md). 1-based origin;
      * vp_cols/vp_rows > 0 enables. Place uses this c×r; CUP to (vp_row,vp_col).
      * *_req are the env values; ClampViewport copies them then fits the grid so

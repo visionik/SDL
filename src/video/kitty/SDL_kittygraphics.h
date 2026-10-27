@@ -54,6 +54,7 @@ void KITTY_ApplyFramebufferCap(SDL_VideoData *data);
 /*
  * Parse SDL_KITTY_VIEWPORT=col,row,w,h (1-based cells) and SDL_KITTY_ALTSCREEN.
  * Viewport set ⇒ default use_alt_screen false unless ALTSCREEN explicitly on.
+ * Also parses SDL_KITTY_LEAVE_IMAGES (skip a=d,d=A on quit).
  */
 void KITTY_ApplyViewportEnv(SDL_VideoData *data);
 
@@ -66,8 +67,8 @@ void KITTY_GetPlaceCells(const SDL_VideoData *data, int *out_cols, int *out_rows
 /* CUP to viewport origin, or home if no viewport. */
 bool KITTY_WritePlaceOrigin(SDL_VideoData *data);
 
-/* ASCII border one cell outside the live viewport (card chrome). No-op if
- * no viewport or no room for a border. Safe to call again after WINCH. */
+/* ASCII border one cell outside the live viewport when SDL_KITTY_CARD_CHROME=1.
+ * No-op if chrome off, no viewport, or no room. Safe to call again after WINCH. */
 bool KITTY_DrawViewportChrome(SDL_VideoData *data);
 
 /*

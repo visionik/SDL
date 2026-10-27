@@ -120,8 +120,9 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
 }
 
 /*
- * Clear focus if this was the focus window, delete all Kitty images on the
- * tty, free RGB scratch buffers and SDL_WindowData, and null window->internal.
+ * Clear focus if this was the focus window, optionally delete all Kitty images
+ * on the tty (unless SDL_KITTY_LEAVE_IMAGES), free RGB scratch buffers and
+ * SDL_WindowData, and null window->internal.
  */
 void KITTY_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
 {
@@ -132,7 +133,9 @@ void KITTY_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
         if (vdata->focus_window == window) {
             vdata->focus_window = NULL;
         }
-        KITTY_DeleteAllImages(vdata->tty_fd);
+        if (!vdata->leave_images) {
+            KITTY_DeleteAllImages(vdata->tty_fd);
+        }
     }
     if (data) {
         SDL_free(data->rgb_scratch);
