@@ -191,6 +191,8 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
     if (!KITTY_EnterRawMode(data)) {
         return false;
     }
+    /* Before anything reads the profile (keyboard, sizes, probes). */
+    KITTY_RecogniseTerminal(data);
     if (!KITTY_SetupTerminal(data)) {
         KITTY_LeaveRawMode(data);
         return false;

@@ -102,6 +102,62 @@ KITTY_GraphicsQueryStatus KITTY_ParseGraphicsQueryReply(const char *buf, size_t 
 }
 
 /*
+ * Scan for DCS > | <text> ST (ESC P > | ... ESC \, or BEL) and copy <text>.
+ */
+bool KITTY_ParseXtversionReply(const char *buf, size_t len, char *out, size_t cap)
+{
+    size_t i;
+
+    if (!buf || !out || cap == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    for (i = 0; i + 3 < len; ++i) {
+        if (buf[i] == '\033' && buf[i + 1] == 'P' && buf[i + 2] == '>' && buf[i + 3] == '|') {
+            const size_t start = i + 4;
+            size_t end;
+            for (end = start; end < len; ++end) {
+                if (buf[end] == '\a' || (buf[end] == '\033' && end + 1 < len && buf[end + 1] == '\\')) {
+                    size_t n = end - start;
+                    if (n >= cap) {
+                        n = cap - 1;
+                    }
+                    SDL_memcpy(out, buf + start, n);
+                    out[n] = '\0';
+                    return true;
+                }
+            }
+            return false; /* started but not finished */
+        }
+    }
+    return false;
+}
+
+/*
+ * CSI ? <digits and ;> c
+ */
+bool KITTY_ReplyHasDA1(const char *buf, size_t len)
+{
+    size_t i;
+
+    if (!buf) {
+        return false;
+    }
+    for (i = 0; i + 2 < len; ++i) {
+        if (buf[i] == '\033' && buf[i + 1] == '[' && buf[i + 2] == '?') {
+            size_t j = i + 3;
+            while (j < len && ((buf[j] >= '0' && buf[j] <= '9') || buf[j] == ';')) {
+                ++j;
+            }
+            if (j < len && buf[j] == 'c') {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
  * SDL_KITTY_FB_ALPHA=1/true/yes/on → true (ARGB8888 + Kitty f=32).
  * Unset or any other value → false.
  */
@@ -627,6 +683,43 @@ static void KITTY_DrainTty(int fd)
 }
 
 /*
+ * Ask XTVERSION (CSI > 0 q) with DA1 (CSI c) behind it: every terminal
+ * answers DA1, so its answer ends the wait. Copies the XTVERSION text
+ * ("ghostty 1.3.1") to out. False when the terminal didn't say.
+ */
+static bool KITTY_QueryXtversion(SDL_VideoData *data, char *out, size_t cap)
+{
+    static const char query[] = "\033[>0q\033[c";
+    char buf[512];
+    size_t total = 0;
+    const int attempts = KITTY_ProfileProbeAttempts(data->term_profile);
+    int a;
+
+    out[0] = '\0';
+    if (!KITTY_WriteAllProbe(data->tty_out, query, sizeof(query) - 1)) {
+        return false;
+    }
+    for (a = 0; a < attempts && total < sizeof(buf) - 1; ++a) {
+        fd_set fds;
+        struct timeval tv;
+        FD_ZERO(&fds);
+        FD_SET(data->tty_in, &fds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 25000;
+        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) > 0) {
+            const ssize_t n = read(data->tty_in, buf + total, sizeof(buf) - 1 - total);
+            if (n > 0) {
+                total += (size_t)n;
+                if (KITTY_ReplyHasDA1(buf, total)) {
+                    break;
+                }
+            }
+        }
+    }
+    return KITTY_ParseXtversionReply(buf, total, out, cap);
+}
+
+/*
  * Transmit-only 2x2 image (a=t), then a=f edit one pixel on root frame r=1;
  * delete with a=d. No on-screen place. Hosts with silent_af_ok (Rex) treat
  * OK or silent NONE as success and ERROR as fail; strict hosts require OK.
@@ -689,6 +782,39 @@ cleanup:
 }
 
 /*
+ * Recognise the terminal by asking it, and switch data->term_profile to the
+ * answer's profile. The environment can be inherited (WezTerm started from a
+ * Rex pane has TERM_PROGRAM=rex); XTVERSION can't, and it carries the
+ * version for version rows (Ghostty 1.3.1). Call in raw mode, before
+ * anything reads the profile. SDL_KITTY_XTVERSION=0 keeps the environment's
+ * guess.
+ */
+void KITTY_RecogniseTerminal(SDL_VideoData *data)
+{
+    const char *xt_env = SDL_getenv("SDL_KITTY_XTVERSION");
+    char xtversion[128];
+
+    if (!data) {
+        return;
+    }
+    KITTY_DrainTty(data->tty_in);
+    if (!(xt_env && xt_env[0] == '0') &&
+        KITTY_QueryXtversion(data, xtversion, sizeof(xtversion))) {
+        data->term_profile = KITTY_IdentifyTerminalProfile(xtversion, NULL);
+    }
+    KITTY_DrainTty(data->tty_in);
+#ifdef SDL_KITTY_RUNTIME_DEBUG
+    if (KITTY_DebugEnabled() && data->term_profile) {
+        KITTY_DebugLog("kitty: terminal=%s rows=%s version=%s by=%s",
+                       data->term_profile->name,
+                       data->term_profile->rows[0] ? data->term_profile->rows : "-",
+                       data->term_profile->version[0] ? data->term_profile->version : "?",
+                       data->term_profile->recognised_by[0] ? data->term_profile->recognised_by : "-");
+    }
+#endif
+}
+
+/*
  * Drain tty, probe direct a=q (and SHM unless prefer_direct), select
  * transmit_mode / shm_failed, then probe or force frame_edit_ok from
  * SDL_KITTY_DIRTY_BW. Logs outcomes when runtime debug is on.
@@ -714,6 +840,10 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
         return false;
     }
     data->frame_edit_ok = false;
+
+    /* Drain any prior CSI noise from the input tty. */
+    KITTY_DrainTty(data->tty_in);
+
     if (data->term_profile) {
         prefer_direct = data->term_profile->prefer_direct;
         prefer_zlib = data->term_profile->prefer_zlib;
@@ -722,9 +852,6 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
         term_name = data->term_profile->name;
 #endif
     }
-
-    /* Drain any prior CSI noise from the input tty. */
-    KITTY_DrainTty(data->tty_in);
 
     direct_ok = KITTY_ProbeDirectQuery(data, id_direct);
     /* Skip SHM probe when the profile prefers direct (Rex) — SelectTransmitMode
@@ -757,6 +884,8 @@ bool KITTY_ProbeTransmitModes(SDL_VideoData *data)
                    (bw_env[0] == '1' || SDL_strcasecmp(bw_env, "on") == 0 ||
                     SDL_strcasecmp(bw_env, "true") == 0 || SDL_strcasecmp(bw_env, "yes") == 0)) {
             frame_ok = true;
+        } else if (data->term_profile && data->term_profile->skip_af_probe) {
+            frame_ok = false; /* kitty.frame_edit = false: a=f won't show */
         } else {
             frame_ok = KITTY_ProbeFrameEdit(data, id_frame);
         }
