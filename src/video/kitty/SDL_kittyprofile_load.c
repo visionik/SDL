@@ -4,9 +4,17 @@
 */
 
 /*
- * TOML loader for terminal profiles (tomlc17): parse config/terminals.toml
- * (or SDL_KITTY_PROFILES / search paths) into KITTY_ProfileEntry rows with
- * matchers and policy overlays; detect the active loaded profile from env.
+ * Terminal profiles from two TOML files (tomlc17):
+ *
+ *  - terminals.toml, the shared facts (terminal-facts SPEC.md, schema 1):
+ *    recognise the terminal (XTVERSION first, then the environment), then
+ *    stack every extending row whose conditions hold.
+ *  - sdl-kitty.toml, this driver's tuning: [defaults], then
+ *    [terminal.<id>] for each row applied, or [terminal.unknown].
+ *
+ * Resolving: seed (SDL_kittyprofile.c) -> tuning -> facts that decide a
+ * setting. SDL_KITTY_* environment variables are read at their call sites
+ * and win over all of these.
  */
 #ifdef KITTY_PROFILE_STANDALONE
 #include <SDL3/SDL.h>
@@ -19,56 +27,76 @@
 #if defined(SDL_VIDEO_DRIVER_KITTY) || defined(KITTY_PROFILE_STANDALONE)
 
 #include "SDL_kittyprofile.h"
+#include "SDL_kittyprofile_data.h"
 #include "tomlc17.h"
 
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 
 #ifndef KITTY_PROFILE_STANDALONE
 #include "SDL_kittyprobe.h"
 #endif
 
-#define KITTY_MATCH_MAX 8
-#define KITTY_PROFILE_MAX 32
-#define KITTY_SOURCE_MAX 512
+#define KITTY_LIST_MAX 8
+#define KITTY_TEXT_MAX 64
+#define KITTY_ROWS_MAX 48
+#define KITTY_TUNING_MAX 8
+#define KITTY_SOURCE_MAX 1024
+#define KITTY_VERSION_PARTS 6
+#define KITTY_APC_HEADROOM 256 /* escape-code header and ST around a chunk */
 
 typedef struct KITTY_StringList
 {
-    char *items[KITTY_MATCH_MAX];
+    char items[KITTY_LIST_MAX][KITTY_TEXT_MAX];
     int count;
 } KITTY_StringList;
 
-typedef struct KITTY_ProfileEntry
+enum
 {
-    KITTY_TerminalProfile profile;
-    char name_storage[64];
-    char *notes_heap; /* owned; profile.notes points here when set */
-    char *force_transmit_heap; /* owned; profile.force_transmit points here */
-    KITTY_StringList term_program;
-    KITTY_StringList term_when_program_empty;
-    KITTY_StringList term_substring;
-    bool match_kitty_window_id;
-    char *version_min; /* owned; match.term_program_version_min */
-    char *version_max; /* owned; match.term_program_version_max */
-    bool has_matchers;
-} KITTY_ProfileEntry;
+    KITTY_OS_MACOS = 1,
+    KITTY_OS_LINUX = 2,
+    KITTY_OS_WINDOWS = 4,
+    KITTY_OS_BSD = 8
+};
 
-typedef struct KITTY_ParsedVersion
+/* One [[terminal]] row of terminals.toml. */
+typedef struct KITTY_FactRow
 {
-    int major;
-    int minor;
-    int patch;
-    bool has_pre; /* true if a '-' pre-release follows the numeric core */
-} KITTY_ParsedVersion;
+    char id[KITTY_TEXT_MAX];
+    char name[KITTY_TEXT_MAX];
+    int extends; /* index of an earlier row; -1 for a base row */
+    KITTY_StringList xtversion;
+    KITTY_StringList env;
+    KITTY_StringList term_program;
+    KITTY_StringList term;
+    KITTY_StringList term_substring;
+    char version_min[KITTY_TEXT_MAX]; /* "" = no bound */
+    char version_max[KITTY_TEXT_MAX];
+    unsigned os_mask; /* 0 = any OS */
+    KITTY_TerminalFacts facts;
+} KITTY_FactRow;
+
+typedef struct KITTY_FactTable
+{
+    KITTY_FactRow rows[KITTY_ROWS_MAX];
+    int count;
+} KITTY_FactTable;
 
 /* From SDL_kittyprofile.c */
 const KITTY_TerminalProfile *KITTY_BuiltinDefaultsProfile(void);
 
-static KITTY_ProfileEntry g_entries[KITTY_PROFILE_MAX];
-static int g_entry_count;
-static bool g_load_attempted;
-static bool g_have_loaded; /* true when at least one TOML file applied */
+static KITTY_FactTable *g_facts;                 /* heap; NULL until loaded */
+static toml_result_t g_tuning[KITTY_TUNING_MAX]; /* kept: profiles point into them */
+static int g_tuning_count;
+static bool g_loaded;
 static char g_source[KITTY_SOURCE_MAX] = "builtin";
+
+/* The resolved profile and the storage its strings point into. */
+static KITTY_TerminalProfile g_profile;
+static char g_profile_name[KITTY_TEXT_MAX];
+static char g_profile_rows[KITTY_TEXT_MAX * 4];
+static char g_profile_version[KITTY_TEXT_MAX];
 
 /*
  * Debug log for profile load/match when SDL_KITTY_RUNTIME_DEBUG is built and
@@ -103,214 +131,710 @@ static void KITTY_ProfileDebug(const char *fmt, ...)
 #endif /* SDL_KITTY_RUNTIME_DEBUG */
 }
 
-/*
- * Free all strdup'd strings in list and reset count to 0.
- */
-static void KITTY_FreeStringList(KITTY_StringList *list)
+/* tomlc17 on SDL's allocators, once. */
+static void KITTY_TomlInit(void)
 {
-    int i;
-    if (!list) {
+    static bool done;
+    toml_option_t opt;
+    if (done) {
         return;
     }
-    for (i = 0; i < list->count; ++i) {
-        SDL_free(list->items[i]);
-        list->items[i] = NULL;
-    }
-    list->count = 0;
+    done = true;
+    opt = toml_default_option();
+    opt.mem_realloc = SDL_realloc;
+    opt.mem_free = SDL_free;
+    toml_set_option(opt);
 }
 
-/*
- * Release owned heap fields and string lists on e, then zero the entry.
- */
-static void KITTY_ClearEntry(KITTY_ProfileEntry *e)
+/* ---- Versions and XTVERSION (SPEC.md: Comparing versions) ---- */
+
+typedef struct KITTY_VersionKey
 {
-    if (!e) {
-        return;
-    }
-    KITTY_FreeStringList(&e->term_program);
-    KITTY_FreeStringList(&e->term_when_program_empty);
-    KITTY_FreeStringList(&e->term_substring);
-    SDL_free(e->notes_heap);
-    e->notes_heap = NULL;
-    SDL_free(e->force_transmit_heap);
-    e->force_transmit_heap = NULL;
-    SDL_free(e->version_min);
-    e->version_min = NULL;
-    SDL_free(e->version_max);
-    e->version_max = NULL;
-    SDL_zerop(e);
-}
+    long parts[KITTY_VERSION_PARTS];
+    int released; /* 0 when a '-suffix' follows the numbers */
+} KITTY_VersionKey;
 
 /*
- * Clear every loaded entry, mark unloaded, and reset g_source to "builtin".
+ * The first run of dotted numbers in s (after any non-digit prefix), padded
+ * with zeros; a '-' straight after it sorts below the same numbers. False if
+ * s has no digits.
  */
-static void KITTY_ClearAllEntries(void)
+static bool KITTY_VersionKeyOf(const char *s, KITTY_VersionKey *out)
 {
-    int i;
-    for (i = 0; i < g_entry_count; ++i) {
-        KITTY_ClearEntry(&g_entries[i]);
-    }
-    g_entry_count = 0;
-    g_have_loaded = false;
-    SDL_strlcpy(g_source, "builtin", sizeof(g_source));
-}
+    const char *p = s;
+    int n = 0;
 
-/*
- * Map a [[terminal]] id string (and kitty-/ghostty-/wezterm- prefixes) to
- * KITTY_TerminalKind. Unknown or empty → KITTY_TERM_UNKNOWN.
- */
-static KITTY_TerminalKind KITTY_KindFromId(const char *id)
-{
-    if (!id || !id[0]) {
-        return KITTY_TERM_UNKNOWN;
-    }
-    if (SDL_strcasecmp(id, "rex") == 0) {
-        return KITTY_TERM_REX;
-    }
-    if (SDL_strcasecmp(id, "kitty") == 0 || SDL_strncasecmp(id, "kitty-", 6) == 0) {
-        return KITTY_TERM_KITTY;
-    }
-    if (SDL_strcasecmp(id, "ghostty") == 0 || SDL_strncasecmp(id, "ghostty-", 8) == 0) {
-        return KITTY_TERM_GHOSTTY;
-    }
-    if (SDL_strcasecmp(id, "wezterm") == 0 || SDL_strncasecmp(id, "wezterm-", 8) == 0) {
-        return KITTY_TERM_WEZTERM;
-    }
-    return KITTY_TERM_UNKNOWN;
-}
-
-/*
- * Parse leading major[.minor[.patch]] from TERM_PROGRAM_VERSION / match
- * bounds. Skips a non-digit prefix (e.g. "ghostty 1.3.1"). A '-' after the
- * numeric core sets has_pre (pre-release sorts below a plain release).
- */
-static bool KITTY_ParseVersion(const char *s, KITTY_ParsedVersion *out)
-{
-    const char *p;
-    long major = 0, minor = 0, patch = 0;
-    char *end = NULL;
-
-    if (!s || !out) {
+    SDL_zerop(out);
+    if (!s) {
         return false;
     }
-    SDL_zerop(out);
-    p = s;
     while (*p && (*p < '0' || *p > '9')) {
         ++p;
     }
     if (!*p) {
         return false;
     }
-    major = SDL_strtol(p, &end, 10);
-    if (end == p) {
-        return false;
-    }
-    p = end;
-    if (*p == '.') {
-        ++p;
-        minor = SDL_strtol(p, &end, 10);
-        if (end == p) {
-            return false;
-        }
-        p = end;
-        if (*p == '.') {
+    for (;;) {
+        long v = 0;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + (*p - '0');
             ++p;
-            patch = SDL_strtol(p, &end, 10);
-            if (end == p) {
-                return false;
-            }
-            p = end;
         }
+        if (n < KITTY_VERSION_PARTS) {
+            out->parts[n++] = v;
+        }
+        if (p[0] == '.' && p[1] >= '0' && p[1] <= '9') {
+            ++p;
+            continue;
+        }
+        break;
     }
-    out->major = (int)major;
-    out->minor = (int)minor;
-    out->patch = (int)patch;
-    out->has_pre = (*p == '-');
+    out->released = (*p == '-') ? 0 : 1;
     return true;
 }
 
-/*
- * Compare parsed versions: major/minor/patch first; when equal, a plain
- * release sorts above a pre-release (has_pre). Returns -1 / 0 / 1.
- */
-static int KITTY_CmpParsedVersion(const KITTY_ParsedVersion *a, const KITTY_ParsedVersion *b)
+static int KITTY_CompareVersionKeys(const KITTY_VersionKey *a, const KITTY_VersionKey *b)
 {
-    if (a->major != b->major) {
-        return (a->major < b->major) ? -1 : 1;
+    int i;
+    for (i = 0; i < KITTY_VERSION_PARTS; ++i) {
+        if (a->parts[i] != b->parts[i]) {
+            return (a->parts[i] < b->parts[i]) ? -1 : 1;
+        }
     }
-    if (a->minor != b->minor) {
-        return (a->minor < b->minor) ? -1 : 1;
-    }
-    if (a->patch != b->patch) {
-        return (a->patch < b->patch) ? -1 : 1;
-    }
-    if (a->has_pre != b->has_pre) {
-        return a->has_pre ? -1 : 1;
+    if (a->released != b->released) {
+        return (a->released < b->released) ? -1 : 1;
     }
     return 0;
 }
 
 /*
- * True if actual is within optional [min_s, max_s] inclusive. No bounds →
- * true; constrained row with missing/unparseable actual → false.
+ * Split an XTVERSION answer into a lower-case name (first word, up to a space
+ * or '(') and the version after it: "kitty(0.50.0)" -> kitty, 0.50.0;
+ * "WezTerm 20240203-110809-5046fc22" -> wezterm, 20240203-110809-5046fc22.
  */
-static bool KITTY_VersionInRange(const char *actual,
-                                 const char *min_s,
-                                 const char *max_s)
+static void KITTY_SplitXtversion(const char *text, char *name, size_t name_cap,
+                                 char *version, size_t version_cap)
 {
-    KITTY_ParsedVersion v, bound;
+    const char *p = text;
+    size_t n = 0;
 
-    if ((!min_s || !min_s[0]) && (!max_s || !max_s[0])) {
-        return true; /* no version constraint */
+    name[0] = '\0';
+    version[0] = '\0';
+    while (*p == ' ' || *p == '\t') {
+        ++p;
     }
-    if (!actual || !actual[0]) {
-        return false; /* constrained row needs TERM_PROGRAM_VERSION */
+    while (*p && *p != ' ' && *p != '\t' && *p != '(') {
+        if (n + 1 < name_cap) {
+            name[n++] = (char)SDL_tolower((unsigned char)*p);
+        }
+        ++p;
     }
-    if (!KITTY_ParseVersion(actual, &v)) {
+    name[n] = '\0';
+    while (*p == ' ' || *p == '\t' || *p == '(') {
+        ++p;
+    }
+    n = 0;
+    while (*p && *p != ')') {
+        if (n + 1 < version_cap) {
+            version[n++] = *p;
+        }
+        ++p;
+    }
+    while (n > 0 && (version[n - 1] == ' ' || version[n - 1] == '\t')) {
+        --n;
+    }
+    version[n] = '\0';
+}
+
+static unsigned KITTY_CurrentOS(void)
+{
+#if defined(__APPLE__)
+    return KITTY_OS_MACOS;
+#elif defined(__linux__)
+    return KITTY_OS_LINUX;
+#elif defined(_WIN32) || defined(__CYGWIN__)
+    return KITTY_OS_WINDOWS;
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+    return KITTY_OS_BSD;
+#else
+    return 0;
+#endif
+}
+
+static unsigned KITTY_OSFromName(const char *name)
+{
+    if (!name) {
+        return 0;
+    }
+    if (SDL_strcmp(name, "macos") == 0) {
+        return KITTY_OS_MACOS;
+    }
+    if (SDL_strcmp(name, "linux") == 0) {
+        return KITTY_OS_LINUX;
+    }
+    if (SDL_strcmp(name, "windows") == 0) {
+        return KITTY_OS_WINDOWS;
+    }
+    if (SDL_strcmp(name, "bsd") == 0) {
+        return KITTY_OS_BSD;
+    }
+    return 0;
+}
+
+/* ---- Reading terminals.toml (SPEC.md: Layout, Row keys, Facts) ---- */
+
+typedef enum KITTY_FactType
+{
+    KITTY_FACT_BOOL,
+    KITTY_FACT_SIZE,
+    KITTY_FACT_FORMAT,
+    KITTY_FACT_TEXT
+} KITTY_FactType;
+
+typedef struct KITTY_FactKey
+{
+    const char *key;
+    KITTY_FactType type;
+    size_t offset;
+    size_t cap; /* text facts */
+} KITTY_FactKey;
+
+/* Every fact in schema 1 (terminal-facts FACTS). */
+static const KITTY_FactKey KITTY_fact_keys[] = {
+    { "kitty.placeholders", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, placeholders), 0 },
+    { "kitty.frame_edit", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, frame_edit), 0 },
+    { "kitty.frame_edit_reply", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, frame_edit_reply), 0 },
+    { "kitty.animation", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, animation), 0 },
+    { "kitty.shm", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, shm), 0 },
+    { "kitty.max_escape_bytes", KITTY_FACT_SIZE, offsetof(KITTY_TerminalFacts, max_escape_bytes), 0 },
+    { "kitty.storage_bytes", KITTY_FACT_SIZE, offsetof(KITTY_TerminalFacts, storage_bytes), 0 },
+    { "kitty.fastest_format", KITTY_FACT_FORMAT, offsetof(KITTY_TerminalFacts, fastest_format),
+      sizeof(((KITTY_TerminalFacts *)0)->fastest_format) },
+    { "iterm2.gif_animation", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, iterm2_gif_animation), 0 },
+    { "window.ioctl_pixels", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, ioctl_pixels), 0 },
+    { "keyboard.kitty_protocol_config", KITTY_FACT_TEXT, offsetof(KITTY_TerminalFacts, keyboard_config),
+      sizeof(((KITTY_TerminalFacts *)0)->keyboard_config) },
+};
+
+static void KITTY_FactsUnknown(KITTY_TerminalFacts *f)
+{
+    SDL_zerop(f);
+    f->placeholders = KITTY_FACT_UNKNOWN;
+    f->frame_edit = KITTY_FACT_UNKNOWN;
+    f->frame_edit_reply = KITTY_FACT_UNKNOWN;
+    f->animation = KITTY_FACT_UNKNOWN;
+    f->shm = KITTY_FACT_UNKNOWN;
+    f->iterm2_gif_animation = KITTY_FACT_UNKNOWN;
+    f->ioctl_pixels = KITTY_FACT_UNKNOWN;
+}
+
+/* Copy the facts src knows onto dst (a later row wins). */
+static void KITTY_FactsOverlay(KITTY_TerminalFacts *dst, const KITTY_TerminalFacts *src)
+{
+    size_t i;
+    for (i = 0; i < SDL_arraysize(KITTY_fact_keys); ++i) {
+        const KITTY_FactKey *k = &KITTY_fact_keys[i];
+        const char *from = (const char *)src + k->offset;
+        char *to = (char *)dst + k->offset;
+        switch (k->type) {
+        case KITTY_FACT_BOOL:
+            if (*(const KITTY_Fact *)from != KITTY_FACT_UNKNOWN) {
+                *(KITTY_Fact *)to = *(const KITTY_Fact *)from;
+            }
+            break;
+        case KITTY_FACT_SIZE:
+            if (*(const size_t *)from > 0) {
+                *(size_t *)to = *(const size_t *)from;
+            }
+            break;
+        case KITTY_FACT_FORMAT:
+        case KITTY_FACT_TEXT:
+            if (from[0]) {
+                SDL_strlcpy(to, from, k->cap);
+            }
+            break;
+        }
+    }
+}
+
+static bool KITTY_Fail(char *err, size_t cap, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    SDL_vsnprintf(err, cap, fmt, ap);
+    va_end(ap);
+    return false;
+}
+
+/*
+ * Read the facts in a row table (dotted keys such as kitty.frame_edit, as
+ * nested tables), skipping the row keys at the top. Unknown keys and wrong
+ * types are errors, so a typo can't become an unknown fact.
+ */
+static bool KITTY_ReadFacts(toml_datum_t tab, const char *prefix, const char *where,
+                            KITTY_TerminalFacts *facts, char *err, size_t cap)
+{
+    int i;
+    for (i = 0; i < tab.u.tab.size; ++i) {
+        const char *key = tab.u.tab.key[i];
+        const toml_datum_t v = tab.u.tab.value[i];
+        char dotted[128];
+        size_t f;
+        const KITTY_FactKey *k = NULL;
+
+        if (!prefix[0] && (SDL_strcmp(key, "id") == 0 || SDL_strcmp(key, "name") == 0 ||
+                           SDL_strcmp(key, "extends") == 0 || SDL_strcmp(key, "match") == 0 ||
+                           SDL_strcmp(key, "evidence") == 0 || SDL_strcmp(key, "notes") == 0)) {
+            continue;
+        }
+        SDL_snprintf(dotted, sizeof(dotted), "%s%s", prefix, key);
+        if (v.type == TOML_TABLE) {
+            char next[128];
+            SDL_snprintf(next, sizeof(next), "%s.", dotted);
+            if (!KITTY_ReadFacts(v, next, where, facts, err, cap)) {
+                return false;
+            }
+            continue;
+        }
+        for (f = 0; f < SDL_arraysize(KITTY_fact_keys); ++f) {
+            if (SDL_strcmp(KITTY_fact_keys[f].key, dotted) == 0) {
+                k = &KITTY_fact_keys[f];
+                break;
+            }
+        }
+        if (!k) {
+            return KITTY_Fail(err, cap, "%s: unknown fact '%s'", where, dotted);
+        }
+        switch (k->type) {
+        case KITTY_FACT_BOOL:
+            if (v.type != TOML_BOOLEAN) {
+                return KITTY_Fail(err, cap, "%s: %s isn't bool", where, dotted);
+            }
+            *(KITTY_Fact *)((char *)facts + k->offset) = v.u.boolean ? KITTY_FACT_YES : KITTY_FACT_NO;
+            break;
+        case KITTY_FACT_SIZE:
+            if (v.type != TOML_INT64 || v.u.int64 <= 0) {
+                return KITTY_Fail(err, cap, "%s: %s isn't a positive int", where, dotted);
+            }
+            *(size_t *)((char *)facts + k->offset) = (size_t)v.u.int64;
+            break;
+        case KITTY_FACT_FORMAT:
+            if (v.type != TOML_STRING || (SDL_strcmp(v.u.s, "zlib") != 0 &&
+                                          SDL_strcmp(v.u.s, "png") != 0 &&
+                                          SDL_strcmp(v.u.s, "raw") != 0)) {
+                return KITTY_Fail(err, cap, "%s: %s isn't zlib, png or raw", where, dotted);
+            }
+            SDL_strlcpy((char *)facts + k->offset, v.u.s, k->cap);
+            break;
+        case KITTY_FACT_TEXT:
+            if (v.type != TOML_STRING) {
+                return KITTY_Fail(err, cap, "%s: %s isn't a string", where, dotted);
+            }
+            SDL_strlcpy((char *)facts + k->offset, v.u.s, k->cap);
+            break;
+        }
+    }
+    return true;
+}
+
+static bool KITTY_ReadList(toml_datum_t match, const char *key, const char *where,
+                           KITTY_StringList *out, bool *present, char *err, size_t cap)
+{
+    const toml_datum_t arr = toml_get(match, key);
+    int i;
+
+    out->count = 0;
+    if (arr.type == TOML_UNKNOWN) {
+        return true;
+    }
+    if (arr.type != TOML_ARRAY) {
+        return KITTY_Fail(err, cap, "%s: match.%s must be a list of strings", where, key);
+    }
+    for (i = 0; i < arr.u.arr.size; ++i) {
+        const toml_datum_t el = arr.u.arr.elem[i];
+        if (el.type != TOML_STRING || !el.u.s[0]) {
+            return KITTY_Fail(err, cap, "%s: match.%s must be a list of strings", where, key);
+        }
+        if (out->count < KITTY_LIST_MAX) {
+            SDL_strlcpy(out->items[out->count++], el.u.s, KITTY_TEXT_MAX);
+        }
+    }
+    if (out->count > 0) {
+        *present = true;
+    }
+    return true;
+}
+
+static bool KITTY_IsIdentityKey(const char *key)
+{
+    return SDL_strcmp(key, "xtversion") == 0 || SDL_strcmp(key, "env") == 0 ||
+           SDL_strcmp(key, "term_program") == 0 || SDL_strcmp(key, "term") == 0 ||
+           SDL_strcmp(key, "term_substring") == 0;
+}
+
+static bool KITTY_IsConditionKey(const char *key)
+{
+    return SDL_strcmp(key, "version_min") == 0 || SDL_strcmp(key, "version_max") == 0 ||
+           SDL_strcmp(key, "os") == 0;
+}
+
+static bool KITTY_ValidId(const char *id)
+{
+    const char *p;
+    if (!id || !((id[0] >= 'a' && id[0] <= 'z') || (id[0] >= '0' && id[0] <= '9'))) {
         return false;
     }
-    if (min_s && min_s[0]) {
-        if (!KITTY_ParseVersion(min_s, &bound)) {
-            return false;
-        }
-        if (KITTY_CmpParsedVersion(&v, &bound) < 0) {
+    for (p = id; *p; ++p) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '.' || *p == '-')) {
             return false;
         }
     }
-    if (max_s && max_s[0]) {
-        if (!KITTY_ParseVersion(max_s, &bound)) {
+    return SDL_strlen(id) < KITTY_TEXT_MAX;
+}
+
+static int KITTY_FindRow(const KITTY_FactTable *t, const char *id)
+{
+    int i;
+    for (i = 0; i < t->count; ++i) {
+        if (SDL_strcmp(t->rows[i].id, id) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* One [[terminal]] table into row (rows before it are in t). */
+static bool KITTY_ReadRow(const KITTY_FactTable *t, toml_datum_t tab, KITTY_FactRow *row,
+                          char *err, size_t cap)
+{
+    const toml_datum_t id = toml_get(tab, "id");
+    const toml_datum_t name = toml_get(tab, "name");
+    const toml_datum_t extends = toml_get(tab, "extends");
+    const toml_datum_t match = toml_get(tab, "match");
+    const toml_datum_t evidence = toml_get(tab, "evidence");
+    char where[96];
+    bool identity = false;
+    int i;
+
+    SDL_zerop(row);
+    row->extends = -1;
+    KITTY_FactsUnknown(&row->facts);
+
+    if (tab.type != TOML_TABLE) {
+        return KITTY_Fail(err, cap, "a [[terminal]] isn't a table");
+    }
+    if (id.type != TOML_STRING || !KITTY_ValidId(id.u.s)) {
+        return KITTY_Fail(err, cap, "bad or missing id");
+    }
+    SDL_strlcpy(row->id, id.u.s, sizeof(row->id));
+    SDL_snprintf(where, sizeof(where), "terminal '%s'", row->id);
+    if (KITTY_FindRow(t, row->id) >= 0) {
+        return KITTY_Fail(err, cap, "%s: id used twice", where);
+    }
+    if (match.type != TOML_UNKNOWN && match.type != TOML_TABLE) {
+        return KITTY_Fail(err, cap, "%s: match must be a table", where);
+    }
+    if (evidence.type != TOML_UNKNOWN) {
+        if (evidence.type != TOML_TABLE) {
+            return KITTY_Fail(err, cap, "%s: evidence must map fact keys to strings", where);
+        }
+        for (i = 0; i < evidence.u.tab.size; ++i) {
+            size_t f;
+            bool known = false;
+            if (evidence.u.tab.value[i].type != TOML_STRING) {
+                return KITTY_Fail(err, cap, "%s: evidence must map fact keys to strings", where);
+            }
+            for (f = 0; f < SDL_arraysize(KITTY_fact_keys); ++f) {
+                known = known || SDL_strcmp(KITTY_fact_keys[f].key, evidence.u.tab.key[i]) == 0;
+            }
+            if (!known) {
+                return KITTY_Fail(err, cap, "%s: evidence for unknown fact '%s'", where,
+                                  evidence.u.tab.key[i]);
+            }
+        }
+    }
+
+    if (extends.type == TOML_UNKNOWN) {
+        if (name.type != TOML_STRING || !name.u.s[0]) {
+            return KITTY_Fail(err, cap, "%s: a base row needs a name", where);
+        }
+        SDL_strlcpy(row->name, name.u.s, sizeof(row->name));
+        if (match.type == TOML_TABLE) {
+            for (i = 0; i < match.u.tab.size; ++i) {
+                if (!KITTY_IsIdentityKey(match.u.tab.key[i])) {
+                    return KITTY_Fail(err, cap, "%s: a base row can't match by '%s'", where,
+                                      match.u.tab.key[i]);
+                }
+            }
+            if (!KITTY_ReadList(match, "xtversion", where, &row->xtversion, &identity, err, cap) ||
+                !KITTY_ReadList(match, "env", where, &row->env, &identity, err, cap) ||
+                !KITTY_ReadList(match, "term_program", where, &row->term_program, &identity, err, cap) ||
+                !KITTY_ReadList(match, "term", where, &row->term, &identity, err, cap) ||
+                !KITTY_ReadList(match, "term_substring", where, &row->term_substring, &identity, err, cap)) {
+                return false;
+            }
+        }
+        if (!identity) {
+            return KITTY_Fail(err, cap, "%s: a base row needs at least one identity matcher", where);
+        }
+    } else {
+        toml_datum_t v;
+        if (extends.type != TOML_STRING || (row->extends = KITTY_FindRow(t, extends.u.s)) < 0) {
+            return KITTY_Fail(err, cap, "%s: extends a row that isn't an earlier row", where);
+        }
+        if (name.type != TOML_UNKNOWN) {
+            return KITTY_Fail(err, cap, "%s: an extending row has no name", where);
+        }
+        if (match.type != TOML_TABLE || match.u.tab.size == 0) {
+            return KITTY_Fail(err, cap, "%s: an extending row needs a condition", where);
+        }
+        for (i = 0; i < match.u.tab.size; ++i) {
+            if (!KITTY_IsConditionKey(match.u.tab.key[i])) {
+                return KITTY_Fail(err, cap, "%s: an extending row adds version_min, version_max or os, not '%s'",
+                                  where, match.u.tab.key[i]);
+            }
+        }
+        v = toml_get(match, "version_min");
+        if (v.type != TOML_UNKNOWN) {
+            KITTY_VersionKey key;
+            if (v.type != TOML_STRING || !KITTY_VersionKeyOf(v.u.s, &key)) {
+                return KITTY_Fail(err, cap, "%s: match.version_min must be a version string", where);
+            }
+            SDL_strlcpy(row->version_min, v.u.s, sizeof(row->version_min));
+        }
+        v = toml_get(match, "version_max");
+        if (v.type != TOML_UNKNOWN) {
+            KITTY_VersionKey key;
+            if (v.type != TOML_STRING || !KITTY_VersionKeyOf(v.u.s, &key)) {
+                return KITTY_Fail(err, cap, "%s: match.version_max must be a version string", where);
+            }
+            SDL_strlcpy(row->version_max, v.u.s, sizeof(row->version_max));
+        }
+        v = toml_get(match, "os");
+        if (v.type != TOML_UNKNOWN) {
+            if (v.type != TOML_ARRAY || v.u.arr.size == 0) {
+                return KITTY_Fail(err, cap, "%s: match.os must list some of macos, linux, windows, bsd", where);
+            }
+            for (i = 0; i < v.u.arr.size; ++i) {
+                const unsigned bit = (v.u.arr.elem[i].type == TOML_STRING)
+                                         ? KITTY_OSFromName(v.u.arr.elem[i].u.s)
+                                         : 0;
+                if (!bit) {
+                    return KITTY_Fail(err, cap, "%s: match.os must list some of macos, linux, windows, bsd", where);
+                }
+                row->os_mask |= bit;
+            }
+        }
+    }
+    return KITTY_ReadFacts(tab, "", where, &row->facts, err, cap);
+}
+
+/* A whole terminals.toml, checked against schema 1, into t. */
+static bool KITTY_ReadFactsFile(toml_result_t result, KITTY_FactTable *t, char *err, size_t cap)
+{
+    const toml_datum_t top = result.toptab;
+    const toml_datum_t schema = toml_get(top, "schema");
+    const toml_datum_t rows = toml_get(top, "terminal");
+    int i;
+
+    t->count = 0;
+    if (schema.type != TOML_INT64 || schema.u.int64 != 1) {
+        return KITTY_Fail(err, cap, "schema must be 1");
+    }
+    for (i = 0; i < top.u.tab.size; ++i) {
+        if (SDL_strcmp(top.u.tab.key[i], "schema") != 0 &&
+            SDL_strcmp(top.u.tab.key[i], "terminal") != 0) {
+            return KITTY_Fail(err, cap, "unknown top-level key '%s'", top.u.tab.key[i]);
+        }
+    }
+    if (rows.type == TOML_UNKNOWN) {
+        return true;
+    }
+    if (rows.type != TOML_ARRAY) {
+        return KITTY_Fail(err, cap, "terminal must be an array of tables");
+    }
+    for (i = 0; i < rows.u.arr.size; ++i) {
+        if (t->count >= KITTY_ROWS_MAX) {
+            return KITTY_Fail(err, cap, "more than %d rows", KITTY_ROWS_MAX);
+        }
+        if (!KITTY_ReadRow(t, rows.u.arr.elem[i], &t->rows[t->count], err, cap)) {
             return false;
         }
-        if (KITTY_CmpParsedVersion(&v, &bound) > 0) {
+        t->count++;
+    }
+    return true;
+}
+
+/* Parse facts text (compiled in or from a file); replace g_facts if valid. */
+static bool KITTY_TakeFacts(toml_result_t result, const char *what)
+{
+    KITTY_FactTable *t;
+    char err[256];
+
+    if (!result.ok) {
+        KITTY_ProfileDebug("kitty: facts %s not TOML: %s", what, result.errmsg);
+        return false;
+    }
+    t = (KITTY_FactTable *)SDL_calloc(1, sizeof(*t));
+    if (!t) {
+        return false;
+    }
+    err[0] = '\0';
+    if (!KITTY_ReadFactsFile(result, t, err, sizeof(err))) {
+        KITTY_ProfileDebug("kitty: facts %s refused: %s", what, err);
+        SDL_free(t);
+        return false;
+    }
+    SDL_free(g_facts);
+    g_facts = t;
+    KITTY_ProfileDebug("kitty: facts %s rows=%d", what, t->count);
+    return true;
+}
+
+/* ---- Recognising the terminal (SPEC.md: Recognising, Resolving) ---- */
+
+static bool KITTY_ListHasCI(const KITTY_StringList *list, const char *s)
+{
+    int i;
+    for (i = 0; s && i < list->count; ++i) {
+        if (SDL_strcasecmp(list->items[i], s) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool KITTY_ListHas(const KITTY_StringList *list, const char *s)
+{
+    int i;
+    for (i = 0; s && i < list->count; ++i) {
+        if (SDL_strcmp(list->items[i], s) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool KITTY_ListInside(const KITTY_StringList *list, const char *s)
+{
+    int i;
+    for (i = 0; s && i < list->count; ++i) {
+        if (SDL_strstr(s, list->items[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool KITTY_AnyEnvSet(const KITTY_StringList *list)
+{
+    int i;
+    for (i = 0; i < list->count; ++i) {
+        const char *v = SDL_getenv(list->items[i]);
+        if (v && v[0]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * The base row for this terminal: XTVERSION answer first (it can't be
+ * inherited from a parent terminal), then match.env, TERM_PROGRAM, TERM.
+ * -1 if nothing matches. Fills version and how.
+ */
+static int KITTY_RecogniseBase(const KITTY_FactTable *t, const char *xtversion,
+                               char *version, size_t version_cap, const char **how)
+{
+    const char *program = SDL_getenv("TERM_PROGRAM");
+    const char *term = SDL_getenv("TERM");
+    int base = -1;
+    int i;
+
+    version[0] = '\0';
+    *how = "";
+    if (xtversion && xtversion[0]) {
+        char name[KITTY_TEXT_MAX];
+        KITTY_SplitXtversion(xtversion, name, sizeof(name), version, version_cap);
+        for (i = 0; i < t->count && base < 0; ++i) {
+            if (t->rows[i].extends < 0 && KITTY_ListHasCI(&t->rows[i].xtversion, name)) {
+                base = i;
+                *how = "xtversion";
+            }
+        }
+        if (base < 0) {
+            version[0] = '\0';
+        }
+    }
+    for (i = 0; i < t->count && base < 0; ++i) {
+        if (t->rows[i].extends < 0 && KITTY_AnyEnvSet(&t->rows[i].env)) {
+            base = i;
+            *how = "env";
+        }
+    }
+    for (i = 0; i < t->count && base < 0 && program && program[0]; ++i) {
+        if (t->rows[i].extends < 0 && KITTY_ListHasCI(&t->rows[i].term_program, program)) {
+            base = i;
+            *how = "term_program";
+        }
+    }
+    for (i = 0; i < t->count && base < 0 && term; ++i) {
+        if (t->rows[i].extends < 0 && (KITTY_ListHas(&t->rows[i].term, term) ||
+                                       KITTY_ListInside(&t->rows[i].term_substring, term))) {
+            base = i;
+            *how = "term";
+        }
+    }
+    if (base >= 0 && SDL_strcmp(*how, "xtversion") != 0 && program && program[0] &&
+        KITTY_ListHasCI(&t->rows[base].term_program, program)) {
+        const char *v = SDL_getenv("TERM_PROGRAM_VERSION");
+        SDL_strlcpy(version, v ? v : "", version_cap);
+    }
+    return base;
+}
+
+static bool KITTY_ConditionsHold(const KITTY_FactRow *row, const char *version, unsigned os)
+{
+    KITTY_VersionKey have, bound;
+
+    if (row->os_mask && !(row->os_mask & os)) {
+        return false;
+    }
+    if (row->version_min[0] || row->version_max[0]) {
+        if (!version || !version[0] || !KITTY_VersionKeyOf(version, &have)) {
+            return false; /* a version bound never holds for an unknown version */
+        }
+        if (row->version_min[0] && KITTY_VersionKeyOf(row->version_min, &bound) &&
+            KITTY_CompareVersionKeys(&have, &bound) < 0) {
+            return false;
+        }
+        if (row->version_max[0] && KITTY_VersionKeyOf(row->version_max, &bound) &&
+            KITTY_CompareVersionKeys(&have, &bound) > 0) {
             return false;
         }
     }
     return true;
 }
 
-/*
- * Parse "WxH" (case-insensitive x) into positive width and height outputs.
- */
-static bool KITTY_ParseWxH(const char *s, int *w, int *h)
+static KITTY_TerminalKind KITTY_KindFromId(const char *id)
 {
-    int aw = 0, ah = 0;
-    if (!s || !w || !h) {
-        return false;
+    if (SDL_strcmp(id, "rex") == 0) {
+        return KITTY_TERM_REX;
     }
-    if (SDL_sscanf(s, "%dx%d", &aw, &ah) != 2 && SDL_sscanf(s, "%dX%d", &aw, &ah) != 2) {
-        return false;
+    if (SDL_strcmp(id, "kitty") == 0) {
+        return KITTY_TERM_KITTY;
     }
-    if (aw <= 0 || ah <= 0) {
-        return false;
+    if (SDL_strcmp(id, "ghostty") == 0) {
+        return KITTY_TERM_GHOSTTY;
     }
-    *w = aw;
-    *h = ah;
-    return true;
+    if (SDL_strcmp(id, "wezterm") == 0) {
+        return KITTY_TERM_WEZTERM;
+    }
+    return KITTY_TERM_UNKNOWN;
 }
 
-/*
- * Read a TOML boolean key into *out. Returns false if missing or wrong type.
- */
+/* ---- Tuning (sdl-kitty.toml) ---- */
+
 static bool KITTY_TomlGetBool(toml_datum_t tab, const char *key, bool *out)
 {
     toml_datum_t v = toml_get(tab, key);
@@ -321,9 +845,6 @@ static bool KITTY_TomlGetBool(toml_datum_t tab, const char *key, bool *out)
     return true;
 }
 
-/*
- * Read a TOML int64 key into *out. Returns false if missing or wrong type.
- */
 static bool KITTY_TomlGetInt(toml_datum_t tab, const char *key, int64_t *out)
 {
     toml_datum_t v = toml_get(tab, key);
@@ -334,10 +855,7 @@ static bool KITTY_TomlGetInt(toml_datum_t tab, const char *key, int64_t *out)
     return true;
 }
 
-/*
- * Read a TOML float key into *out; int64 values are widened. Returns false
- * if missing or neither FP64 nor INT64.
- */
+/* Floats; ints are widened. */
 static bool KITTY_TomlGetFloat(toml_datum_t tab, const char *key, double *out)
 {
     toml_datum_t v = toml_get(tab, key);
@@ -352,10 +870,7 @@ static bool KITTY_TomlGetFloat(toml_datum_t tab, const char *key, double *out)
     return false;
 }
 
-/*
- * Read a TOML string key into *out (points into the parse tree). Returns
- * false if missing, wrong type, or null.
- */
+/* Strings point into the parse tree (valid while the tuning stays loaded). */
 static bool KITTY_TomlGetString(toml_datum_t tab, const char *key, const char **out)
 {
     toml_datum_t v = toml_get(tab, key);
@@ -366,93 +881,60 @@ static bool KITTY_TomlGetString(toml_datum_t tab, const char *key, const char **
     return true;
 }
 
-/*
- * Replace out with strdup'd strings from a TOML string array (up to
- * KITTY_MATCH_MAX). Returns true if at least one string was copied.
- */
-static bool KITTY_CopyStringListFromToml(KITTY_StringList *out, toml_datum_t arr)
+/* "WxH" (either case of x) into positive width and height. */
+static bool KITTY_ParseWxH(const char *s, int *w, int *h)
 {
-    int i;
-    KITTY_FreeStringList(out);
-    if (arr.type != TOML_ARRAY) {
+    int aw = 0, ah = 0;
+    if (SDL_sscanf(s, "%dx%d", &aw, &ah) != 2 && SDL_sscanf(s, "%dX%d", &aw, &ah) != 2) {
         return false;
     }
-    for (i = 0; i < arr.u.arr.size && out->count < KITTY_MATCH_MAX; ++i) {
-        toml_datum_t el = arr.u.arr.elem[i];
-        char *dup;
-        if (el.type != TOML_STRING || !el.u.s) {
-            continue;
-        }
-        dup = SDL_strdup(el.u.s);
-        if (!dup) {
-            KITTY_FreeStringList(out);
-            return false;
-        }
-        out->items[out->count++] = dup;
+    if (aw <= 0 || ah <= 0) {
+        return false;
     }
-    return out->count > 0;
+    *w = aw;
+    *h = ah;
+    return true;
 }
 
-/*
- * Sparse-overlay policy/tunable keys from a TOML table onto *p. When entry
- * is non-NULL, owns heap for force_transmit and notes strings.
- */
-static void KITTY_OverlayProfileFromTable(KITTY_TerminalProfile *p, toml_datum_t tab,
-                                          KITTY_ProfileEntry *entry)
+/* "WxH", or "0" / "off" / "none" / "" for no cap. */
+static void KITTY_TomlGetCap(toml_datum_t tab, const char *key, int *w, int *h)
+{
+    const char *s;
+    if (!KITTY_TomlGetString(tab, key, &s)) {
+        return;
+    }
+    if (!KITTY_ParseWxH(s, w, h) &&
+        (SDL_strcmp(s, "0") == 0 || SDL_strcasecmp(s, "off") == 0 ||
+         SDL_strcasecmp(s, "none") == 0 || s[0] == '\0')) {
+        *w = 0;
+        *h = 0;
+    }
+}
+
+/* Lay the keys set in a tuning table over *p. */
+static void KITTY_OverlayTuning(KITTY_TerminalProfile *p, toml_datum_t tab)
 {
     bool b;
     int64_t i64;
     double fp;
     const char *s;
 
+    if (tab.type != TOML_TABLE) {
+        return;
+    }
     if (KITTY_TomlGetBool(tab, "prefer_direct", &b)) {
         p->prefer_direct = b;
     }
     if (KITTY_TomlGetBool(tab, "prefer_zlib", &b)) {
         p->prefer_zlib = b;
     }
-    if (entry && KITTY_TomlGetString(tab, "force_transmit", &s)) {
-        SDL_free(entry->force_transmit_heap);
-        entry->force_transmit_heap = NULL;
-        p->force_transmit = NULL;
-        if (s && *s && SDL_strcasecmp(s, "off") != 0 && SDL_strcasecmp(s, "none") != 0) {
-            entry->force_transmit_heap = SDL_strdup(s);
-            p->force_transmit = entry->force_transmit_heap;
-        }
+    if (KITTY_TomlGetString(tab, "force_transmit", &s)) {
+        p->force_transmit = (s[0] && SDL_strcasecmp(s, "off") != 0 &&
+                             SDL_strcasecmp(s, "none") != 0) ? s : NULL;
     }
-    if (KITTY_TomlGetString(tab, "default_fb_max", &s)) {
-        int w = 0, h = 0;
-        if (KITTY_ParseWxH(s, &w, &h)) {
-            p->default_fb_max_w = w;
-            p->default_fb_max_h = h;
-        } else if (SDL_strcmp(s, "0") == 0 || SDL_strcasecmp(s, "off") == 0 ||
-                   SDL_strcasecmp(s, "none") == 0 || s[0] == '\0') {
-            p->default_fb_max_w = 0;
-            p->default_fb_max_h = 0;
-        }
-    }
-    if (KITTY_TomlGetString(tab, "default_fb_max_shm", &s)) {
-        int w = 0, h = 0;
-        if (KITTY_ParseWxH(s, &w, &h)) {
-            p->default_fb_max_shm_w = w;
-            p->default_fb_max_shm_h = h;
-        } else if (SDL_strcmp(s, "0") == 0 || SDL_strcasecmp(s, "off") == 0 ||
-                   SDL_strcasecmp(s, "none") == 0 || s[0] == '\0') {
-            p->default_fb_max_shm_w = 0;
-            p->default_fb_max_shm_h = 0;
-        }
-    }
-    if (KITTY_TomlGetString(tab, "default_fb_max_direct", &s)) {
-        int w = 0, h = 0;
-        if (KITTY_ParseWxH(s, &w, &h)) {
-            p->default_fb_max_direct_w = w;
-            p->default_fb_max_direct_h = h;
-        } else if (SDL_strcmp(s, "0") == 0 || SDL_strcasecmp(s, "off") == 0 ||
-                   SDL_strcasecmp(s, "none") == 0 || s[0] == '\0') {
-            p->default_fb_max_direct_w = 0;
-            p->default_fb_max_direct_h = 0;
-        }
-    }
+    KITTY_TomlGetCap(tab, "default_fb_max", &p->default_fb_max_w, &p->default_fb_max_h);
+    KITTY_TomlGetCap(tab, "default_fb_max_shm", &p->default_fb_max_shm_w, &p->default_fb_max_shm_h);
+    KITTY_TomlGetCap(tab, "default_fb_max_direct", &p->default_fb_max_direct_w, &p->default_fb_max_direct_h);
     if (KITTY_TomlGetInt(tab, "max_direct_bytes", &i64) && i64 > 0) {
         p->max_direct_bytes = (size_t)i64;
     }
@@ -544,525 +1026,311 @@ static void KITTY_OverlayProfileFromTable(KITTY_TerminalProfile *p, toml_datum_t
     if (KITTY_TomlGetBool(tab, "shm_unlink_after_send", &b)) {
         p->shm_unlink_after_send = b;
     }
-    if (entry && KITTY_TomlGetString(tab, "notes", &s)) {
-        SDL_free(entry->notes_heap);
-        entry->notes_heap = SDL_strdup(s);
-        p->notes = entry->notes_heap;
+    if (KITTY_TomlGetString(tab, "notes", &s)) {
+        p->notes = s;
     }
 }
 
-/*
- * Read match.* keys from tab into entry (term_program lists, kitty_window_id,
- * version min/max). Sets has_matchers when any matcher is present.
- */
-static void KITTY_OverlayMatchers(KITTY_ProfileEntry *entry, toml_datum_t tab)
-{
-    toml_datum_t a;
-
-    a = toml_seek(tab, "match.term_program");
-    if (a.type == TOML_ARRAY) {
-        if (KITTY_CopyStringListFromToml(&entry->term_program, a)) {
-            entry->has_matchers = true;
-        }
-    }
-    a = toml_seek(tab, "match.term_when_program_empty");
-    if (a.type == TOML_ARRAY) {
-        if (KITTY_CopyStringListFromToml(&entry->term_when_program_empty, a)) {
-            entry->has_matchers = true;
-        }
-    }
-    a = toml_seek(tab, "match.term_substring");
-    if (a.type == TOML_ARRAY) {
-        if (KITTY_CopyStringListFromToml(&entry->term_substring, a)) {
-            entry->has_matchers = true;
-        }
-    }
-    a = toml_seek(tab, "match.kitty_window_id");
-    if (a.type == TOML_BOOLEAN) {
-        entry->match_kitty_window_id = a.u.boolean;
-        if (a.u.boolean) {
-            entry->has_matchers = true;
-        }
-    }
-    a = toml_seek(tab, "match.term_program_version_min");
-    if (a.type == TOML_STRING && a.u.s && a.u.s[0]) {
-        SDL_free(entry->version_min);
-        entry->version_min = SDL_strdup(a.u.s);
-        entry->has_matchers = true;
-    }
-    a = toml_seek(tab, "match.term_program_version_max");
-    if (a.type == TOML_STRING && a.u.s && a.u.s[0]) {
-        SDL_free(entry->version_max);
-        entry->version_max = SDL_strdup(a.u.s);
-        entry->has_matchers = true;
-    }
-}
-
-/*
- * Case-insensitive exact match of s against any item in list.
- */
-static bool KITTY_ListContainsCI(const KITTY_StringList *list, const char *s)
+/* [terminal.<id>] from every tuning file, in load order. */
+static void KITTY_OverlayTuningFor(KITTY_TerminalProfile *p, const char *id)
 {
     int i;
-    if (!list || !s) {
-        return false;
-    }
-    for (i = 0; i < list->count; ++i) {
-        if (list->items[i] && SDL_strcasecmp(list->items[i], s) == 0) {
-            return true;
+    for (i = 0; i < g_tuning_count; ++i) {
+        const toml_datum_t terminals = toml_get(g_tuning[i].toptab, "terminal");
+        if (terminals.type == TOML_TABLE) {
+            KITTY_OverlayTuning(p, toml_get(terminals, id));
         }
     }
-    return false;
 }
 
-/*
- * True if any list item occurs as a substring of s (case-sensitive strstr).
- */
-static bool KITTY_ListSubstring(const KITTY_StringList *list, const char *s)
+static bool KITTY_TakeTuning(toml_result_t result, const char *what)
 {
-    int i;
-    if (!list || !s) {
-        return false;
-    }
-    for (i = 0; i < list->count; ++i) {
-        if (list->items[i] && SDL_strstr(s, list->items[i]) != NULL) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/*
- * True if e's identity matchers hit tp/term/KITTY_WINDOW_ID and optional
- * TERM_PROGRAM_VERSION lies in [version_min, version_max].
- */
-static bool KITTY_EntryMatches(const KITTY_ProfileEntry *e, const char *tp, const char *term)
-{
-    bool identity = false;
-    const char *tpv;
-
-    if (!e || !e->has_matchers) {
-        return false;
-    }
-    if (tp && *tp && KITTY_ListContainsCI(&e->term_program, tp)) {
-        identity = true;
-    } else if ((!tp || !*tp) && term && *term &&
-               KITTY_ListContainsCI(&e->term_when_program_empty, term)) {
-        identity = true;
-    } else if (term && *term && KITTY_ListSubstring(&e->term_substring, term)) {
-        identity = true;
-    } else if (e->match_kitty_window_id && SDL_getenv("KITTY_WINDOW_ID") != NULL) {
-        identity = true;
-    }
-    if (!identity) {
-        return false;
-    }
-    /* Version bounds AND with identity. Missing env fails a constrained row. */
-    tpv = SDL_getenv("TERM_PROGRAM_VERSION");
-    return KITTY_VersionInRange(tpv, e->version_min, e->version_max);
-}
-
-/*
- * Find a loaded entry whose name_storage matches name (case-insensitive).
- */
-static KITTY_ProfileEntry *KITTY_FindEntryByName(const char *name)
-{
-    int i;
-    if (!name) {
-        return NULL;
-    }
-    for (i = 0; i < g_entry_count; ++i) {
-        if (SDL_strcasecmp(g_entries[i].name_storage, name) == 0) {
-            return &g_entries[i];
-        }
-    }
-    return NULL;
-}
-
-/*
- * Append a new entry cloned from defaults (or BuiltinDefaultsProfile), with
- * kind/name from id. Returns NULL if the table is full or id is empty.
- */
-static KITTY_ProfileEntry *KITTY_AddEntryFromDefaults(const KITTY_TerminalProfile *defaults,
-                                                     const char *id)
-{
-    KITTY_ProfileEntry *e;
-
-    if (g_entry_count >= KITTY_PROFILE_MAX || !id || !id[0]) {
-        return NULL;
-    }
-    e = &g_entries[g_entry_count++];
-    SDL_zerop(e);
-    /* Resolve: copy [defaults], then [[terminal]] overlays set keys only. */
-    e->profile = defaults ? *defaults : *KITTY_BuiltinDefaultsProfile();
-    e->profile.kind = KITTY_KindFromId(id);
-    SDL_strlcpy(e->name_storage, id, sizeof(e->name_storage));
-    e->profile.name = e->name_storage;
-    e->profile.notes = NULL;
-    return e;
-}
-
-/*
- * Apply a parsed TOML result: overlay [defaults], optionally replace all
- * entries, then merge each [[terminal]] row (policy + matchers). Sets
- * g_have_loaded on success.
- */
-static bool KITTY_ApplyTomlResult(toml_result_t result, bool replace)
-{
-    toml_datum_t defaults_tab;
-    KITTY_TerminalProfile defaults_profile;
-    toml_datum_t terminals;
-    int i;
-
     if (!result.ok) {
+        KITTY_ProfileDebug("kitty: tuning %s not TOML: %s", what, result.errmsg);
+        toml_free(result);
         return false;
     }
-
-    defaults_profile = *KITTY_BuiltinDefaultsProfile();
-    defaults_tab = toml_get(result.toptab, "defaults");
-    if (defaults_tab.type == TOML_TABLE) {
-        KITTY_OverlayProfileFromTable(&defaults_profile, defaults_tab, NULL);
+    if (g_tuning_count >= KITTY_TUNING_MAX) {
+        KITTY_ProfileDebug("kitty: tuning %s skipped: more than %d files", what, KITTY_TUNING_MAX);
+        toml_free(result);
+        return false;
     }
-
-    if (replace) {
-        KITTY_ClearAllEntries();
-    }
-
-    terminals = toml_get(result.toptab, "terminal");
-    if (terminals.type != TOML_ARRAY) {
-        /* No [[terminal]] rows — keep defaults only as "unknown". */
-        KITTY_ProfileEntry *unk = KITTY_FindEntryByName("unknown");
-        if (!unk) {
-            unk = KITTY_AddEntryFromDefaults(&defaults_profile, "unknown");
-        } else {
-            unk->profile = defaults_profile;
-            unk->profile.name = unk->name_storage;
-            unk->profile.kind = KITTY_TERM_UNKNOWN;
-        }
-        if (unk) {
-            unk->has_matchers = false;
-        }
-        g_have_loaded = true;
-        return true;
-    }
-
-    for (i = 0; i < terminals.u.arr.size; ++i) {
-        toml_datum_t tab = terminals.u.arr.elem[i];
-        const char *id = NULL;
-        KITTY_ProfileEntry *e;
-        bool is_new = false;
-
-        if (tab.type != TOML_TABLE) {
-            continue;
-        }
-        if (!KITTY_TomlGetString(tab, "id", &id) || !id || !id[0]) {
-            KITTY_ProfileDebug("kitty: profiles skip [[terminal]] without id");
-            continue;
-        }
-
-        e = KITTY_FindEntryByName(id);
-        if (!e) {
-            e = KITTY_AddEntryFromDefaults(&defaults_profile, id);
-            is_new = true;
-            if (!e) {
-                KITTY_ProfileDebug("kitty: profiles table full, skip id=%s", id);
-                continue;
-            }
-        }
-
-        /* Sparse overlay of keys set on this [[terminal]] row. */
-        KITTY_OverlayProfileFromTable(&e->profile, tab, e);
-        e->profile.name = e->name_storage;
-        e->profile.kind = KITTY_KindFromId(id);
-
-        /* Replace matchers when this row defines any match.* key. */
-        {
-            const bool any_match_key =
-                (toml_seek(tab, "match.term_program").type == TOML_ARRAY) ||
-                (toml_seek(tab, "match.term_when_program_empty").type == TOML_ARRAY) ||
-                (toml_seek(tab, "match.term_substring").type == TOML_ARRAY) ||
-                (toml_seek(tab, "match.kitty_window_id").type == TOML_BOOLEAN) ||
-                (toml_seek(tab, "match.term_program_version_min").type == TOML_STRING) ||
-                (toml_seek(tab, "match.term_program_version_max").type == TOML_STRING);
-            if (is_new || any_match_key) {
-                if (any_match_key) {
-                    KITTY_FreeStringList(&e->term_program);
-                    KITTY_FreeStringList(&e->term_when_program_empty);
-                    KITTY_FreeStringList(&e->term_substring);
-                    e->match_kitty_window_id = false;
-                    SDL_free(e->version_min);
-                    e->version_min = NULL;
-                    SDL_free(e->version_max);
-                    e->version_max = NULL;
-                    e->has_matchers = false;
-                    KITTY_OverlayMatchers(e, tab);
-                }
-            }
-        }
-
-        /* unknown is the explicit no-matcher fallback. */
-        if (SDL_strcasecmp(id, "unknown") == 0) {
-            e->has_matchers = false;
-        }
-    }
-
-    g_have_loaded = g_entry_count > 0;
-    return g_have_loaded;
+    g_tuning[g_tuning_count++] = result;
+    return true;
 }
 
-/*
- * Parse path with tomlc17 and ApplyTomlResult. On success, record path in
- * g_source (append with ';' if already loaded). Returns false on I/O/parse
- * failure.
- */
-static bool KITTY_LoadProfilesFile(const char *path, bool replace)
+/* ---- Loading ---- */
+
+static void KITTY_NoteSource(const char *path)
+{
+    const size_t len = SDL_strlen(g_source);
+    SDL_snprintf(g_source + len, sizeof(g_source) - len, ";%s", path);
+}
+
+static void KITTY_ClearAll(void)
+{
+    int i;
+    for (i = 0; i < g_tuning_count; ++i) {
+        toml_free(g_tuning[i]);
+    }
+    g_tuning_count = 0;
+    SDL_free(g_facts);
+    g_facts = NULL;
+    SDL_strlcpy(g_source, "builtin", sizeof(g_source));
+}
+
+/* The compiled-in terminals.toml and sdl-kitty.toml. */
+static void KITTY_LoadEmbedded(void)
+{
+    toml_result_t facts, tuning;
+
+    KITTY_TomlInit();
+    facts = toml_parse(KITTY_EMBEDDED_FACTS_TOML, (int)SDL_strlen(KITTY_EMBEDDED_FACTS_TOML));
+    (void)KITTY_TakeFacts(facts, "builtin");
+    toml_free(facts);
+    tuning = toml_parse(KITTY_EMBEDDED_TUNING_TOML, (int)SDL_strlen(KITTY_EMBEDDED_TUNING_TOML));
+    (void)KITTY_TakeTuning(tuning, "builtin");
+}
+
+static bool KITTY_Readable(const char *path)
+{
+    FILE *fp;
+    if (!path || !path[0]) {
+        return false;
+    }
+    fp = fopen(path, "rb");
+    if (!fp) {
+        return false;
+    }
+    fclose(fp);
+    return true;
+}
+
+bool KITTY_LoadTerminalFacts(const char *path)
 {
     toml_result_t result;
     bool ok;
 
-    if (!path || !path[0]) {
+    KITTY_EnsureTerminalProfilesLoaded();
+    if (!KITTY_Readable(path)) {
         return false;
     }
-
     result = toml_parse_file_ex(path);
-    if (!result.ok) {
-        KITTY_ProfileDebug("kitty: profiles parse failed path=%s err=%s", path,
-                           result.errmsg);
-        toml_free(result);
-        return false;
-    }
-
-    ok = KITTY_ApplyTomlResult(result, replace);
+    ok = KITTY_TakeFacts(result, path);
     toml_free(result);
     if (ok) {
-        if (g_source[0] && SDL_strcmp(g_source, "builtin") != 0) {
-            char next[KITTY_SOURCE_MAX];
-            SDL_snprintf(next, sizeof(next), "%s;%s", g_source, path);
-            SDL_strlcpy(g_source, next, sizeof(g_source));
-        } else {
-            SDL_strlcpy(g_source, path, sizeof(g_source));
-        }
-        KITTY_ProfileDebug("kitty: profiles loaded path=%s entries=%d", path, g_entry_count);
+        KITTY_NoteSource(path);
     }
     return ok;
 }
 
-/*
- * If path is readable, strdup it into paths[*n] and increment *n (no-op if
- * full, empty, or fopen fails).
- */
-static void KITTY_AppendPathIfExists(char **paths, int *n, int cap, const char *path)
+bool KITTY_LoadTerminalProfiles(const char *path)
 {
-    FILE *fp;
-    if (!path || !path[0] || *n >= cap) {
-        return;
+    KITTY_EnsureTerminalProfilesLoaded();
+    if (!KITTY_Readable(path)) {
+        return false;
     }
-    fp = fopen(path, "rb");
-    if (!fp) {
-        return;
+    if (!KITTY_TakeTuning(toml_parse_file_ex(path), path)) {
+        return false;
     }
-    fclose(fp);
-    paths[*n] = SDL_strdup(path);
-    if (paths[*n]) {
-        (*n)++;
-    }
+    KITTY_NoteSource(path);
+    return true;
 }
 
-/*
- * Fill paths with existing profile files: SDL_KITTY_PROFILES (colon list,
- * exclusive) else pref/base-path terminals.toml and KITTY_DEFAULT_PROFILES_PATH.
- */
-static void KITTY_CollectSearchPaths(char **paths, int *n, int cap)
+/* pref path / base path candidates for a file name, in search order. */
+static int KITTY_DefaultPaths(const char *file, const char *compiled, char paths[][1024], int cap)
 {
-    const char *env = SDL_getenv("SDL_KITTY_PROFILES");
-    char *pref = NULL;
-    const char *base = NULL;
-
-    *n = 0;
-
-    if (env && *env) {
-        /* Colon-separated list (same idea as PATH). */
-        char *copy = SDL_strdup(env);
-        char *cursor;
-        char *tok;
-        if (!copy) {
-            return;
+    int n = 0;
+#ifndef KITTY_PROFILE_STANDALONE
+    {
+        char *pref = SDL_GetPrefPath("sdl-kitty", "kitty");
+        const char *base = SDL_GetBasePath();
+        if (pref && n < cap) {
+            SDL_snprintf(paths[n++], 1024, "%s%s", pref, file);
         }
-        cursor = copy;
-        while (cursor && *n < cap) {
-            tok = cursor;
-            while (*cursor && *cursor != ':') {
-                cursor++;
+        SDL_free(pref);
+        if (base && n + 1 < cap) {
+            SDL_snprintf(paths[n++], 1024, "%skitty/%s", base, file);
+            SDL_snprintf(paths[n++], 1024, "%s%s", base, file);
+        }
+    }
+#else
+    (void)file;
+#endif
+    if (compiled && compiled[0] && n < cap) {
+        SDL_strlcpy(paths[n++], compiled, 1024);
+    }
+    return n;
+}
+
+void KITTY_EnsureTerminalProfilesLoaded(void)
+{
+    char paths[4][1024];
+    const char *facts_env;
+    const char *tuning_env;
+    const char *compiled_facts = NULL;
+    const char *compiled_tuning = NULL;
+    int n, i;
+
+    if (g_loaded) {
+        return;
+    }
+    g_loaded = true;
+    KITTY_LoadEmbedded();
+#ifdef KITTY_DEFAULT_FACTS_PATH
+    compiled_facts = KITTY_DEFAULT_FACTS_PATH;
+#endif
+#ifdef KITTY_DEFAULT_PROFILES_PATH
+    compiled_tuning = KITTY_DEFAULT_PROFILES_PATH;
+#endif
+
+    /* Facts: one file replaces the compiled-in copy; the first found wins. */
+    facts_env = SDL_getenv("SDL_KITTY_FACTS");
+    if (facts_env && facts_env[0]) {
+        (void)KITTY_LoadTerminalFacts(facts_env);
+    } else {
+        n = KITTY_DefaultPaths("terminals.toml", compiled_facts, paths, 4);
+        for (i = 0; i < n; ++i) {
+            if (KITTY_Readable(paths[i])) {
+                (void)KITTY_LoadTerminalFacts(paths[i]);
+                break;
             }
-            if (*cursor == ':') {
+        }
+    }
+
+    /* Tuning: every file found overlays, in order. SDL_KITTY_PROFILES (a
+     * colon-separated list) replaces the search. */
+    tuning_env = SDL_getenv("SDL_KITTY_PROFILES");
+    if (tuning_env && tuning_env[0]) {
+        char *copy = SDL_strdup(tuning_env);
+        char *cursor = copy;
+        while (cursor) {
+            char *tok = cursor;
+            cursor = SDL_strchr(cursor, ':');
+            if (cursor) {
                 *cursor++ = '\0';
-            } else {
-                cursor = NULL;
             }
             if (tok[0]) {
-                KITTY_AppendPathIfExists(paths, n, cap, tok);
+                (void)KITTY_LoadTerminalProfiles(tok);
             }
         }
         SDL_free(copy);
-        return; /* explicit list wins; do not also auto-search */
+    } else {
+        n = KITTY_DefaultPaths("sdl-kitty.toml", compiled_tuning, paths, 4);
+        for (i = 0; i < n; ++i) {
+            (void)KITTY_LoadTerminalProfiles(paths[i]);
+        }
     }
-
-#ifndef KITTY_PROFILE_STANDALONE
-    pref = SDL_GetPrefPath("sdl-kitty", "kitty");
-    if (pref) {
-        char buf[1024];
-        SDL_snprintf(buf, sizeof(buf), "%sterminals.toml", pref);
-        KITTY_AppendPathIfExists(paths, n, cap, buf);
-        SDL_free(pref);
-    }
-    base = SDL_GetBasePath();
-    if (base) {
-        char buf[1024];
-        SDL_snprintf(buf, sizeof(buf), "%skitty/terminals.toml", base);
-        KITTY_AppendPathIfExists(paths, n, cap, buf);
-        SDL_snprintf(buf, sizeof(buf), "%sterminals.toml", base);
-        KITTY_AppendPathIfExists(paths, n, cap, buf);
-    }
-#endif
-
-#ifdef KITTY_DEFAULT_PROFILES_PATH
-    KITTY_AppendPathIfExists(paths, n, cap, KITTY_DEFAULT_PROFILES_PATH);
-#endif
+    KITTY_ProfileDebug("kitty: profiles=%s", g_source);
 }
 
-/*
- * Drop loaded entries and clear g_load_attempted so the next Ensure will
- * search again (builtins until a TOML load succeeds).
- */
 void KITTY_ResetTerminalProfilesToBuiltin(void)
 {
-    KITTY_ClearAllEntries();
-    g_load_attempted = false;
-    g_have_loaded = false;
+    KITTY_ClearAll();
+    g_loaded = false;
 }
 
-/*
- * Load profiles from an explicit path. First successful load replaces;
- * later calls overlay. Marks load attempted on success.
- */
-bool KITTY_LoadTerminalProfiles(const char *path)
-{
-    bool ok;
-    /* First successful explicit load replaces; subsequent overlay. */
-    ok = KITTY_LoadProfilesFile(path, !g_have_loaded);
-    if (ok) {
-        g_load_attempted = true;
-    }
-    return ok;
-}
-
-/*
- * One-shot search/load of profile TOML via CollectSearchPaths. Configures
- * tomlc17 to use SDL allocators. Idempotent after the first call.
- */
-void KITTY_EnsureTerminalProfilesLoaded(void)
-{
-    char *paths[8];
-    int n = 0;
-    int i;
-    toml_option_t opt;
-
-    if (g_load_attempted) {
-        return;
-    }
-    g_load_attempted = true;
-
-    /* Prefer SDL allocators for tomlc17 heap. */
-    opt = toml_default_option();
-    opt.mem_realloc = SDL_realloc;
-    opt.mem_free = SDL_free;
-    toml_set_option(opt);
-
-    for (i = 0; i < 8; ++i) {
-        paths[i] = NULL;
-    }
-    KITTY_CollectSearchPaths(paths, &n, 8);
-
-    for (i = 0; i < n; ++i) {
-        const bool replace = !g_have_loaded;
-        (void)KITTY_LoadProfilesFile(paths[i], replace);
-        SDL_free(paths[i]);
-        paths[i] = NULL;
-    }
-
-    if (!g_have_loaded) {
-        KITTY_ProfileDebug("kitty: profiles=builtin (no TOML found)");
-    }
-}
-
-/*
- * Among loaded entries, return the first env matcher hit; else the
- * "unknown" no-matcher row; else first entry without matchers; else
- * g_entries[0]. NULL if nothing loaded.
- */
-const KITTY_TerminalProfile *KITTY_DetectLoadedTerminalProfile(void)
-{
-    const char *tp;
-    const char *term;
-    int i;
-
-    if (!g_have_loaded || g_entry_count <= 0) {
-        return NULL;
-    }
-
-    tp = SDL_getenv("TERM_PROGRAM");
-    term = SDL_getenv("TERM");
-
-    for (i = 0; i < g_entry_count; ++i) {
-        if (KITTY_EntryMatches(&g_entries[i], tp, term)) {
-            return &g_entries[i].profile;
-        }
-    }
-    for (i = 0; i < g_entry_count; ++i) {
-        if (!g_entries[i].has_matchers &&
-            SDL_strcasecmp(g_entries[i].name_storage, "unknown") == 0) {
-            return &g_entries[i].profile;
-        }
-    }
-    /* Last resort among loaded: first entry without matchers, else first. */
-    for (i = 0; i < g_entry_count; ++i) {
-        if (!g_entries[i].has_matchers) {
-            return &g_entries[i].profile;
-        }
-    }
-    return &g_entries[0].profile;
-}
-
-/*
- * Return g_source ("builtin" or loaded path list). Never NULL.
- */
 const char *KITTY_TerminalProfilesSource(void)
 {
-    return g_source[0] ? g_source : "builtin";
+    return g_source;
 }
 
-/*
- * Ensure profiles loaded; true if any loaded entry's matchers hit the
- * current TERM_PROGRAM/TERM env (ProbeSupport).
- */
-bool KITTY_EnvMatchesLoadedProfile(void)
+/* ---- Resolving ---- */
+
+/* Settings the facts decide, over the tuning. */
+static void KITTY_ApplyFacts(KITTY_TerminalProfile *p)
 {
-    const char *tp;
-    const char *term;
+    const KITTY_TerminalFacts *f = &p->facts;
+
+    if (f->frame_edit_reply != KITTY_FACT_UNKNOWN) {
+        p->silent_af_ok = (f->frame_edit_reply == KITTY_FACT_NO);
+    }
+    if (f->ioctl_pixels != KITTY_FACT_UNKNOWN) {
+        p->ignore_ioctl_pixels = (f->ioctl_pixels == KITTY_FACT_NO);
+    }
+    if (f->max_escape_bytes > KITTY_APC_HEADROOM) {
+        p->apc_chunk_bytes = f->max_escape_bytes - KITTY_APC_HEADROOM;
+    }
+    if (f->shm == KITTY_FACT_NO) {
+        p->prefer_direct = true;
+    }
+    if (f->frame_edit == KITTY_FACT_NO) {
+        p->skip_af_probe = true;
+        p->direct_af_when_shm = false;
+    }
+}
+
+const KITTY_TerminalProfile *KITTY_IdentifyTerminalProfile(const char *xtversion,
+                                                           const char *os_name)
+{
+    const unsigned os = os_name ? KITTY_OSFromName(os_name) : KITTY_CurrentOS();
+    const char *how = "";
+    bool applied[KITTY_ROWS_MAX];
+    int base = -1;
     int i;
+    int t;
 
     KITTY_EnsureTerminalProfilesLoaded();
-    if (!g_have_loaded || g_entry_count <= 0) {
-        return false;
+    g_profile = *KITTY_BuiltinDefaultsProfile();
+    KITTY_FactsUnknown(&g_profile.facts);
+    g_profile_version[0] = '\0';
+    g_profile_rows[0] = '\0';
+    SDL_strlcpy(g_profile_name, "unknown", sizeof(g_profile_name));
+
+    for (t = 0; t < g_tuning_count; ++t) {
+        KITTY_OverlayTuning(&g_profile, toml_get(g_tuning[t].toptab, "defaults"));
     }
-    tp = SDL_getenv("TERM_PROGRAM");
-    term = SDL_getenv("TERM");
-    for (i = 0; i < g_entry_count; ++i) {
-        if (KITTY_EntryMatches(&g_entries[i], tp, term)) {
-            return true;
+    if (g_facts) {
+        base = KITTY_RecogniseBase(g_facts, xtversion, g_profile_version,
+                                   sizeof(g_profile_version), &how);
+    }
+    if (base < 0) {
+        KITTY_OverlayTuningFor(&g_profile, "unknown");
+        how = "";
+    } else {
+        SDL_zeroa(applied);
+        applied[base] = true;
+        SDL_strlcpy(g_profile_name, g_facts->rows[base].id, sizeof(g_profile_name));
+        SDL_strlcpy(g_profile_rows, g_facts->rows[base].id, sizeof(g_profile_rows));
+        g_profile.facts = g_facts->rows[base].facts;
+        KITTY_OverlayTuningFor(&g_profile, g_facts->rows[base].id);
+        for (i = 0; i < g_facts->count; ++i) {
+            const KITTY_FactRow *row = &g_facts->rows[i];
+            if (row->extends >= 0 && applied[row->extends] &&
+                KITTY_ConditionsHold(row, g_profile_version, os)) {
+                applied[i] = true;
+                SDL_strlcat(g_profile_rows, ",", sizeof(g_profile_rows));
+                SDL_strlcat(g_profile_rows, row->id, sizeof(g_profile_rows));
+                KITTY_FactsOverlay(&g_profile.facts, &row->facts);
+                KITTY_OverlayTuningFor(&g_profile, row->id);
+            }
         }
     }
-    return false;
+    KITTY_ApplyFacts(&g_profile);
+    g_profile.kind = KITTY_KindFromId(g_profile_name);
+    g_profile.name = g_profile_name;
+    g_profile.rows = g_profile_rows;
+    g_profile.version = g_profile_version;
+    g_profile.recognised_by = how;
+    KITTY_ProfileDebug("kitty: terminal=%s rows=%s version=%s by=%s", g_profile.name,
+                       g_profile.rows[0] ? g_profile.rows : "-",
+                       g_profile.version[0] ? g_profile.version : "?",
+                       how[0] ? how : "-");
+    return &g_profile;
+}
+
+const KITTY_TerminalProfile *KITTY_DetectTerminalProfile(void)
+{
+    return KITTY_IdentifyTerminalProfile(NULL, NULL);
+}
+
+bool KITTY_EnvMatchesLoadedProfile(void)
+{
+    char version[KITTY_TEXT_MAX];
+    const char *how;
+
+    KITTY_EnsureTerminalProfilesLoaded();
+    return g_facts && KITTY_RecogniseBase(g_facts, NULL, version, sizeof(version), &how) >= 0;
 }
 
 #endif /* SDL_VIDEO_DRIVER_KITTY || KITTY_PROFILE_STANDALONE */

@@ -104,6 +104,19 @@ bool KITTY_SelectPingPong(const char *env, bool default_on);
 #define KITTY_AT_PLACE_KEYS "C=1,N=1,p=1,q=2"
 
 /*
+ * Find an XTVERSION answer (DCS > | text ST, ST being ESC \ or BEL) in buf
+ * and copy its text to out (NUL-terminated, truncated to cap). False if
+ * there's no complete answer.
+ */
+bool KITTY_ParseXtversionReply(const char *buf, size_t len, char *out, size_t cap);
+
+/*
+ * True when buf holds a primary device attributes answer (CSI ? ... c),
+ * which every terminal sends: the sentinel after an XTVERSION query.
+ */
+bool KITTY_ReplyHasDA1(const char *buf, size_t len);
+
+/*
  * SDL_KITTY_FB_ALPHA=1/true/yes/on → ARGB8888 window FB + Kitty f=32.
  * Unset or any other value → false (RGB24 / f=24).
  */
@@ -160,6 +173,12 @@ KITTY_ResizeAction KITTY_ClassifyResize(bool place_cells, bool has_live_image,
                                         int old_cols, int old_rows, int new_cols, int new_rows);
 
 #ifndef KITTY_PROBE_STANDALONE
+/*
+ * Ask XTVERSION and switch data->term_profile to the terminal it names
+ * (terminals.toml). Call right after entering raw mode.
+ */
+void KITTY_RecogniseTerminal(SDL_VideoData *data);
+
 /*
  * Run a=q (+ optional a=f) probes on the tty; set data->transmit_mode,
  * shm_failed, and frame_edit_ok. Honors SDL_KITTY_TRANSMIT / DIRTY_BW env.

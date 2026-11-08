@@ -4,9 +4,10 @@
 */
 
 /*
- * Builtin KITTY_TerminalProfile tables (rex/kitty/ghostty/wezterm/unknown)
- * and env-based detect helpers. TOML overlays live in SDL_kittyprofile_load.c;
- * DetectTerminalProfile prefers a loaded match, else DetectBuiltinTerminalProfile.
+ * The seed every profile starts from: the driver's own defaults, before
+ * sdl-kitty.toml's [defaults] and per-terminal tuning, and before facts from
+ * terminals.toml. No per-terminal values live here; those are in the TOML
+ * files (SDL_kittyprofile_load.c).
  */
 #ifdef KITTY_PROFILE_STANDALONE
 #include <SDL3/SDL.h>
@@ -19,143 +20,21 @@
 
 #include "SDL_kittyprofile.h"
 
-/* ~1920x1080 RGBA — refuse larger direct APC dumps into the tty. */
-#define KITTY_MAX_DIRECT_BYTES_DEFAULT ((size_t)1920 * 1080 * 4)
-#define KITTY_AF_MAX_PX_DEFAULT ((size_t)160 * 1024)
-#define KITTY_DIRECT_FALLBACK_DEFAULT ((size_t)256 * 1024)
-#define KITTY_APC_CHUNK_DEFAULT ((size_t)2 * 1024 * 1024)
-
-/* Shared §C tunables matching config/terminals.toml [defaults]. */
-#define KITTY_PROFILE_TUNABLES                                                 \
-    .direct_fallback_max_bytes = KITTY_DIRECT_FALLBACK_DEFAULT,                \
-    .apc_chunk_bytes = KITTY_APC_CHUNK_DEFAULT,                                \
-    .probe_timeout_ms = 40,                                                    \
-    .drain_passes = 8,                                                         \
-    .drain_quiet_us = 15000,                                                   \
-    .stub_winch_iters = 40,                                                    \
-    .stub_winch_delay_ms = 25,                                                 \
-    .stub_cols = 80,                                                           \
-    .stub_rows = 24,                                                           \
-    .key_hold_ms = 80,                                                         \
-    .fb_diff = true,                                                           \
-    .fb_diff_tile = 32,                                                        \
-    .fb_diff_cover = 0.45f,                                                    \
-    .tty_pending_max = 4096,                                                   \
-    .window_fallback_w = 640,                                                  \
-    .window_fallback_h = 480,                                                  \
-    .place_cells = true,                                                       \
-    .pingpong = false,                                                         \
-    .shm_unlink_after_send = false,                                            \
-    .upload_skip = true,                                                       \
-    .coalesce_gap_px = 0,                                                      \
-    .notes = NULL
-
-static const KITTY_TerminalProfile KITTY_profile_rex = {
-    .kind = KITTY_TERM_REX,
-    .name = "rex",
-    .prefer_direct = true, /* SHM/zlib historically flaky / unsupported medium */
-    .prefer_zlib = false,
-    .force_transmit = NULL,
-    .default_fb_max_w = 1280,
-    .default_fb_max_h = 720,
-    /* libghostty Screen.zig .lib storage default 10MB — 1080p RGBA ~8.3MB. */
-    .default_fb_max_shm_w = 0,
-    .default_fb_max_shm_h = 0,
-    .default_fb_max_direct_w = 1280,
-    .default_fb_max_direct_h = 720,
-    .max_direct_bytes = KITTY_MAX_DIRECT_BYTES_DEFAULT,
-    .af_max_coverage = 0.40f,
-    .af_max_pixels = (size_t)1280 * 720,
-    .keys_on_stdin = true,
-    .silent_af_ok = true,
-    .ignore_ioctl_pixels = true,
-    .direct_af_when_shm = true,
-    KITTY_PROFILE_TUNABLES
-};
-
-static const KITTY_TerminalProfile KITTY_profile_kitty = {
-    .kind = KITTY_TERM_KITTY,
-    .name = "kitty",
-    .prefer_direct = false, /* SHM first-class in graphics.c */
-    .prefer_zlib = false,
-    .force_transmit = NULL,
-    .default_fb_max_w = 1920,
-    .default_fb_max_h = 1080,
-    /* SHM APC is path-only; direct chunked under MAX_ESCAPE_CODE_LENGTH 256KiB. */
-    .default_fb_max_shm_w = 1920,
-    .default_fb_max_shm_h = 1080,
-    .default_fb_max_direct_w = 1280,
-    .default_fb_max_direct_h = 720,
-    .max_direct_bytes = KITTY_MAX_DIRECT_BYTES_DEFAULT,
-    .af_max_coverage = 0.40f,
-    .af_max_pixels = KITTY_AF_MAX_PX_DEFAULT,
-    .keys_on_stdin = true,
-    .silent_af_ok = false, /* Kitty replies Gi=…[,r=N];OK */
-    .ignore_ioctl_pixels = false,
-    .direct_af_when_shm = true, /* a=f t=d edits root of SHM-placed image */
-    /* Override tunables: Kitty ignores APC > MAX_ESCAPE_CODE_LENGTH (256KiB). */
-    .shm_unlink_after_send = false,
-    .place_cells = true,
-    .pingpong = false,
-    .fb_diff = true,
-    .apc_chunk_bytes = 261888, /* 262144 - header/ST headroom */
-    .tty_pending_max = 4096,
-};
-
-static const KITTY_TerminalProfile KITTY_profile_ghostty = {
-    .kind = KITTY_TERM_GHOSTTY,
-    .name = "ghostty",
-    .prefer_direct = false,
-    .prefer_zlib = false,
-    .force_transmit = NULL,
-    .default_fb_max_w = 1920,
-    .default_fb_max_h = 1080,
-    /* App SHM on; APC kitty max 65MiB; keep direct soft-max lower for fallback. */
-    .default_fb_max_shm_w = 1920,
-    .default_fb_max_shm_h = 1080,
-    .default_fb_max_direct_w = 1280,
-    .default_fb_max_direct_h = 720,
-    .max_direct_bytes = KITTY_MAX_DIRECT_BYTES_DEFAULT,
-    .af_max_coverage = 0.40f,
-    .af_max_pixels = KITTY_AF_MAX_PX_DEFAULT,
-    .keys_on_stdin = true,
-    /* 1.3.1: a=f unimplemented ("ERROR: unimplemented action"); tip #13943 adds it. */
-    .silent_af_ok = false,
-    .ignore_ioctl_pixels = false,
-    .direct_af_when_shm = false,
-    KITTY_PROFILE_TUNABLES
-};
-
-static const KITTY_TerminalProfile KITTY_profile_wezterm = {
-    .kind = KITTY_TERM_WEZTERM,
-    .name = "wezterm",
-    /* macOS SHM t=s broken (seek/read ENXIO) until wezterm#8063. */
-    .prefer_direct = true,
-    .prefer_zlib = true,
-    .force_transmit = NULL,
-    .default_fb_max_w = 1280,
-    .default_fb_max_h = 720,
-    /* No macOS SHM; a=f display broken (#8281) → zlib full a=T; MAX_IMAGE_SIZE 100MB. */
-    .default_fb_max_shm_w = 0,
-    .default_fb_max_shm_h = 0,
-    .default_fb_max_direct_w = 1280,
-    .default_fb_max_direct_h = 720,
-    .max_direct_bytes = KITTY_MAX_DIRECT_BYTES_DEFAULT,
-    .af_max_coverage = 0.40f,
-    .af_max_pixels = KITTY_AF_MAX_PX_DEFAULT,
-    .keys_on_stdin = true,
-    /* a=f edits pixels but ImageData.hash is creation-time only → GPU stale. */
-    .silent_af_ok = false,
-    .ignore_ioctl_pixels = false,
-    .direct_af_when_shm = false,
-    /* dirty_at crashes WezTerm 20240203 (assign_image_to_cells overflow). */
-    .dirty_at_overlays = false,
-    KITTY_PROFILE_TUNABLES
-};
-
-static const KITTY_TerminalProfile KITTY_profile_unknown = {
+static const KITTY_TerminalProfile KITTY_profile_seed = {
     .kind = KITTY_TERM_UNKNOWN,
     .name = "unknown",
+    .rows = "",
+    .version = "",
+    .recognised_by = "",
+    .facts = {
+        .placeholders = KITTY_FACT_UNKNOWN,
+        .frame_edit = KITTY_FACT_UNKNOWN,
+        .frame_edit_reply = KITTY_FACT_UNKNOWN,
+        .animation = KITTY_FACT_UNKNOWN,
+        .shm = KITTY_FACT_UNKNOWN,
+        .iterm2_gif_animation = KITTY_FACT_UNKNOWN,
+        .ioctl_pixels = KITTY_FACT_UNKNOWN,
+    },
     .prefer_direct = false,
     .prefer_zlib = false,
     .force_transmit = NULL,
@@ -165,106 +44,46 @@ static const KITTY_TerminalProfile KITTY_profile_unknown = {
     .default_fb_max_shm_h = 720,
     .default_fb_max_direct_w = 1280,
     .default_fb_max_direct_h = 720,
-    .max_direct_bytes = KITTY_MAX_DIRECT_BYTES_DEFAULT,
+    .max_direct_bytes = (size_t)1920 * 1080 * 4, /* refuse larger direct dumps */
     .af_max_coverage = 0.40f,
-    .af_max_pixels = KITTY_AF_MAX_PX_DEFAULT,
+    .af_max_pixels = (size_t)160 * 1024,
     .keys_on_stdin = true,
-    .silent_af_ok = true, /* silent a=f often means support */
+    .silent_af_ok = true, /* unknown terminal: silent a=f often means support */
+    .skip_af_probe = false,
     .ignore_ioctl_pixels = false,
     .direct_af_when_shm = false,
-    KITTY_PROFILE_TUNABLES
+    .dirty_at_overlays = false,
+    .dirty_union_at = false,
+    .upload_skip = true,
+    .coalesce_gap_px = 0,
+    .direct_fallback_max_bytes = (size_t)256 * 1024,
+    .apc_chunk_bytes = (size_t)2 * 1024 * 1024,
+    .probe_timeout_ms = 40,
+    .drain_passes = 8,
+    .drain_quiet_us = 15000,
+    .stub_winch_iters = 40,
+    .stub_winch_delay_ms = 25,
+    .stub_cols = 80,
+    .stub_rows = 24,
+    .key_hold_ms = 80,
+    .fb_diff = true,
+    .fb_diff_tile = 32,
+    .fb_diff_cover = 0.45f,
+    .tty_pending_max = 4096,
+    .window_fallback_w = 640,
+    .window_fallback_h = 480,
+    .place_cells = true,
+    .pingpong = false,
+    .shm_unlink_after_send = false,
+    .notes = NULL
 };
 
 /*
- * Declared in SDL_kittyprofile_load.c: TOML-backed detect, lazy load, and
- * human-readable source string for the active profile table.
- */
-extern const KITTY_TerminalProfile *KITTY_DetectLoadedTerminalProfile(void);
-extern void KITTY_EnsureTerminalProfilesLoaded(void);
-extern const char *KITTY_TerminalProfilesSource(void);
-
-/*
- * Map TERM_PROGRAM (rex/kitty/ghostty/WezTerm) or TERM=xterm-kitty to a
- * builtin profile pointer. Unrecognized → KITTY_profile_unknown.
- */
-static const KITTY_TerminalProfile *KITTY_DetectBuiltinTerminalProfile(void)
-{
-    const char *tp = SDL_getenv("TERM_PROGRAM");
-    const char *term = SDL_getenv("TERM");
-
-    if (tp && *tp) {
-        if (SDL_strcasecmp(tp, "rex") == 0) {
-            return &KITTY_profile_rex;
-        }
-        if (SDL_strcasecmp(tp, "kitty") == 0) {
-            return &KITTY_profile_kitty;
-        }
-        if (SDL_strcasecmp(tp, "ghostty") == 0) {
-            return &KITTY_profile_ghostty;
-        }
-        if (SDL_strcasecmp(tp, "WezTerm") == 0 || SDL_strcasecmp(tp, "wezterm") == 0) {
-            return &KITTY_profile_wezterm;
-        }
-    }
-
-    /* Kitty.app often leaves TERM_PROGRAM unset but sets TERM=xterm-kitty. */
-    if ((!tp || !*tp) && term && SDL_strcmp(term, "xterm-kitty") == 0) {
-        return &KITTY_profile_kitty;
-    }
-
-    return &KITTY_profile_unknown;
-}
-
-/*
- * Ensure TOML profiles are loaded, return a loaded matcher hit if any,
- * otherwise the builtin env heuristic profile. Never NULL.
- */
-const KITTY_TerminalProfile *KITTY_DetectTerminalProfile(void)
-{
-    const KITTY_TerminalProfile *loaded;
-
-    KITTY_EnsureTerminalProfilesLoaded();
-    loaded = KITTY_DetectLoadedTerminalProfile();
-    if (loaded) {
-        return loaded;
-    }
-    return KITTY_DetectBuiltinTerminalProfile();
-}
-
-/*
- * Builtin [defaults]-shaped seed for the TOML loader (unknown profile).
+ * The seed profile (SDL_kittyprofile_load.c copies it before overlaying).
  */
 const KITTY_TerminalProfile *KITTY_BuiltinDefaultsProfile(void)
 {
-    return &KITTY_profile_unknown;
-}
-
-/*
- * True if TERM_PROGRAM is a known Kitty-protocol host, KITTY_WINDOW_ID is
- * set, or TERM contains "kitty"/"ghostty".
- */
-bool KITTY_BuiltinEnvLooksLikeKittyHost(void)
-{
-    const char *term_program = SDL_getenv("TERM_PROGRAM");
-    const char *term;
-
-    if (term_program && *term_program) {
-        if (SDL_strcasecmp(term_program, "kitty") == 0 ||
-            SDL_strcasecmp(term_program, "ghostty") == 0 ||
-            SDL_strcasecmp(term_program, "WezTerm") == 0 ||
-            SDL_strcasecmp(term_program, "wezterm") == 0 ||
-            SDL_strcasecmp(term_program, "rex") == 0) {
-            return true;
-        }
-    }
-    if (SDL_getenv("KITTY_WINDOW_ID") != NULL) {
-        return true;
-    }
-    term = SDL_getenv("TERM");
-    if (term && (SDL_strstr(term, "kitty") || SDL_strstr(term, "ghostty"))) {
-        return true;
-    }
-    return false;
+    return &KITTY_profile_seed;
 }
 
 #endif /* SDL_VIDEO_DRIVER_KITTY || KITTY_PROFILE_STANDALONE */

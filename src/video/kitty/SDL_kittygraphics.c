@@ -341,7 +341,8 @@ done:
 
 /*
  * Return true when stdout is a tty and the host looks like a Kitty-protocol
- * terminal (SDL_HINT_VIDEO_DRIVER, loaded profile match, or builtin env).
+ * terminal (SDL_HINT_VIDEO_DRIVER, or the environment names a terminal in
+ * terminals.toml).
  */
 bool KITTY_ProbeSupport(void)
 {
@@ -358,11 +359,8 @@ bool KITTY_ProbeSupport(void)
         return true;
     }
 
-    /* Prefer matchers from loaded profiles (config/terminals.toml). */
-    if (KITTY_EnvMatchesLoadedProfile()) {
-        return true;
-    }
-    return KITTY_BuiltinEnvLooksLikeKittyHost();
+    /* The environment names a terminal in terminals.toml. */
+    return KITTY_EnvMatchesLoadedProfile();
 }
 
 /*
@@ -1101,13 +1099,15 @@ bool KITTY_SetupTerminal(SDL_VideoData *data)
     /* Viewport ASCII chrome is drawn after QueryTerminalSize / stub WINCH
      * wait in VideoInit, and again on resize replace. */
     data->kitty_keyboard_ok = KITTY_ProbeKittyKeyboard(data);
-    if (!data->kitty_keyboard_ok && data->term_profile && data->term_profile->name &&
-        SDL_strcasecmp(data->term_profile->name, "wezterm") == 0) {
-        /* Always warn (not RUNTIME_DEBUG): games need press/release. */
+    if (!data->kitty_keyboard_ok && data->term_profile &&
+        data->term_profile->facts.keyboard_config[0]) {
+        /* keyboard.kitty_protocol_config: the terminal needs configuring.
+         * Always warn (not RUNTIME_DEBUG): games need press/release. */
         SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
-                    "kitty: WezTerm kitty keyboard inactive (CSI ? u unanswered). "
-                    "Set enable_kitty_keyboard = true in wezterm.lua for "
-                    "press/release keys; until then arrow holds use OS key-repeat.");
+                    "kitty: kitty keyboard inactive (CSI ? u unanswered). "
+                    "Set %s for press/release keys; until then arrow holds "
+                    "use OS key-repeat.",
+                    data->term_profile->facts.keyboard_config);
     }
 #ifdef SDL_KITTY_RUNTIME_DEBUG
     if (KITTY_DebugEnabled()) {
