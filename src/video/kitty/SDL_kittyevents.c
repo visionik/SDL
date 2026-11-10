@@ -1036,6 +1036,17 @@ void KITTY_PumpEvents(SDL_VideoDevice *_this)
     }
 
     if (data->got_winch) {
+        if (data->resize_settle_ms == 0) {
+            KITTY_HandleWinch(_this);
+        } else {
+            /* Each SIGWINCH restarts the settle clock (drag in progress). */
+            data->got_winch = 0;
+            data->winch_pending = true;
+            data->winch_at_ms = SDL_GetTicks();
+        }
+    }
+    if (data->winch_pending && SDL_GetTicks() - data->winch_at_ms >= data->resize_settle_ms) {
+        data->winch_pending = false;
         KITTY_HandleWinch(_this);
     }
 
