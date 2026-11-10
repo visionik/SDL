@@ -323,6 +323,40 @@ static SDL_Scancode KITTY_AsciiToScancode(unsigned char c)
     case 0x7f:
     case 0x08:
         return SDL_SCANCODE_BACKSPACE;
+    /* Punctuation, shifted or not, by its key on a US layout. */
+    case '-':
+    case '_':
+        return SDL_SCANCODE_MINUS;
+    case '=':
+    case '+':
+        return SDL_SCANCODE_EQUALS;
+    case '[':
+    case '{':
+        return SDL_SCANCODE_LEFTBRACKET;
+    case ']':
+    case '}':
+        return SDL_SCANCODE_RIGHTBRACKET;
+    case '\\':
+    case '|':
+        return SDL_SCANCODE_BACKSLASH;
+    case ';':
+    case ':':
+        return SDL_SCANCODE_SEMICOLON;
+    case '\'':
+    case '"':
+        return SDL_SCANCODE_APOSTROPHE;
+    case ',':
+    case '<':
+        return SDL_SCANCODE_COMMA;
+    case '.':
+    case '>':
+        return SDL_SCANCODE_PERIOD;
+    case '/':
+    case '?':
+        return SDL_SCANCODE_SLASH;
+    case '`':
+    case '~':
+        return SDL_SCANCODE_GRAVE;
     default:
         return SDL_SCANCODE_UNKNOWN;
     }
@@ -359,7 +393,7 @@ static SDL_Keymod KITTY_ModsToSDL(unsigned mods_field)
 
 /*
  * Map Kitty CSI-u codepoint / functional PUA code to SDL_Scancode.
- * Covers ASCII letters/digits, arrows, locks, menu, modifiers (flag 8),
+ * Covers ASCII letters/digits/punctuation, arrows, locks, menu, modifiers (flag 8),
  * and F13–F24 PUA range. F1–F12 often arrive via legacy CSI instead.
  */
 static SDL_Scancode KITTY_CodeToScancode(unsigned code)
@@ -377,6 +411,29 @@ static SDL_Scancode KITTY_CodeToScancode(unsigned code)
         return SDL_SCANCODE_0;
     }
     switch (code) {
+    /* Punctuation: the Kitty protocol reports the unshifted key's codepoint (US layout positions). */
+    case '-':
+        return SDL_SCANCODE_MINUS;
+    case '=':
+        return SDL_SCANCODE_EQUALS;
+    case '[':
+        return SDL_SCANCODE_LEFTBRACKET;
+    case ']':
+        return SDL_SCANCODE_RIGHTBRACKET;
+    case '\\':
+        return SDL_SCANCODE_BACKSLASH;
+    case ';':
+        return SDL_SCANCODE_SEMICOLON;
+    case '\'':
+        return SDL_SCANCODE_APOSTROPHE;
+    case ',':
+        return SDL_SCANCODE_COMMA;
+    case '.':
+        return SDL_SCANCODE_PERIOD;
+    case '/':
+        return SDL_SCANCODE_SLASH;
+    case '`':
+        return SDL_SCANCODE_GRAVE;
     case 27:
         return SDL_SCANCODE_ESCAPE;
     case 13:
