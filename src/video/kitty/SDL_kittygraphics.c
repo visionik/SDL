@@ -1371,6 +1371,15 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
     }
 }
 
+bool KITTY_EditsCompressed(const SDL_VideoData *vdata)
+{
+    const char *z = SDL_getenv("SDL_KITTY_AF_ZLIB");
+    if (z && (z[0] == '0' || z[0] == '1') && z[1] == '\0') {
+        return z[0] == '1';
+    }
+    return vdata && vdata->term_profile && vdata->term_profile->af_zlib;
+}
+
 /*
  * Edit root frame (r=1) in place with packed RGB/RGBA for rectangle
  * x,y,s,v (Kitty a=f, t=d only). Chunked base64; does not home or re-place.
@@ -1414,12 +1423,10 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
         }
     }
 
-    /* SDL_KITTY_AF_ZLIB=1: compress the edit (o=z), as full a=T does with prefer_zlib. A desktop's
-     * changed rectangles are mostly text and flat colour, which zlib shrinks several times over. */
-    {
-        const char *z = SDL_getenv("SDL_KITTY_AF_ZLIB");
-        zlib_edit = z && z[0] == '1';
-    }
+    /* Compress the edit (o=z) where the terminal shows compressed edits, as full a=T does with
+     * prefer_zlib. A desktop's changed rectangles are mostly text and flat colour, which zlib shrinks
+     * several times over. */
+    zlib_edit = KITTY_EditsCompressed(vdata);
     if (zlib_edit) {
         uLongf out_len = compressBound((uLong)payload_len);
         compressed = (Uint8 *)SDL_malloc(out_len);

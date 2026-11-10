@@ -107,6 +107,16 @@ void KITTY_RestoreTerminal(SDL_VideoData *data);
 bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, int w, int h, int kitty_f);
 
 /*
+ * Whether a=f edits go compressed (o=z): SDL_KITTY_AF_ZLIB=1 or 0 if set, else
+ * the profile's af_zlib (kitty.frame_edit_zlib, or tuning).
+ */
+bool KITTY_EditsCompressed(const SDL_VideoData *vdata);
+
+/* The window property apps read to see whether edits go compressed (as
+ * KITTY_EditsCompressed decided when the window was made). */
+#define KITTY_PROP_WINDOW_AF_ZLIB "SDL.window.kitty.af_zlib"
+
+/*
  * Edit root frame (r=1) in place with packed pixels for rectangle
  * x,y,s,v (Kitty a=f, t=d only). Does not home or re-place.
  */

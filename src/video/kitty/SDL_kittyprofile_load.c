@@ -304,6 +304,7 @@ static const KITTY_FactKey KITTY_fact_keys[] = {
     { "kitty.placeholders", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, placeholders), 0 },
     { "kitty.frame_edit", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, frame_edit), 0 },
     { "kitty.frame_edit_reply", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, frame_edit_reply), 0 },
+    { "kitty.frame_edit_zlib", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, frame_edit_zlib), 0 },
     { "kitty.animation", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, animation), 0 },
     { "kitty.shm", KITTY_FACT_BOOL, offsetof(KITTY_TerminalFacts, shm), 0 },
     { "kitty.max_escape_bytes", KITTY_FACT_SIZE, offsetof(KITTY_TerminalFacts, max_escape_bytes), 0 },
@@ -322,6 +323,7 @@ static void KITTY_FactsUnknown(KITTY_TerminalFacts *f)
     f->placeholders = KITTY_FACT_UNKNOWN;
     f->frame_edit = KITTY_FACT_UNKNOWN;
     f->frame_edit_reply = KITTY_FACT_UNKNOWN;
+    f->frame_edit_zlib = KITTY_FACT_UNKNOWN;
     f->animation = KITTY_FACT_UNKNOWN;
     f->shm = KITTY_FACT_UNKNOWN;
     f->iterm2_gif_animation = KITTY_FACT_UNKNOWN;
@@ -941,6 +943,9 @@ static void KITTY_OverlayTuning(KITTY_TerminalProfile *p, toml_datum_t tab)
     if (KITTY_TomlGetFloat(tab, "af_max_coverage", &fp)) {
         p->af_max_coverage = (float)fp;
     }
+    if (KITTY_TomlGetBool(tab, "af_zlib", &b)) {
+        p->af_zlib = b;
+    }
     if (KITTY_TomlGetInt(tab, "af_max_pixels", &i64) && i64 > 0) {
         p->af_max_pixels = (size_t)i64;
     }
@@ -1253,6 +1258,9 @@ static void KITTY_ApplyFacts(KITTY_TerminalProfile *p)
     }
     if (f->shm == KITTY_FACT_NO) {
         p->prefer_direct = true;
+    }
+    if (f->frame_edit_zlib != KITTY_FACT_UNKNOWN) {
+        p->af_zlib = (f->frame_edit_zlib == KITTY_FACT_YES);
     }
     if (f->frame_edit == KITTY_FACT_NO) {
         p->skip_af_probe = true;
