@@ -108,6 +108,14 @@ bool KITTY_PlaceCellsTouchesEdge(int col0, int row0, int place_cols, int place_r
                                  int cols, int rows);
 
 /*
+ * The largest box of cells with the FB's aspect ratio, centred in a cols×rows
+ * grid of cell_w×cell_h pixel cells (SDL_KITTY_PLACE_ASPECT). Writes a 1-based
+ * origin and size in cells. False (outputs untouched) on non-positive input.
+ */
+bool KITTY_FitAspectCells(int cols, int rows, int cell_w, int cell_h, int fb_w, int fb_h,
+                          int *out_col, int *out_row, int *out_cols, int *out_rows);
+
+/*
  * Tile memcmp of prev vs next tightly packed RGB/RGBA frames (bpp 3 or 4).
  * dirty_out gets the changed-tile bbox when RECT/FULL. cover_limit: if bbox
  * coverage >= limit → FULL. NONE when identical; FULL on bad args.

@@ -30,6 +30,7 @@
 #include "SDL_kittygraphics.h"
 #include "SDL_kittyprobe.h"
 #include "SDL_kittyprofile.h"
+#include "SDL_kittyrect.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -492,7 +493,38 @@ static void KITTY_UpdateMouseCoordSpace(SDL_VideoData *data)
  * SDL_KITTY_FB_MAX=W[xH] — aspect-fit into a max box (e.g. 800 or 800x600).
  * Unset → transport-aware profile soft-max (shm vs direct; docs/terminals.md).
  */
+static void KITTY_ApplyFramebufferCapInner(SDL_VideoData *data);
+
+/*
+ * SDL_KITTY_PLACE_ASPECT: set the live viewport to the centred aspect-fit box
+ * for the current grid, cell size and FB. An explicit SDL_KITTY_VIEWPORT wins.
+ */
+static void KITTY_FitAspectViewport(SDL_VideoData *data)
+{
+    int col, row, c, r;
+
+    if (!data->place_aspect || !data->place_cells || data->vp_cols_req > 0) {
+        return;
+    }
+    if (KITTY_FitAspectCells(data->cols, data->rows, data->cell_w, data->cell_h,
+                             data->pixel_w, data->pixel_h, &col, &row, &c, &r)) {
+        data->vp_col = col;
+        data->vp_row = row;
+        data->vp_cols = c;
+        data->vp_rows = r;
+    }
+}
+
 void KITTY_ApplyFramebufferCap(SDL_VideoData *data)
+{
+    if (!data) {
+        return;
+    }
+    KITTY_ApplyFramebufferCapInner(data);
+    KITTY_FitAspectViewport(data);
+}
+
+static void KITTY_ApplyFramebufferCapInner(SDL_VideoData *data)
 {
     const char *fixed;
     const char *env;
@@ -634,6 +666,13 @@ void KITTY_ApplyViewportEnv(SDL_VideoData *data)
             SDL_strcasecmp(leave, "no") != 0) {
             data->leave_images = true;
         }
+    }
+    {
+        const char *aspect = SDL_getenv("SDL_KITTY_PLACE_ASPECT");
+        data->place_aspect = aspect && *aspect && aspect[0] != '0' &&
+                             SDL_strcasecmp(aspect, "false") != 0 &&
+                             SDL_strcasecmp(aspect, "off") != 0 &&
+                             SDL_strcasecmp(aspect, "no") != 0;
     }
     {
         const char *chrome = SDL_getenv("SDL_KITTY_CARD_CHROME");
