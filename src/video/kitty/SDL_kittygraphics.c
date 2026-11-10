@@ -1371,6 +1371,15 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
     }
 }
 
+bool KITTY_EditsCompressed(const SDL_VideoData *vdata)
+{
+    const char *z = SDL_getenv("SDL_KITTY_AF_ZLIB");
+    if (z && (z[0] == '0' || z[0] == '1') && z[1] == '\0') {
+        return z[0] == '1';
+    }
+    return vdata && vdata->term_profile && vdata->term_profile->af_zlib;
+}
+
 /*
  * Edit root frame (r=1) in place with packed RGB/RGBA for rectangle
  * x,y,s,v (Kitty a=f, t=d only). Chunked base64; does not home or re-place.
@@ -1385,6 +1394,10 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     size_t encoded;
     size_t offset = 0;
     bool first = true;
+    bool zlib_edit;
+    Uint8 *compressed = NULL;
+    const Uint8 *body = packed_rgb;
+    size_t body_len = payload_len;
 
     if (kitty_f != 24 && kitty_f != 32) {
         kitty_f = 24;
@@ -1410,12 +1423,32 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
         }
     }
 
-    b64_len = ((payload_len + 2) / 3) * 4;
+    /* Compress the edit (o=z) where the terminal shows compressed edits, as full a=T does with
+     * prefer_zlib. A desktop's changed rectangles are mostly text and flat colour, which zlib shrinks
+     * several times over. */
+    zlib_edit = KITTY_EditsCompressed(vdata);
+    if (zlib_edit) {
+        uLongf out_len = compressBound((uLong)payload_len);
+        compressed = (Uint8 *)SDL_malloc(out_len);
+        if (!compressed) {
+            return false;
+        }
+        if (compress2(compressed, &out_len, packed_rgb, (uLong)payload_len, Z_BEST_SPEED) != Z_OK) {
+            SDL_free(compressed);
+            return SDL_SetError("zlib compress2 failed for a=f");
+        }
+        body = compressed;
+        body_len = (size_t)out_len;
+    }
+
+    b64_len = ((body_len + 2) / 3) * 4;
     b64 = (char *)SDL_malloc(b64_len + 1);
     if (!b64) {
+        SDL_free(compressed);
         return false;
     }
-    encoded = KITTY_Base64Encode(packed_rgb, payload_len, b64, b64_len + 1);
+    encoded = KITTY_Base64Encode(body, body_len, b64, b64_len + 1);
+    SDL_free(compressed);
     if (encoded == 0) {
         SDL_free(b64);
         return SDL_SetError("base64 encode failed");
@@ -1438,15 +1471,10 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
             more = (offset + chunk < encoded) ? 1 : 0;
             if (first) {
                 /* r=1 edits root; X=1 overwrite; q=2 quiet (no APC OK). */
-                if (more) {
-                    header_len = SDL_snprintf(header, sizeof(header),
-                                              "\033_Ga=f,f=%d,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2,m=1;",
-                                              kitty_f, (unsigned)image_id, x, y, rw, rh);
-                } else {
-                    header_len = SDL_snprintf(header, sizeof(header),
-                                              "\033_Ga=f,f=%d,t=d,i=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
-                                              kitty_f, (unsigned)image_id, x, y, rw, rh);
-                }
+                header_len = SDL_snprintf(header, sizeof(header),
+                                          "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2%s;",
+                                          kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id, x, y, rw, rh,
+                                          more ? ",m=1" : "");
                 first = false;
             } else {
                 header_len = SDL_snprintf(header, sizeof(header), "\033_Ga=f,m=%d;", more);

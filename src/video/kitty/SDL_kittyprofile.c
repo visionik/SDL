@@ -30,6 +30,7 @@ static const KITTY_TerminalProfile KITTY_profile_seed = {
         .placeholders = KITTY_FACT_UNKNOWN,
         .frame_edit = KITTY_FACT_UNKNOWN,
         .frame_edit_reply = KITTY_FACT_UNKNOWN,
+        .frame_edit_zlib = KITTY_FACT_UNKNOWN,
         .animation = KITTY_FACT_UNKNOWN,
         .shm = KITTY_FACT_UNKNOWN,
         .iterm2_gif_animation = KITTY_FACT_UNKNOWN,
@@ -47,6 +48,7 @@ static const KITTY_TerminalProfile KITTY_profile_seed = {
     .max_direct_bytes = (size_t)1920 * 1080 * 4, /* refuse larger direct dumps */
     .af_max_coverage = 0.40f,
     .af_max_pixels = (size_t)160 * 1024,
+    .af_zlib = false,
     .keys_on_stdin = true,
     .silent_af_ok = true, /* unknown terminal: silent a=f often means support */
     .skip_af_probe = false,

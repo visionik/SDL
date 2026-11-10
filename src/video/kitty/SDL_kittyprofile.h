@@ -56,6 +56,7 @@ typedef struct KITTY_TerminalFacts
     KITTY_Fact placeholders;      /* kitty.placeholders */
     KITTY_Fact frame_edit;        /* kitty.frame_edit: a=f shows on screen */
     KITTY_Fact frame_edit_reply;  /* kitty.frame_edit_reply: answers a=f */
+    KITTY_Fact frame_edit_zlib;   /* kitty.frame_edit_zlib: a=f with o=z shows */
     KITTY_Fact animation;         /* kitty.animation */
     KITTY_Fact shm;               /* kitty.shm: t=s works */
     size_t max_escape_bytes;      /* kitty.max_escape_bytes; 0 = unknown */
@@ -120,6 +121,10 @@ typedef struct KITTY_TerminalProfile
     /* Skip a=f (use full a=T) when dirty coverage or pixel count exceeds. */
     float af_max_coverage;
     size_t af_max_pixels;
+
+    /* Compress a=f edits (o=z). From kitty.frame_edit_zlib when that's known;
+     * else tuning (off). SDL_KITTY_AF_ZLIB=0/1 wins. */
+    bool af_zlib;
 
     /* Read keyboard from stdin (Rex delivers keys on fd0 only). */
     bool keys_on_stdin;
