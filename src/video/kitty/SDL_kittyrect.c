@@ -238,6 +238,47 @@ bool KITTY_PlaceCellsTouchesEdge(int col0, int row0, int place_cols, int place_r
     return false;
 }
 
+bool KITTY_FitAspectCells(int cols, int rows, int cell_w, int cell_h, int fb_w, int fb_h,
+                          int *out_col, int *out_row, int *out_cols, int *out_rows)
+{
+    double aspect;
+    int c, r;
+
+    if (cols <= 0 || rows <= 0 || cell_w <= 0 || cell_h <= 0 || fb_w <= 0 || fb_h <= 0) {
+        return false;
+    }
+    aspect = (double)fb_w / (double)fb_h;
+    /* Full width first; if that is too tall, full height. */
+    c = cols;
+    r = (int)((double)c * cell_w / aspect / cell_h + 0.5);
+    if (r > rows) {
+        r = rows;
+        c = (int)((double)r * cell_h * aspect / cell_w + 0.5);
+        if (c > cols) {
+            c = cols;
+        }
+    }
+    if (c < 1) {
+        c = 1;
+    }
+    if (r < 1) {
+        r = 1;
+    }
+    if (out_col) {
+        *out_col = (cols - c) / 2 + 1;
+    }
+    if (out_row) {
+        *out_row = (rows - r) / 2 + 1;
+    }
+    if (out_cols) {
+        *out_cols = c;
+    }
+    if (out_rows) {
+        *out_rows = r;
+    }
+    return true;
+}
+
 /*
  * Clip in[] to the FB, then iteratively union pairs whose gap_px-expanded
  * boxes intersect (tmp cap 64). If more than max_out remain, collapse to

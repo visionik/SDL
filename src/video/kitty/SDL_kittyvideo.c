@@ -149,6 +149,11 @@ static SDL_VideoDevice *KITTY_CreateDevice(void)
         }
     }
     KITTY_ApplyViewportEnv(data);
+    {
+        const char *settle = SDL_getenv("SDL_KITTY_RESIZE_SETTLE_MS");
+        const long ms = (settle && *settle) ? SDL_strtol(settle, NULL, 10) : 0;
+        data->resize_settle_ms = ms > 0 ? (Uint32)ms : 0;
+    }
     device->internal = data;
 
     device->VideoInit = KITTY_VideoInit;

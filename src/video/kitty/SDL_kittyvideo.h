@@ -82,6 +82,10 @@ typedef struct SDL_VideoData
      * vp_cols/vp_rows > 0 enables. Place uses this c×r; CUP to (vp_row,vp_col).
      * *_req are the env values; ClampViewport copies them then fits the grid so
      * a stub 80×24 ioctl cannot permanently shrink a taller card across WINCH. */
+    /* SDL_KITTY_PLACE_ASPECT=1: with place_cells and no VIEWPORT, place the FB
+     * in the largest centred cell box with its aspect (letterbox), refit on
+     * every size change, instead of stretching it over the whole pane. */
+    bool place_aspect;
     int vp_col_req;
     int vp_row_req;
     int vp_cols_req;
@@ -111,6 +115,12 @@ typedef struct SDL_VideoData
     SDL_Window *focus_window;
     bool focus_announced; /* SetKeyboardFocus once from first PumpEvents (deferred from CreateWindow) */
     volatile sig_atomic_t got_winch;
+    /* SDL_KITTY_RESIZE_SETTLE_MS: handle a resize only once no SIGWINCH has
+     * arrived for this long, so dragging a divider refits once, not at every
+     * step. 0 (default) handles each at the next pump. */
+    Uint32 resize_settle_ms;
+    bool winch_pending;
+    Uint64 winch_at_ms;
     unsigned char tty_pending[KITTY_TTY_PENDING_MAX];
     size_t tty_pending_len;
     /* Perf counters (SDL_KITTY_DEBUG present lines + kitty_perf_summary.py). */
