@@ -1454,6 +1454,155 @@ bool KITTY_ConvertSurfaceRectToRGBA(SDL_Surface *surface, const SDL_Rect *rect, 
 }
 
 /*
+ * Convert a clipped surface rect into rgb_scratch in-place, detecting whether
+ * any pixel actually changed. Leaves unchanged 16-pixel chunks read-only and
+ * switches to write-only NEON conversion on the remainder once a change is seen.
+ */
+bool KITTY_ConvertSurfaceRectCheckChanged(SDL_Surface *surface, const SDL_Rect *rect,
+                                          Uint8 *rgb_scratch, bool use_rgba,
+                                          bool *out_changed)
+{
+    SDL_Rect fb, area;
+    const size_t bpp = use_rgba ? 4u : 3u;
+    const size_t src_stride = surface ? (size_t)surface->pitch : 0u;
+    const size_t dst_stride = surface ? (size_t)surface->w * bpp : 0u;
+    const Uint8 *src_row;
+    Uint8 *dst_row;
+    bool changed = false;
+    int y;
+
+    if (out_changed) {
+        *out_changed = false;
+    }
+    if (!surface || !rgb_scratch || !rect || surface->w <= 0 || surface->h <= 0) {
+        return false;
+    }
+    fb.x = 0;
+    fb.y = 0;
+    fb.w = surface->w;
+    fb.h = surface->h;
+    if (!SDL_GetRectIntersection(rect, &fb, &area) || area.w <= 0 || area.h <= 0) {
+        return false;
+    }
+
+    src_row = (const Uint8 *)surface->pixels + (size_t)area.y * src_stride + (size_t)area.x * 4u;
+    dst_row = rgb_scratch + ((size_t)area.y * (size_t)surface->w + (size_t)area.x) * bpp;
+
+    for (y = 0; y < area.h; ++y) {
+        const Uint32 *src = (const Uint32 *)src_row;
+        Uint8 *dst = dst_row;
+        if (changed) {
+            if (use_rgba) {
+                KITTY_ConvertRowRGBA(src, dst, area.w);
+            } else {
+                KITTY_ConvertRowRGB(src, dst, area.w);
+            }
+        } else if (!use_rgba) {
+            int x = 0;
+#ifdef KITTY_HAVE_NEON_LE
+            for (; x + 16 <= area.w; x += 16) {
+                const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
+                const uint8x16x3_t old = vld3q_u8(dst);
+                const uint8x16_t d = vorrq_u8(
+                    vorrq_u8(veorq_u8(bgra.val[2], old.val[0]),
+                             veorq_u8(bgra.val[1], old.val[1])),
+                    veorq_u8(bgra.val[0], old.val[2]));
+                if (vmaxvq_u32(vreinterpretq_u32_u8(d)) != 0) {
+                    uint8x16x3_t rgb;
+                    rgb.val[0] = bgra.val[2];
+                    rgb.val[1] = bgra.val[1];
+                    rgb.val[2] = bgra.val[0];
+                    vst3q_u8(dst, rgb);
+                    changed = true;
+                    x += 16;
+                    dst += 48;
+                    break;
+                }
+                dst += 48;
+            }
+#endif
+            if (!changed) {
+                for (; x < area.w; ++x) {
+                    const Uint32 p = src[x];
+                    const Uint8 r = (Uint8)((p >> 16) & 0xFF);
+                    const Uint8 g = (Uint8)((p >> 8) & 0xFF);
+                    const Uint8 b = (Uint8)(p & 0xFF);
+                    if (dst[0] != r || dst[1] != g || dst[2] != b) {
+                        dst[0] = r;
+                        dst[1] = g;
+                        dst[2] = b;
+                        changed = true;
+                        x++;
+                        dst += 3;
+                        break;
+                    }
+                    dst += 3;
+                }
+            }
+            if (changed && x < area.w) {
+                KITTY_ConvertRowRGB(src + x, dst, area.w - x);
+            }
+        } else {
+            int x = 0;
+#ifdef KITTY_HAVE_NEON_LE
+            for (; x + 16 <= area.w; x += 16) {
+                const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
+                const uint8x16x4_t old = vld4q_u8(dst);
+                const uint8x16_t d = vorrq_u8(
+                    vorrq_u8(veorq_u8(bgra.val[2], old.val[0]),
+                             veorq_u8(bgra.val[1], old.val[1])),
+                    vorrq_u8(veorq_u8(bgra.val[0], old.val[2]),
+                             veorq_u8(bgra.val[3], old.val[3])));
+                if (vmaxvq_u32(vreinterpretq_u32_u8(d)) != 0) {
+                    uint8x16x4_t rgba;
+                    rgba.val[0] = bgra.val[2];
+                    rgba.val[1] = bgra.val[1];
+                    rgba.val[2] = bgra.val[0];
+                    rgba.val[3] = bgra.val[3];
+                    vst4q_u8(dst, rgba);
+                    changed = true;
+                    x += 16;
+                    dst += 64;
+                    break;
+                }
+                dst += 64;
+            }
+#endif
+            if (!changed) {
+                for (; x < area.w; ++x) {
+                    const Uint32 p = src[x];
+                    const Uint8 r = (Uint8)((p >> 16) & 0xFF);
+                    const Uint8 g = (Uint8)((p >> 8) & 0xFF);
+                    const Uint8 b = (Uint8)(p & 0xFF);
+                    const Uint8 a = (Uint8)((p >> 24) & 0xFF);
+                    if (dst[0] != r || dst[1] != g || dst[2] != b || dst[3] != a) {
+                        dst[0] = r;
+                        dst[1] = g;
+                        dst[2] = b;
+                        dst[3] = a;
+                        changed = true;
+                        x++;
+                        dst += 4;
+                        break;
+                    }
+                    dst += 4;
+                }
+            }
+            if (changed && x < area.w) {
+                KITTY_ConvertRowRGBA(src + x, dst, area.w - x);
+            }
+        }
+        src_row += src_stride;
+        dst_row += dst_stride;
+    }
+
+    if (out_changed) {
+        *out_changed = changed;
+    }
+    return true;
+}
+
+/*
  * Copy a clipped rect from a full-frame RGBA32 scratch into tightly packed
  * out (rw*rh*4). Fails if out_cap is too small.
  */

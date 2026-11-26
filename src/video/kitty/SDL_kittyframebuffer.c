@@ -314,11 +314,66 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         }
 
         if (convert_mode == KITTY_CONVERT_DIRTY) {
-            const bool conv_ok = use_rgba
-                                     ? KITTY_ConvertSurfaceRectToRGBA(surface, &dirty, wdata->rgb_scratch)
-                                     : KITTY_ConvertSurfaceRectToRGB(surface, &dirty, wdata->rgb_scratch);
-            if (!conv_ok) {
-                convert_mode = KITTY_CONVERT_FULL;
+            if (rects && numrects > 0) {
+                /* Convert ONLY the app-supplied dirty rects (not their bloated
+                 * union bounding box) while checking whether any pixel changed.
+                 * Leaves rgb_scratch 100% up-to-date and avoids a full-FB hash. */
+                SDL_Rect changed_rects[32];
+                int changed_n = 0;
+                bool overflow_changed = false;
+                bool any_changed = false;
+                bool any_valid = false;
+                int ri;
+                for (ri = 0; ri < numrects; ++ri) {
+                    bool rchg = false;
+                    if (KITTY_ConvertSurfaceRectCheckChanged(surface, &rects[ri],
+                                                             wdata->rgb_scratch, use_rgba, &rchg)) {
+                        any_valid = true;
+                        if (rchg) {
+                            any_changed = true;
+                            if (changed_n < (int)(sizeof(changed_rects) / sizeof(changed_rects[0]))) {
+                                changed_rects[changed_n++] = rects[ri];
+                            } else {
+                                overflow_changed = true;
+                            }
+                        }
+                    }
+                }
+                if (!any_valid) {
+                    convert_mode = KITTY_CONVERT_FULL;
+                } else if (!any_changed && wdata->placed) {
+                    /* Every pixel in every dirty rect matched rgb_scratch! */
+                    ok = true;
+                    wire_mode = KITTY_WIRE_UPLOAD_SKIP;
+                    convert_px = 0;
+                    upload_px = 0;
+                    vdata->skip_presents += 1;
+                    goto kitty_present_log;
+                } else {
+                    diff_proved_changed = true;
+                    if (!overflow_changed && changed_n > 0) {
+                        if (changed_n == 1) {
+                            dirty = changed_rects[0];
+                            multi_rects = NULL;
+                            multi_numrects = 0;
+                        } else if (changed_n <= (int)(sizeof(diff_rects) / sizeof(diff_rects[0]))) {
+                            int ci;
+                            for (ci = 0; ci < changed_n; ++ci) {
+                                diff_rects[ci] = changed_rects[ci];
+                            }
+                            multi_rects = diff_rects;
+                            multi_numrects = changed_n;
+                            KITTY_UnionRects(surface->w, surface->h, diff_rects, changed_n, &dirty);
+                        }
+                    }
+                }
+            } else {
+                const bool conv_ok = use_rgba
+                                         ? KITTY_ConvertSurfaceRectToRGBA(surface, &dirty, wdata->rgb_scratch)
+                                         : KITTY_ConvertSurfaceRectToRGB(surface, &dirty, wdata->rgb_scratch);
+                if (!conv_ok) {
+                    convert_mode = KITTY_CONVERT_FULL;
+                }
             }
         }
         if (convert_mode == KITTY_CONVERT_FULL) {

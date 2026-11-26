@@ -190,6 +190,15 @@ bool KITTY_ConvertSurfaceRectToRGB(SDL_Surface *surface, const SDL_Rect *rect, U
 bool KITTY_ConvertSurfaceRectToRGBA(SDL_Surface *surface, const SDL_Rect *rect, Uint8 *rgba_scratch);
 
 /*
+ * Convert a clipped surface rect into rgb_scratch in-place while checking
+ * whether any pixel differed from the prior scratch contents. Clean chunks
+ * remain read-only; sets *out_changed = true if any pixel changed.
+ */
+bool KITTY_ConvertSurfaceRectCheckChanged(SDL_Surface *surface, const SDL_Rect *rect,
+                                          Uint8 *rgb_scratch, bool use_rgba,
+                                          bool *out_changed);
+
+/*
  * Pack a rect from a full-frame RGB24 scratch into a tightly packed buffer
  * (rw*rh*3). out must hold at least that many bytes; out_len optional.
  */
