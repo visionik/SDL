@@ -1009,7 +1009,66 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
                 continue;
             }
 
-            for (tx_idx = 0; tx_idx < tiles_x; ++tx_idx) {
+#ifdef KITTY_HAVE_NEON_LE
+            /* Clean-row fast path: scan 64 pixels per horizontal reduction (4x fewer
+             * vmaxvq_u32 stalls & zero per-tile loop overhead) on unchanged rows. */
+            if (dirty_in_band == 0 && !use_rgba) {
+                int x = 0;
+                const Uint32 *s = row_src;
+                const Uint8 *d = row_dst;
+                bool row_diff = false;
+                for (; x + 64 <= fb_w; x += 64) {
+                    const uint8x16x4_t b0 = vld4q_u8((const uint8_t *)(s + x));
+                    const uint8x16x3_t o0 = vld3q_u8(d);
+                    const uint8x16x4_t b1 = vld4q_u8((const uint8_t *)(s + x + 16));
+                    const uint8x16x3_t o1 = vld3q_u8(d + 48);
+                    const uint8x16x4_t b2 = vld4q_u8((const uint8_t *)(s + x + 32));
+                    const uint8x16x3_t o2 = vld3q_u8(d + 96);
+                    const uint8x16x4_t b3 = vld4q_u8((const uint8_t *)(s + x + 48));
+                    const uint8x16x3_t o3 = vld3q_u8(d + 144);
+                    const uint8x16_t e0 = vorrq_u8(vorrq_u8(veorq_u8(b0.val[2], o0.val[0]),
+                                                            veorq_u8(b0.val[1], o0.val[1])),
+                                                   veorq_u8(b0.val[0], o0.val[2]));
+                    const uint8x16_t e1 = vorrq_u8(vorrq_u8(veorq_u8(b1.val[2], o1.val[0]),
+                                                            veorq_u8(b1.val[1], o1.val[1])),
+                                                   veorq_u8(b1.val[0], o1.val[2]));
+                    const uint8x16_t e2 = vorrq_u8(vorrq_u8(veorq_u8(b2.val[2], o2.val[0]),
+                                                            veorq_u8(b2.val[1], o2.val[1])),
+                                                   veorq_u8(b2.val[0], o2.val[2]));
+                    const uint8x16_t e3 = vorrq_u8(vorrq_u8(veorq_u8(b3.val[2], o3.val[0]),
+                                                            veorq_u8(b3.val[1], o3.val[1])),
+                                                   veorq_u8(b3.val[0], o3.val[2]));
+                    if (vmaxvq_u32(vreinterpretq_u32_u8(vorrq_u8(vorrq_u8(e0, e1), vorrq_u8(e2, e3)))) != 0) {
+                        row_diff = true;
+                        break;
+                    }
+                    d += 192;
+                }
+                if (!row_diff) {
+                    for (; x < fb_w; ++x) {
+                        const Uint32 p = s[x];
+                        if (d[0] != (Uint8)((p >> 16) & 0xFF) ||
+                            d[1] != (Uint8)((p >> 8) & 0xFF) ||
+                            d[2] != (Uint8)(p & 0xFF)) {
+                            row_diff = true;
+                            break;
+                        }
+                        d += 3;
+                    }
+                }
+                if (!row_diff) {
+                    continue;
+                }
+                /* Start tile loop at the tile containing the first differing pixel. */
+                tx_idx = x / tile;
+            } else {
+                tx_idx = 0;
+            }
+#else
+            tx_idx = 0;
+#endif
+
+            for (; tx_idx < tiles_x; ++tx_idx) {
                 const int tx = tx_idx * tile;
                 const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
                 const Uint32 *src = row_src + tx;
