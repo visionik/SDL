@@ -939,17 +939,19 @@ static inline void KITTY_ConvertRowRGBA(const Uint32 *src, Uint8 *dst, int count
 
 /*
  * Process one horizontal tile band [ty, ty+th): compare surface pixels
- * against rgb_scratch in-place, update changed tiles, and fill tile_dirty[].
+ * against rgb_scratch in-place, update changed tiles, and record exact
+ * changed scanline bounds per tile in tile_span[tx_idx]:
+ *   0 == clean; otherwise ((y0 << 8) | y1_excl) where 0 <= y0 < y1_excl <= th.
  * Returns number of dirty tiles in this band.
  */
 static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
                                     bool use_rgba, int fb_w, int bpp, int tile,
-                                    int tiles_x, int ty, int th, Uint8 *tile_dirty)
+                                    int tiles_x, int ty, int th, Uint16 *tile_span)
 {
     int dirty_in_band = 0;
     int row;
 
-    SDL_memset(tile_dirty, 0, (size_t)tiles_x);
+    SDL_memset(tile_span, 0, (size_t)tiles_x * sizeof(Uint16));
 
     for (row = 0; row < th; ++row) {
         const Uint32 *row_src = (const Uint32 *)((const Uint8 *)surface->pixels +
@@ -958,13 +960,22 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
         int tx_idx;
 
         if (dirty_in_band == tiles_x) {
-            /* Whole band already dirty: contiguous write-only NEON convert. */
-            if (use_rgba) {
-                KITTY_ConvertRowRGBA(row_src, row_dst, fb_w);
-            } else {
-                KITTY_ConvertRowRGB(row_src, row_dst, fb_w);
+            /* Whole band already dirty: contiguous write-only NEON convert and
+             * mark remaining band rows dirty for all tiles. */
+            for (tx_idx = 0; tx_idx < tiles_x; ++tx_idx) {
+                tile_span[tx_idx] = (Uint16)((tile_span[tx_idx] & 0xFF00u) | (Uint16)th);
             }
-            continue;
+            for (; row < th; ++row) {
+                const Uint32 *rs = (const Uint32 *)((const Uint8 *)surface->pixels +
+                                                    (size_t)(ty + row) * (size_t)surface->pitch);
+                Uint8 *rd = rgb_scratch + (size_t)(ty + row) * (size_t)fb_w * (size_t)bpp;
+                if (use_rgba) {
+                    KITTY_ConvertRowRGBA(rs, rd, fb_w);
+                } else {
+                    KITTY_ConvertRowRGB(rs, rd, fb_w);
+                }
+            }
+            break;
         }
 
 #ifdef KITTY_HAVE_NEON_LE
@@ -1030,19 +1041,10 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
             const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
             const Uint32 *src = row_src + tx;
             Uint8 *dst = row_dst + (size_t)tx * (size_t)bpp;
-
-            if (tile_dirty[tx_idx]) {
-                if (use_rgba) {
-                    KITTY_ConvertRowRGBA(src, dst, tw);
-                } else {
-                    KITTY_ConvertRowRGB(src, dst, tw);
-                }
-                continue;
-            }
+            bool changed = false;
 
             if (!use_rgba) {
                 int x = 0;
-                bool changed = false;
 #ifdef KITTY_HAVE_NEON_LE
                 for (; x + 16 <= tw; x += 16) {
                     const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
@@ -1083,16 +1085,11 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
                         dst += 3;
                     }
                 }
-                if (changed) {
-                    tile_dirty[tx_idx] = 1;
-                    dirty_in_band++;
-                    if (x < tw) {
-                        KITTY_ConvertRowRGB(src + x, dst, tw - x);
-                    }
+                if (changed && x < tw) {
+                    KITTY_ConvertRowRGB(src + x, dst, tw - x);
                 }
             } else {
                 int x = 0;
-                bool changed = false;
 #ifdef KITTY_HAVE_NEON_LE
                 for (; x + 16 <= tw; x += 16) {
                     const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
@@ -1137,12 +1134,17 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
                         dst += 4;
                     }
                 }
-                if (changed) {
-                    tile_dirty[tx_idx] = 1;
+                if (changed && x < tw) {
+                    KITTY_ConvertRowRGBA(src + x, dst, tw - x);
+                }
+            }
+
+            if (changed) {
+                if (tile_span[tx_idx] == 0) {
+                    tile_span[tx_idx] = (Uint16)(((Uint16)row << 8) | (Uint16)(row + 1));
                     dirty_in_band++;
-                    if (x < tw) {
-                        KITTY_ConvertRowRGBA(src + x, dst, tw - x);
-                    }
+                } else {
+                    tile_span[tx_idx] = (Uint16)((tile_span[tx_idx] & 0xFF00u) | (Uint16)(row + 1));
                 }
             }
         }
@@ -1163,7 +1165,7 @@ typedef struct KITTY_ParallelDiffCtx
     int tiles_x;
     int num_bands;
     int n_workers;
-    Uint8 *all_dirty;
+    Uint16 *all_spans;
     int *band_counts;
 } KITTY_ParallelDiffCtx;
 
@@ -1176,27 +1178,28 @@ static void KITTY_ParallelDiffWorker(void *arg, size_t widx)
     for (b = b0; b < b1; ++b) {
         const int ty = b * ctx->tile;
         const int th = (ty + ctx->tile <= ctx->fb_h) ? ctx->tile : (ctx->fb_h - ty);
-        Uint8 *td = ctx->all_dirty + (size_t)b * (size_t)ctx->tiles_x;
+        Uint16 *ts = ctx->all_spans + (size_t)b * (size_t)ctx->tiles_x;
         ctx->band_counts[b] = KITTY_ConvertAndDiffBand(ctx->surface, ctx->rgb_scratch,
                                                        ctx->use_rgba, ctx->fb_w, ctx->bpp,
-                                                       ctx->tile, ctx->tiles_x, ty, th, td);
+                                                       ctx->tile, ctx->tiles_x, ty, th, ts);
     }
 }
 #endif
 
 /*
- * Fused single-pass convert + multi-rect tile diff: compares surface pixels
- * directly against rgb_scratch in-place, updating changed pixels and leaving
- * clean tiles read-only. Already-dirty tiles skip reading rgb_scratch.
+ * Fused single-pass convert + multi-rect tile diff with exact vertical
+ * scanline trimming: compares surface pixels directly against rgb_scratch
+ * in-place, updating changed pixels and tightening emitted dirty rects to
+ * the exact changed row range.
  */
 KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb_scratch,
                                                 bool use_rgba, int tile, float cover_limit,
                                                 SDL_Rect *rects_out, int max_rects,
                                                 int *out_count, SDL_Rect *bbox_out)
 {
-    Uint8 stack_dirty[16384];
+    Uint16 stack_spans[8192];
     int stack_counts[256];
-    Uint8 *all_dirty = stack_dirty;
+    Uint16 *all_spans = stack_spans;
     int *band_counts = stack_counts;
     SDL_Rect acc[64];
     int n_acc = 0;
@@ -1235,17 +1238,17 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
     tiles_x = (fb_w + tile - 1) / tile;
     num_bands = (fb_h + tile - 1) / tile;
     total_tiles = (size_t)num_bands * (size_t)tiles_x;
-    if (total_tiles > sizeof(stack_dirty)) {
-        all_dirty = (Uint8 *)SDL_malloc(total_tiles);
-        if (!all_dirty) {
+    if (total_tiles > (sizeof(stack_spans) / sizeof(stack_spans[0]))) {
+        all_spans = (Uint16 *)SDL_malloc(total_tiles * sizeof(Uint16));
+        if (!all_spans) {
             return KITTY_DIFF_FULL;
         }
     }
     if (num_bands > (int)(sizeof(stack_counts) / sizeof(stack_counts[0]))) {
         band_counts = (int *)SDL_malloc((size_t)num_bands * sizeof(int));
         if (!band_counts) {
-            if (all_dirty != stack_dirty) {
-                SDL_free(all_dirty);
+            if (all_spans != stack_spans) {
+                SDL_free(all_spans);
             }
             return KITTY_DIFF_FULL;
         }
@@ -1264,7 +1267,7 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
         ctx.tiles_x = tiles_x;
         ctx.num_bands = num_bands;
         ctx.n_workers = 4;
-        ctx.all_dirty = all_dirty;
+        ctx.all_spans = all_spans;
         ctx.band_counts = band_counts;
         dispatch_apply_f((size_t)ctx.n_workers,
                          dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
@@ -1275,53 +1278,69 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
         for (b = 0; b < num_bands; ++b) {
             const int ty = b * tile;
             const int th = (ty + tile <= fb_h) ? tile : (fb_h - ty);
-            Uint8 *td = all_dirty + (size_t)b * (size_t)tiles_x;
+            Uint16 *ts = all_spans + (size_t)b * (size_t)tiles_x;
             band_counts[b] = KITTY_ConvertAndDiffBand(surface, rgb_scratch, use_rgba, fb_w, bpp,
-                                                      tile, tiles_x, ty, th, td);
+                                                      tile, tiles_x, ty, th, ts);
         }
     }
 
     for (b = 0; b < num_bands; ++b) {
         const int ty = b * tile;
         const int th = (ty + tile <= fb_h) ? tile : (fb_h - ty);
-        const Uint8 *tile_dirty = all_dirty + (size_t)b * (size_t)tiles_x;
+        const Uint16 *tile_span = all_spans + (size_t)b * (size_t)tiles_x;
         if (band_counts[b] == 0) {
             continue;
-        }
-        if (ty < min_y) {
-            min_y = ty;
-        }
-        if (ty + th > max_y) {
-            max_y = ty + th;
         }
         {
             int run_x = -1;
             int run_w = 0;
-            for (tx_idx = 0; tx_idx < tiles_x; ++tx_idx) {
-                const int tx = tx_idx * tile;
-                const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
-                if (tile_dirty[tx_idx]) {
-                    dirty_px += (size_t)tw * (size_t)th;
+            int run_y0 = th;
+            int run_y1 = 0;
+            for (tx_idx = 0; tx_idx <= tiles_x; ++tx_idx) {
+                const Uint16 sp = (tx_idx < tiles_x) ? tile_span[tx_idx] : 0u;
+                if (sp != 0u) {
+                    const int tx = tx_idx * tile;
+                    const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
+                    const int sy0 = (int)(sp >> 8);
+                    const int sy1 = (int)(sp & 0xFFu);
                     if (tx < min_x) {
                         min_x = tx;
                     }
                     if (tx + tw > max_x) {
                         max_x = tx + tw;
                     }
+                    if (ty + sy0 < min_y) {
+                        min_y = ty + sy0;
+                    }
+                    if (ty + sy1 > max_y) {
+                        max_y = ty + sy1;
+                    }
                     if (run_x < 0) {
                         run_x = tx;
                         run_w = tw;
+                        run_y0 = sy0;
+                        run_y1 = sy1;
                     } else {
                         run_w += tw;
+                        if (sy0 < run_y0) {
+                            run_y0 = sy0;
+                        }
+                        if (sy1 > run_y1) {
+                            run_y1 = sy1;
+                        }
                     }
                 } else if (run_x >= 0) {
+                    const int ry0 = ty + run_y0;
+                    const int ry1 = ty + run_y1;
+                    const int rh = ry1 - ry0;
+                    dirty_px += (size_t)run_w * (size_t)rh;
                     if (!overflow) {
                         bool extended = false;
                         int k;
                         for (k = n_acc - 1; k >= 0; --k) {
                             if (acc[k].x == run_x && acc[k].w == run_w &&
-                                acc[k].y + acc[k].h == ty) {
-                                acc[k].h += th;
+                                acc[k].y + acc[k].h == ry0) {
+                                acc[k].h += rh;
                                 extended = true;
                                 break;
                             }
@@ -1329,9 +1348,9 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
                         if (!extended) {
                             if (n_acc < (int)(sizeof(acc) / sizeof(acc[0]))) {
                                 acc[n_acc].x = run_x;
-                                acc[n_acc].y = ty;
+                                acc[n_acc].y = ry0;
                                 acc[n_acc].w = run_w;
-                                acc[n_acc].h = th;
+                                acc[n_acc].h = rh;
                                 n_acc++;
                             } else {
                                 overflow = true;
@@ -1340,29 +1359,8 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
                     }
                     run_x = -1;
                     run_w = 0;
-                }
-            }
-            if (run_x >= 0 && !overflow) {
-                bool extended = false;
-                int k;
-                for (k = n_acc - 1; k >= 0; --k) {
-                    if (acc[k].x == run_x && acc[k].w == run_w &&
-                        acc[k].y + acc[k].h == ty) {
-                        acc[k].h += th;
-                        extended = true;
-                        break;
-                    }
-                }
-                if (!extended) {
-                    if (n_acc < (int)(sizeof(acc) / sizeof(acc[0]))) {
-                        acc[n_acc].x = run_x;
-                        acc[n_acc].y = ty;
-                        acc[n_acc].w = run_w;
-                        acc[n_acc].h = th;
-                        n_acc++;
-                    } else {
-                        overflow = true;
-                    }
+                    run_y0 = th;
+                    run_y1 = 0;
                 }
             }
         }
@@ -1371,8 +1369,8 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
     if (band_counts != stack_counts) {
         SDL_free(band_counts);
     }
-    if (all_dirty != stack_dirty) {
-        SDL_free(all_dirty);
+    if (all_spans != stack_spans) {
+        SDL_free(all_spans);
     }
 
     if (dirty_px == 0) {
