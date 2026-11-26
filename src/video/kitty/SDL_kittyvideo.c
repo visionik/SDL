@@ -36,6 +36,7 @@
 #include "SDL_kittygraphics.h"
 #include "SDL_kittyprobe.h"
 #include "SDL_kittyprofile.h"
+#include "SDL_kittyrect.h"
 #include "SDL_kittyvideo.h"
 #include "SDL_kittywindow.h"
 
@@ -351,6 +352,68 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
     /* Cap used profile preference before probe; re-fit now that transmit_mode
      * is known (shm vs direct soft-maxes differ on Kitty/Ghostty). */
     KITTY_ApplyFramebufferCap(data);
+
+    /* Resolve hot-path env + profile policy once at init so UpdateWindowFramebuffer
+     * and TransmitRGB never call SDL_getenv()/strcasecmp()/atof() per frame. */
+    {
+        const KITTY_TerminalProfile *prof = data->term_profile;
+        const char *env;
+
+        env = SDL_getenv("SDL_KITTY_DIRTY");
+        data->cfg_dirty_enabled = !(env && (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
+                                            SDL_strcasecmp(env, "false") == 0 ||
+                                            SDL_strcasecmp(env, "no") == 0));
+        data->cfg_fb_diff = KITTY_SelectFbDiff(SDL_getenv("SDL_KITTY_FB_DIFF"),
+                                               prof ? prof->fb_diff : true);
+        data->cfg_fb_diff_tile = KITTY_SelectFbDiffTile(SDL_getenv("SDL_KITTY_FB_DIFF_TILE"),
+                                                        prof ? prof->fb_diff_tile : 32);
+        data->cfg_fb_diff_cover = KITTY_SelectFbDiffCover(SDL_getenv("SDL_KITTY_FB_DIFF_COVER"),
+                                                          prof ? prof->fb_diff_cover : 0.45f);
+        data->cfg_upload_skip = KITTY_SelectUploadSkip(SDL_getenv("SDL_KITTY_UPLOAD_SKIP"),
+                                                       prof ? prof->upload_skip : true);
+        data->cfg_af_max_coverage = (prof && prof->af_max_coverage > 0.0f) ? prof->af_max_coverage : 0.40f;
+        env = SDL_getenv("SDL_KITTY_AF_MAX_COVERAGE");
+        if (env && env[0]) {
+            data->cfg_af_max_coverage = (float)SDL_atof(env);
+        }
+        data->cfg_af_max_pixels = (prof && prof->af_max_pixels > 0)
+                                      ? prof->af_max_pixels
+                                      : ((size_t)160 * 1024);
+        data->cfg_dirty_bw = KITTY_SelectDirtyBW(SDL_getenv("SDL_KITTY_DIRTY_BW"), data->frame_edit_ok);
+        data->cfg_coalesce_gap = KITTY_SelectCoalesceGap(SDL_getenv("SDL_KITTY_COALESCE_GAP"),
+                                                         prof ? prof->coalesce_gap_px : 0);
+        data->cfg_dirty_union_at = KITTY_SelectDirtyUnionAT(SDL_getenv("SDL_KITTY_DIRTY_UNION_AT"),
+                                                            prof && prof->dirty_union_at);
+        data->cfg_dirty_at = KITTY_SelectDirtyAT(SDL_getenv("SDL_KITTY_DIRTY_AT"),
+                                                 prof && prof->dirty_at_overlays);
+        data->cfg_pingpong = KITTY_SelectPingPong(SDL_getenv("SDL_KITTY_PINGPONG"),
+                                                  prof && prof->pingpong);
+        env = SDL_getenv("SDL_KITTY_AF_ZLIB");
+        if (env && (env[0] == '0' || env[0] == '1') && env[1] == '\0') {
+            data->cfg_af_zlib = (env[0] == '1');
+        } else {
+            data->cfg_af_zlib = prof && prof->af_zlib;
+        }
+        env = SDL_getenv("SDL_KITTY_TRANSMIT");
+        if (env && env[0]) {
+            if (SDL_strcasecmp(env, "direct") == 0) {
+                data->transmit_mode = KITTY_TRANSMIT_DIRECT;
+            } else if (SDL_strcasecmp(env, "zlib") == 0) {
+                data->transmit_mode = KITTY_TRANSMIT_DIRECT_ZLIB;
+            } else if (SDL_strcasecmp(env, "shm") == 0) {
+                data->transmit_mode = KITTY_TRANSMIT_SHM;
+            }
+        }
+        env = SDL_getenv("SDL_KITTY_PERF_ACK");
+        data->cfg_perf_ack = (env && (env[0] == '1' || SDL_strcasecmp(env, "true") == 0 ||
+                                      SDL_strcasecmp(env, "yes") == 0 ||
+                                      SDL_strcasecmp(env, "on") == 0));
+        data->cfg_max_direct_bytes = (prof && prof->max_direct_bytes > 0)
+                                         ? prof->max_direct_bytes
+                                         : ((size_t)1920 * 1080 * 4);
+        data->cfg_apc_chunk_bytes = KITTY_ProfileApcChunkBytes(prof);
+        data->cfg_cached = true;
+    }
 
     {
         const char *no_mouse = SDL_getenv("SDL_KITTY_MOUSE");

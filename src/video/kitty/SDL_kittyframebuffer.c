@@ -238,8 +238,21 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             return false;
         }
 
-        convert_mode = KITTY_ChooseConvertMode(surface->w, surface->h, rects, numrects,
-                                               wdata->rgb_valid, &dirty);
+        if (vdata->cfg_cached) {
+            if (!vdata->cfg_dirty_enabled || !wdata->rgb_valid || surface->w <= 0 || surface->h <= 0 ||
+                !KITTY_UnionRects(surface->w, surface->h, rects, numrects, &dirty)) {
+                dirty.x = 0;
+                dirty.y = 0;
+                dirty.w = surface->w;
+                dirty.h = surface->h;
+                convert_mode = KITTY_CONVERT_FULL;
+            } else {
+                convert_mode = KITTY_CONVERT_DIRTY;
+            }
+        } else {
+            convert_mode = KITTY_ChooseConvertMode(surface->w, surface->h, rects, numrects,
+                                                   wdata->rgb_valid, &dirty);
+        }
         full.x = 0;
         full.y = 0;
         full.w = surface->w;
@@ -252,11 +265,11 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
          */
         {
             const float app_cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
-            const bool want_diff =
-                KITTY_SelectFbDiff(SDL_getenv("SDL_KITTY_FB_DIFF"),
-                                   vdata->term_profile ? vdata->term_profile->fb_diff : true) &&
-                                   wdata->rgb_valid && wdata->rgb_back &&
-                                   app_cov >= 0.90f;
+            const bool fb_diff_on = vdata->cfg_cached
+                                        ? vdata->cfg_fb_diff
+                                        : KITTY_SelectFbDiff(SDL_getenv("SDL_KITTY_FB_DIFF"),
+                                                             vdata->term_profile ? vdata->term_profile->fb_diff : true);
+            const bool want_diff = fb_diff_on && wdata->rgb_valid && wdata->rgb_back && app_cov >= 0.90f;
             if (want_diff) {
                 const bool conv_ok = use_rgba
                                          ? KITTY_ConvertSurfaceRectToRGBA(surface, &full, wdata->rgb_back)
@@ -265,12 +278,16 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     return SDL_SetError("kitty RGB convert failed");
                 }
                 {
-                    const int tile = KITTY_SelectFbDiffTile(
-                        SDL_getenv("SDL_KITTY_FB_DIFF_TILE"),
-                        vdata->term_profile ? vdata->term_profile->fb_diff_tile : 32);
-                    const float cover = KITTY_SelectFbDiffCover(
-                        SDL_getenv("SDL_KITTY_FB_DIFF_COVER"),
-                        vdata->term_profile ? vdata->term_profile->fb_diff_cover : 0.45f);
+                    const int tile = vdata->cfg_cached
+                                         ? vdata->cfg_fb_diff_tile
+                                         : KITTY_SelectFbDiffTile(
+                                               SDL_getenv("SDL_KITTY_FB_DIFF_TILE"),
+                                               vdata->term_profile ? vdata->term_profile->fb_diff_tile : 32);
+                    const float cover = vdata->cfg_cached
+                                            ? vdata->cfg_fb_diff_cover
+                                            : KITTY_SelectFbDiffCover(
+                                                  SDL_getenv("SDL_KITTY_FB_DIFF_COVER"),
+                                                  vdata->term_profile ? vdata->term_profile->fb_diff_cover : 0.45f);
                     const KITTY_DiffOutcome diff =
                         KITTY_TileDiffRects(wdata->rgb_scratch, wdata->rgb_back, surface->w, surface->h,
                                             bpp, tile, cover, diff_rects,
@@ -350,9 +367,11 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
          * (tile-diff handles identical full-surface frames in ~80 us), and
          * reuse pre_hash after upload so we never hash twice in one frame.
          */
-        upload_skip_enabled = KITTY_SelectUploadSkip(
-            SDL_getenv("SDL_KITTY_UPLOAD_SKIP"),
-            vdata->term_profile ? vdata->term_profile->upload_skip : true);
+        upload_skip_enabled = vdata->cfg_cached
+                                  ? vdata->cfg_upload_skip
+                                  : KITTY_SelectUploadSkip(
+                                        SDL_getenv("SDL_KITTY_UPLOAD_SKIP"),
+                                        vdata->term_profile ? vdata->term_profile->upload_skip : true);
         if (upload_skip_enabled && !diff_proved_changed && wdata->rgb_scratch) {
             const size_t bytes =
                 (size_t)surface->w * (size_t)surface->h * (size_t)bpp;
@@ -374,20 +393,26 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
          * SHM a=f blanked on Kitty.app; keep a=f on t=d only. */
         {
             const float cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
-            float max_cov =
-                (vdata->term_profile && vdata->term_profile->af_max_coverage > 0.0f)
-                    ? vdata->term_profile->af_max_coverage
-                    : 0.40f;
-            {
+            float max_cov;
+            size_t max_af_px;
+            bool dirty_bw_on;
+            if (vdata->cfg_cached) {
+                max_cov = vdata->cfg_af_max_coverage;
+                max_af_px = vdata->cfg_af_max_pixels;
+                dirty_bw_on = vdata->cfg_dirty_bw;
+            } else {
                 const char *cov_env = SDL_getenv("SDL_KITTY_AF_MAX_COVERAGE");
+                max_cov = (vdata->term_profile && vdata->term_profile->af_max_coverage > 0.0f)
+                              ? vdata->term_profile->af_max_coverage
+                              : 0.40f;
                 if (cov_env && cov_env[0]) {
                     max_cov = (float)SDL_atof(cov_env);
                 }
+                max_af_px = (vdata->term_profile && vdata->term_profile->af_max_pixels > 0)
+                                ? vdata->term_profile->af_max_pixels
+                                : ((size_t)160 * 1024);
+                dirty_bw_on = KITTY_SelectDirtyBW(SDL_getenv("SDL_KITTY_DIRTY_BW"), vdata->frame_edit_ok);
             }
-            const size_t max_af_px =
-                (vdata->term_profile && vdata->term_profile->af_max_pixels > 0)
-                    ? vdata->term_profile->af_max_pixels
-                    : ((size_t)160 * 1024); /* ~160k px ≈ 480KB RGB */
             /* Kitty SHM sessions: skip direct a=f unless the profile allows it
              * (direct_af_when_shm). Rex keeps direct a=f; Kitty uses full SHM a=T. */
             const bool shm_session =
@@ -398,7 +423,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             const bool want_af =
                 convert_mode == KITTY_CONVERT_DIRTY &&
                 allow_direct_af &&
-                KITTY_SelectDirtyBW(SDL_getenv("SDL_KITTY_DIRTY_BW"), vdata->frame_edit_ok) &&
+                dirty_bw_on &&
                 wdata->placed &&
                 wdata->live_image_id != 0;
 
@@ -411,9 +436,11 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 SDL_Rect coal_buf[32];
                 const SDL_Rect *af_rects = multi_rects;
                 int af_n = multi_numrects;
-                const int gap = KITTY_SelectCoalesceGap(
-                    SDL_getenv("SDL_KITTY_COALESCE_GAP"),
-                    vdata->term_profile ? vdata->term_profile->coalesce_gap_px : 0);
+                const int gap = vdata->cfg_cached
+                                    ? vdata->cfg_coalesce_gap
+                                    : KITTY_SelectCoalesceGap(
+                                          SDL_getenv("SDL_KITTY_COALESCE_GAP"),
+                                          vdata->term_profile ? vdata->term_profile->coalesce_gap_px : 0);
 
                 /* Exp 5: merge near/overlapping dirty rects before multi a=f. */
                 if (gap > 0) {
@@ -531,11 +558,14 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
              * DECSC/DECRC in TransmitRGBRectPlace; skip if cell box hits edge.
              */
             if (!ok) {
+                const bool union_on = vdata->cfg_cached
+                                          ? vdata->cfg_dirty_union_at
+                                          : KITTY_SelectDirtyUnionAT(SDL_getenv("SDL_KITTY_DIRTY_UNION_AT"),
+                                                                     vdata->term_profile &&
+                                                                         vdata->term_profile->dirty_union_at);
                 const bool want_union =
                     convert_mode == KITTY_CONVERT_DIRTY &&
-                    KITTY_SelectDirtyUnionAT(SDL_getenv("SDL_KITTY_DIRTY_UNION_AT"),
-                                             vdata->term_profile &&
-                                                 vdata->term_profile->dirty_union_at) &&
+                    union_on &&
                     wdata->placed &&
                     wdata->live_image_id != 0 &&
                     cov < max_cov &&
@@ -618,11 +648,14 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
 
             /* Multi a=T overlays (dirty_at_overlays) — default off after WezTerm hang. */
             if (!ok) {
+                const bool at_on = vdata->cfg_cached
+                                       ? vdata->cfg_dirty_at
+                                       : KITTY_SelectDirtyAT(SDL_getenv("SDL_KITTY_DIRTY_AT"),
+                                                             vdata->term_profile &&
+                                                                 vdata->term_profile->dirty_at_overlays);
                 const bool want_at =
                     convert_mode == KITTY_CONVERT_DIRTY &&
-                    KITTY_SelectDirtyAT(SDL_getenv("SDL_KITTY_DIRTY_AT"),
-                                        vdata->term_profile &&
-                                            vdata->term_profile->dirty_at_overlays) &&
+                    at_on &&
                     wdata->placed &&
                     wdata->live_image_id != 0 &&
                     cov < max_cov &&
@@ -742,9 +775,11 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         }
 
         if (!ok) {
-            const bool pingpong = KITTY_SelectPingPong(
-                SDL_getenv("SDL_KITTY_PINGPONG"),
-                vdata->term_profile && vdata->term_profile->pingpong);
+            const bool pingpong = vdata->cfg_cached
+                                      ? vdata->cfg_pingpong
+                                      : KITTY_SelectPingPong(
+                                            SDL_getenv("SDL_KITTY_PINGPONG"),
+                                            vdata->term_profile && vdata->term_profile->pingpong);
             Uint32 prev = 0;
 
             /* Full replace must not leave stale overlays on top of the new base. */

@@ -1596,7 +1596,11 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
 
 bool KITTY_EditsCompressed(const SDL_VideoData *vdata)
 {
-    const char *z = SDL_getenv("SDL_KITTY_AF_ZLIB");
+    const char *z;
+    if (vdata && vdata->cfg_cached) {
+        return vdata->cfg_af_zlib;
+    }
+    z = SDL_getenv("SDL_KITTY_AF_ZLIB");
     if (z && (z[0] == '0' || z[0] == '1') && z[1] == '\0') {
         return z[0] == '1';
     }
@@ -1635,10 +1639,11 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
 
     /* Direct a=f ceiling — huge chunks paint base64 when the host drops the APC. */
     {
-        const size_t max_direct =
-            (vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
-                ? vdata->term_profile->max_direct_bytes
-                : ((size_t)1920 * 1080 * 4);
+        const size_t max_direct = vdata->cfg_cached
+                                      ? vdata->cfg_max_direct_bytes
+                                      : ((vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
+                                             ? vdata->term_profile->max_direct_bytes
+                                             : ((size_t)1920 * 1080 * 4));
         if (payload_len > max_direct) {
             return SDL_SetError(
                 "kitty: refusing direct a=f of %dx%d (~%zu bytes); use smaller FB or SHM full present",
@@ -1671,7 +1676,9 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
 
     /* Edit root frame in place — do not home cursor or re-place. */
     {
-        const size_t chunk_cap = KITTY_ProfileApcChunkBytes(vdata->term_profile);
+        const size_t chunk_cap = vdata->cfg_cached
+                                     ? vdata->cfg_apc_chunk_bytes
+                                     : KITTY_ProfileApcChunkBytes(vdata->term_profile);
         size_t wire = 0;
         const Uint64 t0 = SDL_GetTicksNS();
 
@@ -1781,14 +1788,16 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
         kitty_f = 24;
     }
 
-    const char *force = SDL_getenv("SDL_KITTY_TRANSMIT");
-    if (force) {
-        if (SDL_strcasecmp(force, "direct") == 0) {
-            vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
-        } else if (SDL_strcasecmp(force, "zlib") == 0) {
-            vdata->transmit_mode = KITTY_TRANSMIT_DIRECT_ZLIB;
-        } else if (SDL_strcasecmp(force, "shm") == 0) {
-            vdata->transmit_mode = KITTY_TRANSMIT_SHM;
+    if (!vdata->cfg_cached) {
+        const char *force = SDL_getenv("SDL_KITTY_TRANSMIT");
+        if (force) {
+            if (SDL_strcasecmp(force, "direct") == 0) {
+                vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
+            } else if (SDL_strcasecmp(force, "zlib") == 0) {
+                vdata->transmit_mode = KITTY_TRANSMIT_DIRECT_ZLIB;
+            } else if (SDL_strcasecmp(force, "shm") == 0) {
+                vdata->transmit_mode = KITTY_TRANSMIT_SHM;
+            }
         }
     }
 
@@ -1821,10 +1830,14 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
              * tty when the host rejects/drops the APC (seen with dvd_sprite on
              * Kitty.app at ~3360x2100 after SHM failure). Refuse giant direct;
              * ceiling comes from the host profile (docs/terminals.md). */
-            const size_t max_direct =
-                (vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
-                    ? vdata->term_profile->max_direct_bytes
-                    : ((size_t)1920 * 1080 * 4);
+            const size_t max_direct = vdata->cfg_cached
+                                          ? vdata->cfg_max_direct_bytes
+                                          : ((vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
+                                                 ? vdata->term_profile->max_direct_bytes
+                                                 : ((size_t)1920 * 1080 * 4));
+            const size_t apc_chunk = vdata->cfg_cached
+                                         ? vdata->cfg_apc_chunk_bytes
+                                         : KITTY_ProfileApcChunkBytes(vdata->term_profile);
 
             if (vdata->transmit_mode == KITTY_TRANSMIT_SHM && !vdata->shm_failed) {
                 if (KITTY_TransmitShm(vdata, image_id, rgb, w, h, place_cols, place_rows, kitty_f,
@@ -1868,7 +1881,7 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
             if (!ok && vdata->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
                 if (KITTY_TransmitDirectZlib(vdata, vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
                                              kitty_f, home_cursor,
-                                             KITTY_ProfileApcChunkBytes(vdata->term_profile),
+                                             apc_chunk,
                                              &wire_bytes, &raw_bytes)) {
                     ok = true;
                 } else {
@@ -1886,7 +1899,7 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
                 }
                 ok = KITTY_TransmitDirectRaw(vdata, vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
                                              kitty_f, home_cursor,
-                                             KITTY_ProfileApcChunkBytes(vdata->term_profile),
+                                             apc_chunk,
                                              &wire_bytes, &raw_bytes);
             }
         }

@@ -156,6 +156,24 @@ typedef struct SDL_VideoData
     char *tx_b64_buf;
     size_t tx_b64_cap;
     void *tx_zstream; /* z_stream*, lazily initialized with deflateInit */
+    /* Cached hot-path present/transmit policy resolved once at VideoInit. */
+    bool cfg_cached;
+    bool cfg_dirty_enabled;
+    bool cfg_fb_diff;
+    int cfg_fb_diff_tile;
+    float cfg_fb_diff_cover;
+    bool cfg_upload_skip;
+    float cfg_af_max_coverage;
+    size_t cfg_af_max_pixels;
+    bool cfg_dirty_bw;
+    int cfg_coalesce_gap;
+    bool cfg_dirty_union_at;
+    bool cfg_dirty_at;
+    bool cfg_pingpong;
+    bool cfg_af_zlib;
+    bool cfg_perf_ack;
+    size_t cfg_max_direct_bytes;
+    size_t cfg_apc_chunk_bytes;
 } SDL_VideoData;
 
 /* Stacked a=T dirty overlays (dirty_at_overlays experiment). Ids 100+. */
