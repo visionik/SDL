@@ -42,6 +42,10 @@
 #include <termios.h>
 #include <unistd.h>
 #include <zlib.h>
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define KITTY_HAVE_NEON64 1
+#endif
 
 #ifndef MAP_FAILED
 #define MAP_FAILED ((void *)-1)
@@ -63,18 +67,58 @@ static const char KITTY_b64_table[] =
 static size_t KITTY_Base64Encode(const Uint8 *src, size_t src_len, char *dst, size_t dst_cap)
 {
     size_t i = 0, o = 0;
-    while (i + 2 < src_len) {
-        if (o + 4 >= dst_cap) {
-            break;
-        }
-        const Uint32 n = ((Uint32)src[i] << 16) | ((Uint32)src[i + 1] << 8) | src[i + 2];
-        dst[o++] = KITTY_b64_table[(n >> 18) & 63];
-        dst[o++] = KITTY_b64_table[(n >> 12) & 63];
-        dst[o++] = KITTY_b64_table[(n >> 6) & 63];
-        dst[o++] = KITTY_b64_table[n & 63];
-        i += 3;
+    size_t max_triples;
+    size_t cap_triples;
+
+    if (dst_cap == 0) {
+        return 0;
     }
-    if (i < src_len && o + 4 < dst_cap) {
+    max_triples = src_len / 3u;
+    cap_triples = (dst_cap - 1u) / 4u;
+    if (max_triples > cap_triples) {
+        max_triples = cap_triples;
+    }
+    const size_t full_bytes = max_triples * 3u;
+
+#ifdef KITTY_HAVE_NEON64
+    if (full_bytes >= 48u) {
+        uint8x16x4_t tbl;
+        const uint8x16_t mask6 = vdupq_n_u8(0x3Fu);
+        tbl.val[0] = vld1q_u8((const uint8_t *)(KITTY_b64_table + 0));
+        tbl.val[1] = vld1q_u8((const uint8_t *)(KITTY_b64_table + 16));
+        tbl.val[2] = vld1q_u8((const uint8_t *)(KITTY_b64_table + 32));
+        tbl.val[3] = vld1q_u8((const uint8_t *)(KITTY_b64_table + 48));
+        while (i + 48u <= full_bytes) {
+            const uint8x16x3_t in = vld3q_u8((const uint8_t *)(src + i));
+            const uint8x16_t b0 = in.val[0];
+            const uint8x16_t b1 = in.val[1];
+            const uint8x16_t b2 = in.val[2];
+            const uint8x16_t idx0 = vshrq_n_u8(b0, 2);
+            const uint8x16_t idx1 = vandq_u8(vorrq_u8(vshlq_n_u8(b0, 4), vshrq_n_u8(b1, 4)), mask6);
+            const uint8x16_t idx2 = vandq_u8(vorrq_u8(vshlq_n_u8(b1, 2), vshrq_n_u8(b2, 6)), mask6);
+            const uint8x16_t idx3 = vandq_u8(b2, mask6);
+            uint8x16x4_t out;
+            out.val[0] = vqtbl4q_u8(tbl, idx0);
+            out.val[1] = vqtbl4q_u8(tbl, idx1);
+            out.val[2] = vqtbl4q_u8(tbl, idx2);
+            out.val[3] = vqtbl4q_u8(tbl, idx3);
+            vst4q_u8((uint8_t *)(dst + o), out);
+            i += 48u;
+            o += 64u;
+        }
+    }
+#endif
+
+    while (i < full_bytes) {
+        const Uint32 n = ((Uint32)src[i] << 16) | ((Uint32)src[i + 1] << 8) | src[i + 2];
+        dst[o]     = KITTY_b64_table[(n >> 18) & 63];
+        dst[o + 1] = KITTY_b64_table[(n >> 12) & 63];
+        dst[o + 2] = KITTY_b64_table[(n >> 6) & 63];
+        dst[o + 3] = KITTY_b64_table[n & 63];
+        i += 3u;
+        o += 4u;
+    }
+    if (i < src_len && o + 4u < dst_cap) {
         Uint32 n = (Uint32)src[i] << 16;
         dst[o++] = KITTY_b64_table[(n >> 18) & 63];
         if (i + 1 < src_len) {
@@ -88,9 +132,7 @@ static size_t KITTY_Base64Encode(const Uint8 *src, size_t src_len, char *dst, si
             dst[o++] = '=';
         }
     }
-    if (o < dst_cap) {
-        dst[o] = '\0';
-    }
+    dst[o] = '\0';
     return o;
 }
 
