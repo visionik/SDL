@@ -246,28 +246,40 @@ Uint64 KITTY_FastHash64(const Uint8 *data, size_t len)
     Uint64 h1 = P2;
     Uint64 h2 = P3;
     Uint64 h3 = P4;
+    Uint64 h4 = P1 + P2;
+    Uint64 h5 = P2 + P3;
+    Uint64 h6 = P3 + P4;
+    Uint64 h7 = P4 + P1;
     size_t i = 0;
 
     if (!data) {
         return h0;
     }
 
-    while (i + 32u <= len) {
-        Uint64 w0, w1, w2, w3;
+    while (i + 64u <= len) {
+        Uint64 w0, w1, w2, w3, w4, w5, w6, w7;
         SDL_memcpy(&w0, data + i, 8);
         SDL_memcpy(&w1, data + i + 8, 8);
         SDL_memcpy(&w2, data + i + 16, 8);
         SDL_memcpy(&w3, data + i + 24, 8);
+        SDL_memcpy(&w4, data + i + 32, 8);
+        SDL_memcpy(&w5, data + i + 40, 8);
+        SDL_memcpy(&w6, data + i + 48, 8);
+        SDL_memcpy(&w7, data + i + 56, 8);
         h0 = KITTY_Rotl64(h0 + w0 * P2, 31) * P1;
         h1 = KITTY_Rotl64(h1 + w1 * P2, 31) * P1;
         h2 = KITTY_Rotl64(h2 + w2 * P2, 31) * P1;
         h3 = KITTY_Rotl64(h3 + w3 * P2, 31) * P1;
-        i += 32u;
+        h4 = KITTY_Rotl64(h4 + w4 * P2, 31) * P1;
+        h5 = KITTY_Rotl64(h5 + w5 * P2, 31) * P1;
+        h6 = KITTY_Rotl64(h6 + w6 * P2, 31) * P1;
+        h7 = KITTY_Rotl64(h7 + w7 * P2, 31) * P1;
+        i += 64u;
     }
 
     {
-        Uint64 h = KITTY_Rotl64(h0, 1) + KITTY_Rotl64(h1, 7) +
-                   KITTY_Rotl64(h2, 12) + KITTY_Rotl64(h3, 18);
+        Uint64 h = KITTY_Rotl64(h0 ^ h4, 1) + KITTY_Rotl64(h1 ^ h5, 7) +
+                   KITTY_Rotl64(h2 ^ h6, 12) + KITTY_Rotl64(h3 ^ h7, 18);
         while (i + 8u <= len) {
             Uint64 w;
             SDL_memcpy(&w, data + i, 8);

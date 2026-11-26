@@ -93,6 +93,23 @@ static size_t KITTY_Base64Encode(const Uint8 *src, size_t src_len, char *dst, si
         tbl.val[1] = vld1q_u8((const uint8_t *)(KITTY_b64_table + 16));
         tbl.val[2] = vld1q_u8((const uint8_t *)(KITTY_b64_table + 32));
         tbl.val[3] = vld1q_u8((const uint8_t *)(KITTY_b64_table + 48));
+        while (i + 96u <= full_bytes) {
+            const uint8x16x3_t in0 = vld3q_u8((const uint8_t *)(src + i));
+            const uint8x16x3_t in1 = vld3q_u8((const uint8_t *)(src + i + 48));
+            uint8x16x4_t out0, out1;
+            out0.val[0] = vqtbl4q_u8(tbl, vshrq_n_u8(in0.val[0], 2));
+            out0.val[1] = vqtbl4q_u8(tbl, vandq_u8(vorrq_u8(vshlq_n_u8(in0.val[0], 4), vshrq_n_u8(in0.val[1], 4)), mask6));
+            out0.val[2] = vqtbl4q_u8(tbl, vandq_u8(vorrq_u8(vshlq_n_u8(in0.val[1], 2), vshrq_n_u8(in0.val[2], 6)), mask6));
+            out0.val[3] = vqtbl4q_u8(tbl, vandq_u8(in0.val[2], mask6));
+            out1.val[0] = vqtbl4q_u8(tbl, vshrq_n_u8(in1.val[0], 2));
+            out1.val[1] = vqtbl4q_u8(tbl, vandq_u8(vorrq_u8(vshlq_n_u8(in1.val[0], 4), vshrq_n_u8(in1.val[1], 4)), mask6));
+            out1.val[2] = vqtbl4q_u8(tbl, vandq_u8(vorrq_u8(vshlq_n_u8(in1.val[1], 2), vshrq_n_u8(in1.val[2], 6)), mask6));
+            out1.val[3] = vqtbl4q_u8(tbl, vandq_u8(in1.val[2], mask6));
+            vst4q_u8((uint8_t *)(dst + o), out0);
+            vst4q_u8((uint8_t *)(dst + o + 64), out1);
+            i += 96u;
+            o += 128u;
+        }
         while (i + 48u <= full_bytes) {
             const uint8x16x3_t in = vld3q_u8((const uint8_t *)(src + i));
             const uint8x16_t b0 = in.val[0];
