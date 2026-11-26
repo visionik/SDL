@@ -939,19 +939,19 @@ static inline void KITTY_ConvertRowRGBA(const Uint32 *src, Uint8 *dst, int count
 
 /*
  * Process one horizontal tile band [ty, ty+th): compare surface pixels
- * against rgb_scratch in-place, update changed tiles, and record exact
- * changed scanline bounds per tile in tile_span[tx_idx]:
- *   0 == clean; otherwise ((y0 << 8) | y1_excl) where 0 <= y0 < y1_excl <= th.
+ * against rgb_scratch in-place, update changed tiles, and record exact 2D
+ * changed pixel bounds per tile in tile_span[tx_idx]:
+ *   0 == clean; otherwise ((y0 << 24) | (y1_excl << 16) | (x0 << 8) | x1_excl).
  * Returns number of dirty tiles in this band.
  */
 static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
                                     bool use_rgba, int fb_w, int bpp, int tile,
-                                    int tiles_x, int ty, int th, Uint16 *tile_span)
+                                    int tiles_x, int ty, int th, Uint32 *tile_span)
 {
     int dirty_in_band = 0;
     int row;
 
-    SDL_memset(tile_span, 0, (size_t)tiles_x * sizeof(Uint16));
+    SDL_memset(tile_span, 0, (size_t)tiles_x * sizeof(Uint32));
 
     for (row = 0; row < th; ++row) {
         const Uint32 *row_src = (const Uint32 *)((const Uint8 *)surface->pixels +
@@ -961,9 +961,12 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
 
         if (dirty_in_band == tiles_x) {
             /* Whole band already dirty: contiguous write-only NEON convert and
-             * mark remaining band rows dirty for all tiles. */
+             * mark remaining band rows & full tile widths dirty. */
             for (tx_idx = 0; tx_idx < tiles_x; ++tx_idx) {
-                tile_span[tx_idx] = (Uint16)((tile_span[tx_idx] & 0xFF00u) | (Uint16)th);
+                const int tx = tx_idx * tile;
+                const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
+                const Uint32 y0 = (tile_span[tx_idx] >> 24) & 0xFFu;
+                tile_span[tx_idx] = (y0 << 24) | ((Uint32)th << 16) | (Uint32)tw;
             }
             for (; row < th; ++row) {
                 const Uint32 *rs = (const Uint32 *)((const Uint8 *)surface->pixels +
@@ -1041,7 +1044,8 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
             const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
             const Uint32 *src = row_src + tx;
             Uint8 *dst = row_dst + (size_t)tx * (size_t)bpp;
-            bool changed = false;
+            int min_rx = tw;
+            int max_rx = 0;
 
             if (!use_rgba) {
                 int x = 0;
@@ -1054,39 +1058,45 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
                                  veorq_u8(bgra.val[1], old.val[1])),
                         veorq_u8(bgra.val[0], old.val[2]));
                     if (vmaxvq_u32(vreinterpretq_u32_u8(d)) != 0) {
+                        Uint8 dbuf[16];
                         uint8x16x3_t rgb;
+                        int lane;
+                        vst1q_u8(dbuf, d);
+                        for (lane = 0; lane < 16; ++lane) {
+                            if (dbuf[lane]) {
+                                if (x + lane < min_rx) {
+                                    min_rx = x + lane;
+                                }
+                                if (x + lane + 1 > max_rx) {
+                                    max_rx = x + lane + 1;
+                                }
+                            }
+                        }
                         rgb.val[0] = bgra.val[2];
                         rgb.val[1] = bgra.val[1];
                         rgb.val[2] = bgra.val[0];
                         vst3q_u8(dst, rgb);
-                        changed = true;
-                        x += 16;
-                        dst += 48;
-                        break;
                     }
                     dst += 48;
                 }
 #endif
-                if (!changed) {
-                    for (; x < tw; ++x) {
-                        const Uint32 p = src[x];
-                        const Uint8 r = (Uint8)((p >> 16) & 0xFF);
-                        const Uint8 g = (Uint8)((p >> 8) & 0xFF);
-                        const Uint8 b = (Uint8)(p & 0xFF);
-                        if (dst[0] != r || dst[1] != g || dst[2] != b) {
-                            dst[0] = r;
-                            dst[1] = g;
-                            dst[2] = b;
-                            changed = true;
-                            x++;
-                            dst += 3;
-                            break;
+                for (; x < tw; ++x) {
+                    const Uint32 p = src[x];
+                    const Uint8 r = (Uint8)((p >> 16) & 0xFF);
+                    const Uint8 g = (Uint8)((p >> 8) & 0xFF);
+                    const Uint8 b = (Uint8)(p & 0xFF);
+                    if (dst[0] != r || dst[1] != g || dst[2] != b) {
+                        dst[0] = r;
+                        dst[1] = g;
+                        dst[2] = b;
+                        if (x < min_rx) {
+                            min_rx = x;
                         }
-                        dst += 3;
+                        if (x + 1 > max_rx) {
+                            max_rx = x + 1;
+                        }
                     }
-                }
-                if (changed && x < tw) {
-                    KITTY_ConvertRowRGB(src + x, dst, tw - x);
+                    dst += 3;
                 }
             } else {
                 int x = 0;
@@ -1100,51 +1110,68 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
                         vorrq_u8(veorq_u8(bgra.val[0], old.val[2]),
                                  veorq_u8(bgra.val[3], old.val[3])));
                     if (vmaxvq_u32(vreinterpretq_u32_u8(d)) != 0) {
+                        Uint8 dbuf[16];
                         uint8x16x4_t rgba;
+                        int lane;
+                        vst1q_u8(dbuf, d);
+                        for (lane = 0; lane < 16; ++lane) {
+                            if (dbuf[lane]) {
+                                if (x + lane < min_rx) {
+                                    min_rx = x + lane;
+                                }
+                                if (x + lane + 1 > max_rx) {
+                                    max_rx = x + lane + 1;
+                                }
+                            }
+                        }
                         rgba.val[0] = bgra.val[2];
                         rgba.val[1] = bgra.val[1];
                         rgba.val[2] = bgra.val[0];
                         rgba.val[3] = bgra.val[3];
                         vst4q_u8(dst, rgba);
-                        changed = true;
-                        x += 16;
-                        dst += 64;
-                        break;
                     }
                     dst += 64;
                 }
 #endif
-                if (!changed) {
-                    for (; x < tw; ++x) {
-                        const Uint32 p = src[x];
-                        const Uint8 r = (Uint8)((p >> 16) & 0xFF);
-                        const Uint8 g = (Uint8)((p >> 8) & 0xFF);
-                        const Uint8 b = (Uint8)(p & 0xFF);
-                        const Uint8 a = (Uint8)((p >> 24) & 0xFF);
-                        if (dst[0] != r || dst[1] != g || dst[2] != b || dst[3] != a) {
-                            dst[0] = r;
-                            dst[1] = g;
-                            dst[2] = b;
-                            dst[3] = a;
-                            changed = true;
-                            x++;
-                            dst += 4;
-                            break;
+                for (; x < tw; ++x) {
+                    const Uint32 p = src[x];
+                    const Uint8 r = (Uint8)((p >> 16) & 0xFF);
+                    const Uint8 g = (Uint8)((p >> 8) & 0xFF);
+                    const Uint8 b = (Uint8)(p & 0xFF);
+                    const Uint8 a = (Uint8)((p >> 24) & 0xFF);
+                    if (dst[0] != r || dst[1] != g || dst[2] != b || dst[3] != a) {
+                        dst[0] = r;
+                        dst[1] = g;
+                        dst[2] = b;
+                        dst[3] = a;
+                        if (x < min_rx) {
+                            min_rx = x;
                         }
-                        dst += 4;
+                        if (x + 1 > max_rx) {
+                            max_rx = x + 1;
+                        }
                     }
-                }
-                if (changed && x < tw) {
-                    KITTY_ConvertRowRGBA(src + x, dst, tw - x);
+                    dst += 4;
                 }
             }
 
-            if (changed) {
-                if (tile_span[tx_idx] == 0) {
-                    tile_span[tx_idx] = (Uint16)(((Uint16)row << 8) | (Uint16)(row + 1));
+            if (max_rx > 0) {
+                const Uint32 cur = tile_span[tx_idx];
+                if (cur == 0u) {
+                    tile_span[tx_idx] = ((Uint32)row << 24) | ((Uint32)(row + 1) << 16) |
+                                        ((Uint32)min_rx << 8) | (Uint32)max_rx;
                     dirty_in_band++;
                 } else {
-                    tile_span[tx_idx] = (Uint16)((tile_span[tx_idx] & 0xFF00u) | (Uint16)(row + 1));
+                    const Uint32 y0 = (cur >> 24) & 0xFFu;
+                    Uint32 x0 = (cur >> 8) & 0xFFu;
+                    Uint32 x1 = cur & 0xFFu;
+                    if ((Uint32)min_rx < x0) {
+                        x0 = (Uint32)min_rx;
+                    }
+                    if ((Uint32)max_rx > x1) {
+                        x1 = (Uint32)max_rx;
+                    }
+                    tile_span[tx_idx] = (y0 << 24) | ((Uint32)(row + 1) << 16) | (x0 << 8) | x1;
                 }
             }
         }
@@ -1165,7 +1192,7 @@ typedef struct KITTY_ParallelDiffCtx
     int tiles_x;
     int num_bands;
     int n_workers;
-    Uint16 *all_spans;
+    Uint32 *all_spans;
     int *band_counts;
 } KITTY_ParallelDiffCtx;
 
@@ -1178,7 +1205,7 @@ static void KITTY_ParallelDiffWorker(void *arg, size_t widx)
     for (b = b0; b < b1; ++b) {
         const int ty = b * ctx->tile;
         const int th = (ty + ctx->tile <= ctx->fb_h) ? ctx->tile : (ctx->fb_h - ty);
-        Uint16 *ts = ctx->all_spans + (size_t)b * (size_t)ctx->tiles_x;
+        Uint32 *ts = ctx->all_spans + (size_t)b * (size_t)ctx->tiles_x;
         ctx->band_counts[b] = KITTY_ConvertAndDiffBand(ctx->surface, ctx->rgb_scratch,
                                                        ctx->use_rgba, ctx->fb_w, ctx->bpp,
                                                        ctx->tile, ctx->tiles_x, ty, th, ts);
@@ -1187,19 +1214,19 @@ static void KITTY_ParallelDiffWorker(void *arg, size_t widx)
 #endif
 
 /*
- * Fused single-pass convert + multi-rect tile diff with exact vertical
- * scanline trimming: compares surface pixels directly against rgb_scratch
- * in-place, updating changed pixels and tightening emitted dirty rects to
- * the exact changed row range.
+ * Fused single-pass convert + multi-rect tile diff with exact 2D pixel
+ * trimming: compares surface pixels directly against rgb_scratch in-place,
+ * updating changed pixels and tightening emitted dirty rects to the exact
+ * changed pixel bounds on both X and Y axes.
  */
 KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb_scratch,
                                                 bool use_rgba, int tile, float cover_limit,
                                                 SDL_Rect *rects_out, int max_rects,
                                                 int *out_count, SDL_Rect *bbox_out)
 {
-    Uint16 stack_spans[8192];
+    Uint32 stack_spans[4096];
     int stack_counts[256];
-    Uint16 *all_spans = stack_spans;
+    Uint32 *all_spans = stack_spans;
     int *band_counts = stack_counts;
     SDL_Rect acc[64];
     int n_acc = 0;
@@ -1239,7 +1266,7 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
     num_bands = (fb_h + tile - 1) / tile;
     total_tiles = (size_t)num_bands * (size_t)tiles_x;
     if (total_tiles > (sizeof(stack_spans) / sizeof(stack_spans[0]))) {
-        all_spans = (Uint16 *)SDL_malloc(total_tiles * sizeof(Uint16));
+        all_spans = (Uint32 *)SDL_malloc(total_tiles * sizeof(Uint32));
         if (!all_spans) {
             return KITTY_DIFF_FULL;
         }
@@ -1278,7 +1305,7 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
         for (b = 0; b < num_bands; ++b) {
             const int ty = b * tile;
             const int th = (ty + tile <= fb_h) ? tile : (fb_h - ty);
-            Uint16 *ts = all_spans + (size_t)b * (size_t)tiles_x;
+            Uint32 *ts = all_spans + (size_t)b * (size_t)tiles_x;
             band_counts[b] = KITTY_ConvertAndDiffBand(surface, rgb_scratch, use_rgba, fb_w, bpp,
                                                       tile, tiles_x, ty, th, ts);
         }
@@ -1287,27 +1314,28 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
     for (b = 0; b < num_bands; ++b) {
         const int ty = b * tile;
         const int th = (ty + tile <= fb_h) ? tile : (fb_h - ty);
-        const Uint16 *tile_span = all_spans + (size_t)b * (size_t)tiles_x;
+        const Uint32 *tile_span = all_spans + (size_t)b * (size_t)tiles_x;
         if (band_counts[b] == 0) {
             continue;
         }
         {
-            int run_x = -1;
-            int run_w = 0;
+            int run_x0 = -1;
+            int run_x1 = 0;
             int run_y0 = th;
             int run_y1 = 0;
             for (tx_idx = 0; tx_idx <= tiles_x; ++tx_idx) {
-                const Uint16 sp = (tx_idx < tiles_x) ? tile_span[tx_idx] : 0u;
+                const Uint32 sp = (tx_idx < tiles_x) ? tile_span[tx_idx] : 0u;
                 if (sp != 0u) {
                     const int tx = tx_idx * tile;
-                    const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
-                    const int sy0 = (int)(sp >> 8);
-                    const int sy1 = (int)(sp & 0xFFu);
-                    if (tx < min_x) {
-                        min_x = tx;
+                    const int sy0 = (int)((sp >> 24) & 0xFFu);
+                    const int sy1 = (int)((sp >> 16) & 0xFFu);
+                    const int sx0 = tx + (int)((sp >> 8) & 0xFFu);
+                    const int sx1 = tx + (int)(sp & 0xFFu);
+                    if (sx0 < min_x) {
+                        min_x = sx0;
                     }
-                    if (tx + tw > max_x) {
-                        max_x = tx + tw;
+                    if (sx1 > max_x) {
+                        max_x = sx1;
                     }
                     if (ty + sy0 < min_y) {
                         min_y = ty + sy0;
@@ -1315,13 +1343,13 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
                     if (ty + sy1 > max_y) {
                         max_y = ty + sy1;
                     }
-                    if (run_x < 0) {
-                        run_x = tx;
-                        run_w = tw;
+                    if (run_x0 < 0) {
+                        run_x0 = sx0;
+                        run_x1 = sx1;
                         run_y0 = sy0;
                         run_y1 = sy1;
                     } else {
-                        run_w += tw;
+                        run_x1 = sx1;
                         if (sy0 < run_y0) {
                             run_y0 = sy0;
                         }
@@ -1329,7 +1357,8 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
                             run_y1 = sy1;
                         }
                     }
-                } else if (run_x >= 0) {
+                } else if (run_x0 >= 0) {
+                    const int run_w = run_x1 - run_x0;
                     const int ry0 = ty + run_y0;
                     const int ry1 = ty + run_y1;
                     const int rh = ry1 - ry0;
@@ -1338,7 +1367,7 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
                         bool extended = false;
                         int k;
                         for (k = n_acc - 1; k >= 0; --k) {
-                            if (acc[k].x == run_x && acc[k].w == run_w &&
+                            if (acc[k].x == run_x0 && acc[k].w == run_w &&
                                 acc[k].y + acc[k].h == ry0) {
                                 acc[k].h += rh;
                                 extended = true;
@@ -1347,7 +1376,7 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
                         }
                         if (!extended) {
                             if (n_acc < (int)(sizeof(acc) / sizeof(acc[0]))) {
-                                acc[n_acc].x = run_x;
+                                acc[n_acc].x = run_x0;
                                 acc[n_acc].y = ry0;
                                 acc[n_acc].w = run_w;
                                 acc[n_acc].h = rh;
@@ -1357,8 +1386,8 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
                             }
                         }
                     }
-                    run_x = -1;
-                    run_w = 0;
+                    run_x0 = -1;
+                    run_x1 = 0;
                     run_y0 = th;
                     run_y1 = 0;
                 }
