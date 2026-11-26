@@ -144,11 +144,117 @@ static bool KITTY_PollReadable(int fd, int timeout_ms)
 }
 
 /*
+ * Free persistent transmit scratch buffers and reusable z_stream on vdata.
+ */
+void KITTY_FreeTransmitBuffers(SDL_VideoData *vdata)
+{
+    if (!vdata) {
+        return;
+    }
+    if (vdata->tx_zstream) {
+        deflateEnd((z_stream *)vdata->tx_zstream);
+        SDL_free(vdata->tx_zstream);
+        vdata->tx_zstream = NULL;
+    }
+    SDL_free(vdata->tx_z_buf);
+    vdata->tx_z_buf = NULL;
+    vdata->tx_z_cap = 0;
+    SDL_free(vdata->tx_b64_buf);
+    vdata->tx_b64_buf = NULL;
+    vdata->tx_b64_cap = 0;
+}
+
+static char *KITTY_EnsureB64Buf(SDL_VideoData *vdata, size_t need)
+{
+    char *p;
+    if (vdata->tx_b64_buf && vdata->tx_b64_cap >= need) {
+        return vdata->tx_b64_buf;
+    }
+    p = (char *)SDL_realloc(vdata->tx_b64_buf, need);
+    if (!p) {
+        return NULL;
+    }
+    vdata->tx_b64_buf = p;
+    vdata->tx_b64_cap = need;
+    return p;
+}
+
+static Uint8 *KITTY_EnsureZBuf(SDL_VideoData *vdata, size_t need)
+{
+    Uint8 *p;
+    if (vdata->tx_z_buf && vdata->tx_z_cap >= need) {
+        return vdata->tx_z_buf;
+    }
+    p = (Uint8 *)SDL_realloc(vdata->tx_z_buf, need);
+    if (!p) {
+        return NULL;
+    }
+    vdata->tx_z_buf = p;
+    vdata->tx_z_cap = need;
+    return p;
+}
+
+/*
+ * Compress src into vdata->tx_z_buf reusing a persistent z_stream (deflateReset)
+ * so we never pay deflateInit/deflateEnd (~256 KB alloc+memset) per frame/rect.
+ */
+static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t src_len,
+                               Uint8 **out_buf, size_t *out_len)
+{
+    z_stream *zs;
+    uLongf bound;
+    Uint8 *dst;
+    int zerr;
+
+    if (!vdata || !src || src_len == 0 || !out_buf || !out_len) {
+        return false;
+    }
+    if (!vdata->tx_zstream) {
+        zs = (z_stream *)SDL_calloc(1, sizeof(z_stream));
+        if (!zs) {
+            return false;
+        }
+        zerr = deflateInit2(zs, Z_BEST_SPEED, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY);
+        if (zerr != Z_OK) {
+            SDL_free(zs);
+            return SDL_SetError("zlib deflateInit2 failed (%d)", zerr);
+        }
+        vdata->tx_zstream = zs;
+    } else {
+        zs = (z_stream *)vdata->tx_zstream;
+        zerr = deflateReset(zs);
+        if (zerr != Z_OK) {
+            return SDL_SetError("zlib deflateReset failed (%d)", zerr);
+        }
+    }
+
+    bound = deflateBound(zs, (uLong)src_len);
+    dst = KITTY_EnsureZBuf(vdata, (size_t)bound);
+    if (!dst) {
+        return false;
+    }
+
+    zs->next_in = (Bytef *)src;
+    zs->avail_in = (uInt)src_len;
+    zs->next_out = (Bytef *)dst;
+    zs->avail_out = (uInt)bound;
+
+    zerr = deflate(zs, Z_FINISH);
+    if (zerr != Z_STREAM_END) {
+        return SDL_SetError("zlib deflate failed (%d)", zerr);
+    }
+
+    *out_buf = dst;
+    *out_len = (size_t)zs->total_out;
+    return true;
+}
+
+/*
  * Chunked direct (t=d) a=T transmit: base64-encode payload, optionally
  * home with CSI CUP, then write APC chunks sized by chunk_bytes.
  * extra_keys may add o=z or overlay z/X/Y. out_wire_bytes gets bytes sent.
  */
-static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
+static bool KITTY_TransmitDirectPayload(SDL_VideoData *vdata, int fd, Uint32 image_id, int w, int h,
                                         int place_cols, int place_rows,
                                         const char *extra_keys,
                                         const Uint8 *payload, size_t payload_len,
@@ -159,13 +265,12 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
     const size_t b64_len = ((payload_len + 2) / 3) * 4;
     const size_t chunk_cap = chunk_bytes > 0 ? chunk_bytes : KITTY_CHUNK_DEFAULT;
     size_t wire = 0;
-    char *b64 = (char *)SDL_malloc(b64_len + 1);
+    char *b64 = KITTY_EnsureB64Buf(vdata, b64_len + 1);
     if (!b64) {
         return false;
     }
     const size_t encoded = KITTY_Base64Encode(payload, payload_len, b64, b64_len + 1);
     if (encoded == 0) {
-        SDL_free(b64);
         return SDL_SetError("base64 encode failed");
     }
 
@@ -173,7 +278,6 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
      * fallback homes to 1;1 when a caller still passes home_cursor. */
     if (home_cursor) {
         if (!KITTY_WriteAll(fd, "\033[H", 3)) {
-            SDL_free(b64);
             return false;
         }
         wire += 3;
@@ -197,7 +301,6 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
                                                             w, h, place_cols, place_rows,
                                                             more != 0, extra_keys, 0, kitty_f);
             if (ctrl_len <= 0) {
-                SDL_free(b64);
                 return SDL_SetError("transmit header format failed");
             }
             header_len = SDL_snprintf(header, sizeof(header), "\033_G%s;", ctrl);
@@ -206,20 +309,17 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
             header_len = SDL_snprintf(header, sizeof(header), "\033_Gm=%d;", more);
         }
         if (header_len <= 0) {
-            SDL_free(b64);
             return SDL_SetError("header snprintf failed");
         }
         if (!KITTY_WriteAll(fd, header, (size_t)header_len) ||
             !KITTY_WriteAll(fd, b64 + offset, chunk) ||
             !KITTY_WriteAll(fd, "\033\\", 2)) {
-            SDL_free(b64);
             return false;
         }
         wire += (size_t)header_len + chunk + 2;
         offset += chunk;
     }
 
-    SDL_free(b64);
     if (out_wire_bytes) {
         *out_wire_bytes = wire;
     }
@@ -230,40 +330,30 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
  * zlib-compress RGB/RGBA then transmit as direct a=T with o=z.
  * out_raw_bytes receives compressed payload size (pre-base64).
  */
-static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
+static bool KITTY_TransmitDirectZlib(SDL_VideoData *vdata, int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
                                      int place_cols, int place_rows, int kitty_f, bool home_cursor,
                                      size_t chunk_bytes, size_t *out_wire_bytes, size_t *out_raw_bytes)
 {
     const int bpp = (kitty_f == 32) ? 4 : 3;
-    const uLong raw_len = (uLong)w * (uLong)h * (uLong)bpp;
-    uLongf bound = compressBound(raw_len);
-    Uint8 *compressed = (Uint8 *)SDL_malloc((size_t)bound);
-    if (!compressed) {
+    const size_t raw_len = (size_t)w * (size_t)h * (size_t)bpp;
+    Uint8 *compressed = NULL;
+    size_t out_len = 0;
+    if (!KITTY_ZlibCompress(vdata, rgb, raw_len, &compressed, &out_len)) {
         return false;
     }
-    uLongf out_len = bound;
-    const int zerr = compress2(compressed, &out_len, rgb, raw_len, Z_BEST_SPEED);
-    if (zerr != Z_OK) {
-        SDL_free(compressed);
-        return SDL_SetError("zlib compress2 failed (%d)", zerr);
-    }
     if (out_raw_bytes) {
-        *out_raw_bytes = (size_t)out_len; /* compressed payload size (pre-b64) */
+        *out_raw_bytes = out_len; /* compressed payload size (pre-b64) */
     }
-    {
-        const bool ok = KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows,
-                                                    "o=z", compressed, (size_t)out_len, kitty_f,
-                                                    home_cursor, chunk_bytes, out_wire_bytes);
-        SDL_free(compressed);
-        return ok;
-    }
+    return KITTY_TransmitDirectPayload(vdata, fd, image_id, w, h, place_cols, place_rows,
+                                       "o=z", compressed, out_len, kitty_f,
+                                       home_cursor, chunk_bytes, out_wire_bytes);
 }
 
 /*
  * Transmit uncompressed RGB/RGBA as direct a=T (no o=z).
  * out_raw_bytes receives the raw pixel byte count.
  */
-static bool KITTY_TransmitDirectRaw(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
+static bool KITTY_TransmitDirectRaw(SDL_VideoData *vdata, int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
                                     int place_cols, int place_rows, int kitty_f, bool home_cursor,
                                     size_t chunk_bytes, size_t *out_wire_bytes, size_t *out_raw_bytes)
 {
@@ -272,7 +362,7 @@ static bool KITTY_TransmitDirectRaw(int fd, Uint32 image_id, const Uint8 *rgb, i
     if (out_raw_bytes) {
         *out_raw_bytes = raw_len;
     }
-    return KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows, "", rgb, raw_len,
+    return KITTY_TransmitDirectPayload(vdata, fd, image_id, w, h, place_cols, place_rows, "", rgb, raw_len,
                                        kitty_f, home_cursor, chunk_bytes, out_wire_bytes);
 }
 
@@ -1390,7 +1480,7 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
     chunk_bytes = KITTY_ProfileApcChunkBytes(vdata->term_profile);
     {
         size_t wire = 0;
-        const bool ok = KITTY_TransmitDirectPayload(vdata->tty_fd, image_id, rw, rh,
+        const bool ok = KITTY_TransmitDirectPayload(vdata, vdata->tty_fd, image_id, rw, rh,
                                                    place_cols, place_rows, extra,
                                                    packed_rgb, payload_len, kitty_f,
                                                    false, chunk_bytes, &wire);
@@ -1462,29 +1552,21 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
      * several times over. */
     zlib_edit = KITTY_EditsCompressed(vdata);
     if (zlib_edit) {
-        uLongf out_len = compressBound((uLong)payload_len);
-        compressed = (Uint8 *)SDL_malloc(out_len);
-        if (!compressed) {
+        size_t zlen = 0;
+        if (!KITTY_ZlibCompress(vdata, packed_rgb, payload_len, &compressed, &zlen)) {
             return false;
         }
-        if (compress2(compressed, &out_len, packed_rgb, (uLong)payload_len, Z_BEST_SPEED) != Z_OK) {
-            SDL_free(compressed);
-            return SDL_SetError("zlib compress2 failed for a=f");
-        }
         body = compressed;
-        body_len = (size_t)out_len;
+        body_len = zlen;
     }
 
     b64_len = ((body_len + 2) / 3) * 4;
-    b64 = (char *)SDL_malloc(b64_len + 1);
+    b64 = KITTY_EnsureB64Buf(vdata, b64_len + 1);
     if (!b64) {
-        SDL_free(compressed);
         return false;
     }
     encoded = KITTY_Base64Encode(body, body_len, b64, b64_len + 1);
-    SDL_free(compressed);
     if (encoded == 0) {
-        SDL_free(b64);
         return SDL_SetError("base64 encode failed");
     }
 
@@ -1514,13 +1596,11 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                 header_len = SDL_snprintf(header, sizeof(header), "\033_Ga=f,m=%d;", more);
             }
             if (header_len <= 0) {
-                SDL_free(b64);
                 return SDL_SetError("frame-edit header snprintf failed");
             }
             if (!KITTY_WriteAll(vdata->tty_fd, header, (size_t)header_len) ||
                 !KITTY_WriteAll(vdata->tty_fd, b64 + offset, chunk) ||
                 !KITTY_WriteAll(vdata->tty_fd, "\033\\", 2)) {
-                SDL_free(b64);
                 return false;
             }
             wire += (size_t)header_len + chunk + 2;
@@ -1541,7 +1621,6 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
         }
     }
 
-    SDL_free(b64);
     return true;
 }
 
@@ -1681,7 +1760,7 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
             }
 
             if (!ok && vdata->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
-                if (KITTY_TransmitDirectZlib(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
+                if (KITTY_TransmitDirectZlib(vdata, vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
                                              kitty_f, home_cursor,
                                              KITTY_ProfileApcChunkBytes(vdata->term_profile),
                                              &wire_bytes, &raw_bytes)) {
@@ -1699,7 +1778,7 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
                         "set SDL_KITTY_FB_MAX=1280x720 or fix SHM",
                         (size_t)w, (size_t)h, raw_len);
                 }
-                ok = KITTY_TransmitDirectRaw(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
+                ok = KITTY_TransmitDirectRaw(vdata, vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
                                              kitty_f, home_cursor,
                                              KITTY_ProfileApcChunkBytes(vdata->term_profile),
                                              &wire_bytes, &raw_bytes);

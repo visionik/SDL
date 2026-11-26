@@ -106,6 +106,9 @@ void KITTY_RestoreTerminal(SDL_VideoData *data);
  */
 void KITTY_EmergencyRestore(int tty_in, int tty_out, bool use_alt_screen, bool leave_images);
 
+/* Free persistent transmit scratch buffers and reusable z_stream on vdata. */
+void KITTY_FreeTransmitBuffers(SDL_VideoData *vdata);
+
 /*
  * Full-frame transmit+place (a=T): SHM, zlib direct, or raw base64 per
  * vdata->transmit_mode / SDL_KITTY_TRANSMIT. kitty_f: 24 (RGB) or 32 (RGBA).

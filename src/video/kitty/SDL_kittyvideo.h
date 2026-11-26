@@ -150,6 +150,12 @@ typedef struct SDL_VideoData
     Uint32 wire_presents;
     Uint32 ack_presents; /* presents where ms_ack was measured */
     Uint32 skip_presents;
+    /* Persistent grow-only transmit buffers + reusable z_stream (zero per-frame malloc). */
+    Uint8 *tx_z_buf;
+    size_t tx_z_cap;
+    char *tx_b64_buf;
+    size_t tx_b64_cap;
+    void *tx_zstream; /* z_stream*, lazily initialized with deflateInit */
 } SDL_VideoData;
 
 /* Stacked a=T dirty overlays (dirty_at_overlays experiment). Ids 100+. */
@@ -182,6 +188,9 @@ typedef struct SDL_WindowData
     /* Exp 6: FNV of last successfully uploaded scratch (full buffer). */
     Uint64 last_upload_hash;
     bool last_upload_hash_valid;
+    /* Persistent grow-only scratch for packed dirty-rect uploads. */
+    Uint8 *pack_scratch;
+    size_t pack_scratch_cap;
 } SDL_WindowData;
 
 #endif // SDL_kittyvideo_h_

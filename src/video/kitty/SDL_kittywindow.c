@@ -146,6 +146,9 @@ void KITTY_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
         data->rgb_scratch = NULL;
         SDL_free(data->rgb_back);
         data->rgb_back = NULL;
+        SDL_free(data->pack_scratch);
+        data->pack_scratch = NULL;
+        data->pack_scratch_cap = 0;
         SDL_free(data);
     }
     window->internal = NULL;

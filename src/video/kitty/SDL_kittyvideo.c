@@ -424,6 +424,9 @@ static void KITTY_VideoQuit(SDL_VideoDevice *_this)
         KITTY_RestoreTerminal(data);
         data->terminal_owned = false;
     }
+    if (data) {
+        KITTY_FreeTransmitBuffers(data);
+    }
 }
 
 #endif // SDL_VIDEO_DRIVER_KITTY

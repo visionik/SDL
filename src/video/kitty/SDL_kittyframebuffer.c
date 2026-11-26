@@ -54,6 +54,9 @@ static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
     wdata->rgb_scratch = NULL;
     SDL_free(wdata->rgb_back);
     wdata->rgb_back = NULL;
+    SDL_free(wdata->pack_scratch);
+    wdata->pack_scratch = NULL;
+    wdata->pack_scratch_cap = 0;
     wdata->rgb_w = 0;
     wdata->rgb_h = 0;
     wdata->scratch_bpp = 0;
@@ -93,6 +96,24 @@ static bool KITTY_EnsureRGBScratch(SDL_WindowData *wdata, int w, int h, int bpp)
     wdata->rgb_valid = false;
     wdata->live_image_id = 0;
     return true;
+}
+
+static Uint8 *KITTY_EnsurePackScratch(SDL_WindowData *wdata, size_t need)
+{
+    Uint8 *p;
+    if (!wdata || need == 0) {
+        return NULL;
+    }
+    if (wdata->pack_scratch && wdata->pack_scratch_cap >= need) {
+        return wdata->pack_scratch;
+    }
+    p = (Uint8 *)SDL_realloc(wdata->pack_scratch, need);
+    if (!p) {
+        return NULL;
+    }
+    wdata->pack_scratch = p;
+    wdata->pack_scratch_cap = need;
+    return p;
 }
 
 /*
@@ -429,7 +450,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                         multi_ok = false;
                         break;
                     }
-                    packed = (Uint8 *)SDL_malloc(rpx * (size_t)bpp);
+                    packed = KITTY_EnsurePackScratch(wdata, rpx * (size_t)bpp);
                     if (!packed) {
                         multi_ok = false;
                         break;
@@ -448,7 +469,6 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     } else {
                         multi_upload += rpx;
                     }
-                    SDL_free(packed);
                     packed = NULL;
                 }
 
@@ -467,7 +487,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     size_t packed_len = 0;
                     const size_t pack_cap = convert_px * (size_t)bpp;
                     bool pack_ok = false;
-                    packed = (Uint8 *)SDL_malloc(pack_cap);
+                    packed = KITTY_EnsurePackScratch(wdata, pack_cap);
                     if (packed) {
                         pack_ok = use_rgba
                                       ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h,
@@ -487,7 +507,6 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     } else {
                         SDL_ClearError();
                     }
-                    SDL_free(packed);
                     packed = NULL;
                 }
             }
