@@ -815,7 +815,9 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
                 bool init_ok = true;
                 ctx->max_slices = max_s;
                 for (i = 0; i < max_s; ++i) {
-                    if (deflateInit2(&ctx->slices[i].stream, Z_BEST_SPEED, Z_DEFLATED, -15, 8,
+                    /* Level 3 stays on Apple's fast deflate path while shrinking
+                     * wire bytes enough to reduce overlapped PTY drain time. */
+                    if (deflateInit2(&ctx->slices[i].stream, 3, Z_DEFLATED, -15, 8,
                                      Z_DEFAULT_STRATEGY) != Z_OK) {
                         init_ok = false;
                         break;
