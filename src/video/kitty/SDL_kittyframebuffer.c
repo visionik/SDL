@@ -229,6 +229,10 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         bool upload_skip_enabled = false;
         bool have_pre_hash = false;
         Uint64 pre_hash = 0;
+        SDL_Rect diff_rects[16];
+        int diff_n = 0;
+        const SDL_Rect *multi_rects = rects;
+        int multi_numrects = numrects;
 
         if (!KITTY_EnsureRGBScratch(wdata, surface->w, surface->h, bpp)) {
             return false;
@@ -268,8 +272,10 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                         SDL_getenv("SDL_KITTY_FB_DIFF_COVER"),
                         vdata->term_profile ? vdata->term_profile->fb_diff_cover : 0.45f);
                     const KITTY_DiffOutcome diff =
-                        KITTY_TileDiffBBox(wdata->rgb_scratch, wdata->rgb_back, surface->w, surface->h,
-                                           bpp, tile, cover, &dirty);
+                        KITTY_TileDiffRects(wdata->rgb_scratch, wdata->rgb_back, surface->w, surface->h,
+                                            bpp, tile, cover, diff_rects,
+                                            (int)(sizeof(diff_rects) / sizeof(diff_rects[0])),
+                                            &diff_n, &dirty);
                     if (diff == KITTY_DIFF_NONE) {
 #ifdef SDL_KITTY_RUNTIME_DEBUG
                         if (KITTY_DebugEnabled()) {
@@ -285,6 +291,12 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     }
                     KITTY_SwapRGBScratch(wdata); /* scratch now holds the new frame */
                     diff_proved_changed = true;
+                    if (diff == KITTY_DIFF_RECT && diff_n > 1) {
+                        multi_rects = diff_rects;
+                        multi_numrects = diff_n;
+                    } else if (diff == KITTY_DIFF_RECT && diff_n == 1) {
+                        dirty = diff_rects[0];
+                    }
                     /* DIFF_FULL / DIFF_RECT both keep the tile-change bbox (do not
                      * expand to the full FB). af_max_coverage then chooses sparse a=f
                      * vs zlib/direct full a=T. Expanding to full used to force
@@ -390,15 +402,15 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 wdata->placed &&
                 wdata->live_image_id != 0;
 
-            if (want_af && rects && numrects > 1) {
+            if (want_af && multi_rects && multi_numrects > 1) {
                 bool multi_ok = true;
                 size_t multi_upload = 0;
                 size_t multi_total_px = 0;
                 int ri;
                 SDL_Rect fb = { 0, 0, surface->w, surface->h };
                 SDL_Rect coal_buf[32];
-                const SDL_Rect *af_rects = rects;
-                int af_n = numrects;
+                const SDL_Rect *af_rects = multi_rects;
+                int af_n = multi_numrects;
                 const int gap = KITTY_SelectCoalesceGap(
                     SDL_getenv("SDL_KITTY_COALESCE_GAP"),
                     vdata->term_profile ? vdata->term_profile->coalesce_gap_px : 0);
@@ -406,23 +418,22 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 /* Exp 5: merge near/overlapping dirty rects before multi a=f. */
                 if (gap > 0) {
                     const int cn = KITTY_CoalesceRects(
-                        surface->w, surface->h, rects, numrects, gap, coal_buf,
+                        surface->w, surface->h, multi_rects, multi_numrects, gap, coal_buf,
                         (int)(sizeof(coal_buf) / sizeof(coal_buf[0])));
                     if (cn > 0) {
                         af_rects = coal_buf;
                         af_n = cn;
 #ifdef SDL_KITTY_RUNTIME_DEBUG
-                        if (KITTY_DebugEnabled() && cn != numrects) {
+                        if (KITTY_DebugEnabled() && cn != multi_numrects) {
                             KITTY_DebugLog("kitty: coalesce %d -> %d rects (gap=%d)",
-                                           numrects, cn, gap);
+                                           multi_numrects, cn, gap);
                         }
 #endif
                     }
                 }
 
-                /* Same af_max_* gates as the single-rect path: total pixels and
-                 * union coverage. Per-rect-only caps allowed alpha_blit (~600k
-                 * base64) to flood Kitty's PTY while each rect stayed under max. */
+                /* Gate on actual total dirty pixels and actual multi-rect pixel
+                 * coverage (not the bloated bounding-box union of far corners). */
                 for (ri = 0; ri < af_n; ++ri) {
                     SDL_Rect clipped;
                     if (!SDL_GetRectIntersection(&af_rects[ri], &fb, &clipped) ||
@@ -431,8 +442,12 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     }
                     multi_total_px += (size_t)clipped.w * (size_t)clipped.h;
                 }
-                if (cov >= max_cov || multi_total_px > max_af_px || multi_total_px == 0) {
-                    multi_ok = false;
+                {
+                    const float fb_area = (float)surface->w * (float)surface->h;
+                    const float multi_cov = fb_area > 0.0f ? ((float)multi_total_px / fb_area) : 1.0f;
+                    if (multi_cov >= max_cov || multi_total_px > max_af_px || multi_total_px == 0) {
+                        multi_ok = false;
+                    }
                 }
 
                 for (ri = 0; multi_ok && ri < af_n; ++ri) {

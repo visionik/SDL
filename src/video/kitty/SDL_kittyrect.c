@@ -568,6 +568,188 @@ KITTY_DiffOutcome KITTY_TileDiffBBox(const Uint8 *prev, const Uint8 *next,
 }
 
 /*
+ * Multi-rect tile diff: merge contiguous dirty tiles into horizontal runs
+ * and extend matching runs vertically across tile rows. Falls back to
+ * coalescing or the full bbox when more than max_rects regions exist.
+ */
+KITTY_DiffOutcome KITTY_TileDiffRects(const Uint8 *prev, const Uint8 *next,
+                                      int fb_w, int fb_h, int bpp, int tile,
+                                      float cover_limit,
+                                      SDL_Rect *rects_out, int max_rects,
+                                      int *out_count, SDL_Rect *bbox_out)
+{
+    SDL_Rect acc[64];
+    int n_acc = 0;
+    bool overflow = false;
+    int ty, tx;
+    int min_x = fb_w, min_y = fb_h, max_x = 0, max_y = 0;
+    size_t dirty_px = 0;
+    SDL_Rect bbox;
+
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (bbox_out) {
+        bbox_out->x = 0;
+        bbox_out->y = 0;
+        bbox_out->w = fb_w;
+        bbox_out->h = fb_h;
+    }
+    if (!prev || !next || fb_w <= 0 || fb_h <= 0 || (bpp != 3 && bpp != 4) || tile <= 0) {
+        return KITTY_DIFF_FULL;
+    }
+
+    for (ty = 0; ty < fb_h; ty += tile) {
+        const int th = (ty + tile <= fb_h) ? tile : (fb_h - ty);
+        int run_x = -1;
+        int run_w = 0;
+
+        for (tx = 0; tx < fb_w; tx += tile) {
+            const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
+            int row;
+            bool changed = false;
+            for (row = 0; row < th; ++row) {
+                const size_t off = ((size_t)(ty + row) * (size_t)fb_w + (size_t)tx) * (size_t)bpp;
+                if (SDL_memcmp(prev + off, next + off, (size_t)tw * (size_t)bpp) != 0) {
+                    changed = true;
+                    break;
+                }
+            }
+            if (changed) {
+                dirty_px += (size_t)tw * (size_t)th;
+                if (tx < min_x) {
+                    min_x = tx;
+                }
+                if (ty < min_y) {
+                    min_y = ty;
+                }
+                if (tx + tw > max_x) {
+                    max_x = tx + tw;
+                }
+                if (ty + th > max_y) {
+                    max_y = ty + th;
+                }
+                if (run_x < 0) {
+                    run_x = tx;
+                    run_w = tw;
+                } else {
+                    run_w += tw;
+                }
+            } else if (run_x >= 0) {
+                /* Flush horizontal run and try vertical extension of matching rect. */
+                bool extended = false;
+                if (!overflow) {
+                    int k;
+                    for (k = n_acc - 1; k >= 0; --k) {
+                        if (acc[k].x == run_x && acc[k].w == run_w &&
+                            acc[k].y + acc[k].h == ty) {
+                            acc[k].h += th;
+                            extended = true;
+                            break;
+                        }
+                    }
+                    if (!extended) {
+                        if (n_acc < (int)(sizeof(acc) / sizeof(acc[0]))) {
+                            acc[n_acc].x = run_x;
+                            acc[n_acc].y = ty;
+                            acc[n_acc].w = run_w;
+                            acc[n_acc].h = th;
+                            n_acc++;
+                        } else {
+                            overflow = true;
+                        }
+                    }
+                }
+                run_x = -1;
+                run_w = 0;
+            }
+        }
+        if (run_x >= 0 && !overflow) {
+            bool extended = false;
+            int k;
+            for (k = n_acc - 1; k >= 0; --k) {
+                if (acc[k].x == run_x && acc[k].w == run_w &&
+                    acc[k].y + acc[k].h == ty) {
+                    acc[k].h += th;
+                    extended = true;
+                    break;
+                }
+            }
+            if (!extended) {
+                if (n_acc < (int)(sizeof(acc) / sizeof(acc[0]))) {
+                    acc[n_acc].x = run_x;
+                    acc[n_acc].y = ty;
+                    acc[n_acc].w = run_w;
+                    acc[n_acc].h = th;
+                    n_acc++;
+                } else {
+                    overflow = true;
+                }
+            }
+        }
+    }
+
+    if (dirty_px == 0) {
+        if (bbox_out) {
+            bbox_out->x = bbox_out->y = bbox_out->w = bbox_out->h = 0;
+        }
+        return KITTY_DIFF_NONE;
+    }
+
+    bbox.x = min_x;
+    bbox.y = min_y;
+    bbox.w = max_x - min_x;
+    bbox.h = max_y - min_y;
+    if (bbox_out) {
+        *bbox_out = bbox;
+    }
+
+    {
+        const float fb_area = (float)fb_w * (float)fb_h;
+        const float actual_cov = fb_area > 0.0f ? ((float)dirty_px / fb_area) : 1.0f;
+        if (actual_cov >= cover_limit) {
+            if (rects_out && max_rects > 0) {
+                rects_out[0] = bbox;
+            }
+            if (out_count) {
+                *out_count = (rects_out && max_rects > 0) ? 1 : 0;
+            }
+            return KITTY_DIFF_FULL;
+        }
+    }
+
+    if (rects_out && max_rects > 0) {
+        if (overflow) {
+            rects_out[0] = bbox;
+            if (out_count) {
+                *out_count = 1;
+            }
+        } else if (n_acc > max_rects) {
+            const int cn = KITTY_CoalesceRects(fb_w, fb_h, acc, n_acc, tile, rects_out, max_rects);
+            if (cn > 0) {
+                if (out_count) {
+                    *out_count = cn;
+                }
+            } else {
+                rects_out[0] = bbox;
+                if (out_count) {
+                    *out_count = 1;
+                }
+            }
+        } else {
+            int i;
+            for (i = 0; i < n_acc; ++i) {
+                rects_out[i] = acc[i];
+            }
+            if (out_count) {
+                *out_count = n_acc;
+            }
+        }
+    }
+    return KITTY_DIFF_RECT;
+}
+
+/*
  * FULL if SDL_KITTY_DIRTY disables dirty, scratch invalid, or union empty;
  * else DIRTY with dirty_out = union (no coverage threshold).
  */

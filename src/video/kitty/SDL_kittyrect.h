@@ -128,6 +128,18 @@ KITTY_DiffOutcome KITTY_TileDiffBBox(const Uint8 *prev, const Uint8 *next,
                                      float cover_limit, SDL_Rect *dirty_out);
 
 /*
+ * Multi-rect tile diff: scans prev vs next in tile×tile blocks, merges
+ * horizontally and vertically contiguous dirty tiles into up to max_rects
+ * disjoint rectangles, and returns NONE / RECT / FULL based on actual dirty
+ * pixel coverage vs cover_limit.
+ */
+KITTY_DiffOutcome KITTY_TileDiffRects(const Uint8 *prev, const Uint8 *next,
+                                      int fb_w, int fb_h, int bpp, int tile,
+                                      float cover_limit,
+                                      SDL_Rect *rects_out, int max_rects,
+                                      int *out_count, SDL_Rect *bbox_out);
+
+/*
  * SDL_KITTY_FB_DIFF: env "0"/off/false/no → false; non-empty otherwise →
  * true; unset → default_on (usually from profile).
  */
