@@ -39,6 +39,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <termios.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -167,6 +168,55 @@ static bool KITTY_WriteAll(int fd, const void *buf, size_t len)
         }
         p += (size_t)n;
         len -= (size_t)n;
+    }
+    return true;
+}
+
+/*
+ * Scatter-gather writev() loop sending header + payload + ST in a single
+ * syscall per APC chunk, with EINTR retry and poll(POLLOUT) on EAGAIN.
+ */
+static bool KITTY_WritevAll(int fd, struct iovec *iov, int iovcnt)
+{
+    int idx = 0;
+    while (idx < iovcnt) {
+        ssize_t n;
+        if (iov[idx].iov_len == 0) {
+            idx++;
+            continue;
+        }
+        n = writev(fd, iov + idx, iovcnt - idx);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd;
+                int pr;
+                pfd.fd = fd;
+                pfd.events = POLLOUT;
+                pfd.revents = 0;
+                pr = poll(&pfd, 1, 500);
+                if (pr > 0 && !(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                    continue;
+                }
+                if (pr < 0 && errno == EINTR) {
+                    continue;
+                }
+            }
+            return SDL_SetError("kitty writev failed: %s", strerror(errno));
+        }
+        {
+            size_t rem = (size_t)n;
+            while (idx < iovcnt && rem >= iov[idx].iov_len) {
+                rem -= iov[idx].iov_len;
+                idx++;
+            }
+            if (idx < iovcnt && rem > 0) {
+                iov[idx].iov_base = (char *)iov[idx].iov_base + rem;
+                iov[idx].iov_len -= rem;
+            }
+        }
     }
     return true;
 }
@@ -353,10 +403,17 @@ static bool KITTY_TransmitDirectPayload(SDL_VideoData *vdata, int fd, Uint32 ima
         if (header_len <= 0) {
             return SDL_SetError("header snprintf failed");
         }
-        if (!KITTY_WriteAll(fd, header, (size_t)header_len) ||
-            !KITTY_WriteAll(fd, b64 + offset, chunk) ||
-            !KITTY_WriteAll(fd, "\033\\", 2)) {
-            return false;
+        {
+            struct iovec iov[3];
+            iov[0].iov_base = header;
+            iov[0].iov_len = (size_t)header_len;
+            iov[1].iov_base = b64 + offset;
+            iov[1].iov_len = chunk;
+            iov[2].iov_base = (void *)"\033\\";
+            iov[2].iov_len = 2;
+            if (!KITTY_WritevAll(fd, iov, 3)) {
+                return false;
+            }
         }
         wire += (size_t)header_len + chunk + 2;
         offset += chunk;
@@ -430,12 +487,16 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
     }
     fd = vdata->tty_fd;
 
-    /* Keep name well under macOS PSHMNAMLEN (31 bytes). */
+    /* Keep name well under macOS PSHMNAMLEN (31 bytes). Unique per (pid, id, seq)
+     * so skip the guaranteed-ENOENT pre-unlink unless EEXIST actually happens. */
     SDL_snprintf(name, sizeof(name), "/sk-%x-%x-%x", (unsigned)getpid(), (unsigned)image_id,
                  (unsigned)seq);
-    shm_unlink(name);
 
     shm_fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0600);
+    if (shm_fd < 0 && errno == EEXIST) {
+        shm_unlink(name);
+        shm_fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0600);
+    }
     if (shm_fd < 0) {
         return SDL_SetError("shm_open failed: %s", strerror(errno));
     }
@@ -454,8 +515,9 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
         char name_b64[128];
         const size_t nlen = SDL_strlen(name);
         const size_t encoded = KITTY_Base64Encode((const Uint8 *)name, nlen, name_b64, sizeof(name_b64));
-        char header[256];
-        int header_len;
+        char ctrl[192];
+        char apc[400];
+        int ctrl_len, apc_len;
 
         if (encoded == 0) {
             SDL_SetError("shm name base64 failed");
@@ -464,24 +526,19 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
         if (home_cursor && !KITTY_WritePlaceOrigin(vdata)) {
             goto done;
         }
-        {
-            char ctrl[192];
-            const int ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 's', image_id,
-                                                            w, h, place_cols, place_rows,
-                                                            false, NULL, raw_len, kitty_f);
-            if (ctrl_len <= 0) {
-                SDL_SetError("shm header format failed");
-                goto done;
-            }
-            header_len = SDL_snprintf(header, sizeof(header), "\033_G%s;", ctrl);
-        }
-        if (header_len <= 0) {
-            SDL_SetError("shm header snprintf failed");
+        ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 's', image_id,
+                                              w, h, place_cols, place_rows,
+                                              false, NULL, raw_len, kitty_f);
+        if (ctrl_len <= 0) {
+            SDL_SetError("shm header format failed");
             goto done;
         }
-        if (!KITTY_WriteAll(fd, header, (size_t)header_len) ||
-            !KITTY_WriteAll(fd, name_b64, encoded) ||
-            !KITTY_WriteAll(fd, "\033\\", 2)) {
+        apc_len = SDL_snprintf(apc, sizeof(apc), "\033_G%s;%s\033\\", ctrl, name_b64);
+        if (apc_len <= 0 || (size_t)apc_len >= sizeof(apc)) {
+            SDL_SetError("shm apc snprintf failed");
+            goto done;
+        }
+        if (!KITTY_WriteAll(fd, apc, (size_t)apc_len)) {
             goto done;
         }
         ok = true;
@@ -1640,10 +1697,17 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
             if (header_len <= 0) {
                 return SDL_SetError("frame-edit header snprintf failed");
             }
-            if (!KITTY_WriteAll(vdata->tty_fd, header, (size_t)header_len) ||
-                !KITTY_WriteAll(vdata->tty_fd, b64 + offset, chunk) ||
-                !KITTY_WriteAll(vdata->tty_fd, "\033\\", 2)) {
-                return false;
+            {
+                struct iovec iov[3];
+                iov[0].iov_base = header;
+                iov[0].iov_len = (size_t)header_len;
+                iov[1].iov_base = b64 + offset;
+                iov[1].iov_len = chunk;
+                iov[2].iov_base = (void *)"\033\\";
+                iov[2].iov_len = 2;
+                if (!KITTY_WritevAll(vdata->tty_fd, iov, 3)) {
+                    return false;
+                }
             }
             wire += (size_t)header_len + chunk + 2;
             offset += chunk;
