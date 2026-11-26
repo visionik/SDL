@@ -984,48 +984,95 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
 #ifdef KITTY_HAVE_NEON_LE
         /* Clean-row fast path: scan 64 pixels per horizontal reduction (4x fewer
          * vmaxvq_u32 stalls & zero per-tile loop overhead) on unchanged rows. */
-        if (dirty_in_band == 0 && !use_rgba) {
+        if (dirty_in_band == 0) {
             int x = 0;
             const Uint32 *s = row_src;
             const Uint8 *d = row_dst;
             bool row_diff = false;
-            for (; x + 64 <= fb_w; x += 64) {
-                const uint8x16x4_t b0 = vld4q_u8((const uint8_t *)(s + x));
-                const uint8x16x3_t o0 = vld3q_u8(d);
-                const uint8x16x4_t b1 = vld4q_u8((const uint8_t *)(s + x + 16));
-                const uint8x16x3_t o1 = vld3q_u8(d + 48);
-                const uint8x16x4_t b2 = vld4q_u8((const uint8_t *)(s + x + 32));
-                const uint8x16x3_t o2 = vld3q_u8(d + 96);
-                const uint8x16x4_t b3 = vld4q_u8((const uint8_t *)(s + x + 48));
-                const uint8x16x3_t o3 = vld3q_u8(d + 144);
-                const uint8x16_t e0 = vorrq_u8(vorrq_u8(veorq_u8(b0.val[2], o0.val[0]),
-                                                        veorq_u8(b0.val[1], o0.val[1])),
-                                               veorq_u8(b0.val[0], o0.val[2]));
-                const uint8x16_t e1 = vorrq_u8(vorrq_u8(veorq_u8(b1.val[2], o1.val[0]),
-                                                        veorq_u8(b1.val[1], o1.val[1])),
-                                               veorq_u8(b1.val[0], o1.val[2]));
-                const uint8x16_t e2 = vorrq_u8(vorrq_u8(veorq_u8(b2.val[2], o2.val[0]),
-                                                        veorq_u8(b2.val[1], o2.val[1])),
-                                               veorq_u8(b2.val[0], o2.val[2]));
-                const uint8x16_t e3 = vorrq_u8(vorrq_u8(veorq_u8(b3.val[2], o3.val[0]),
-                                                        veorq_u8(b3.val[1], o3.val[1])),
-                                               veorq_u8(b3.val[0], o3.val[2]));
-                if (vmaxvq_u32(vreinterpretq_u32_u8(vorrq_u8(vorrq_u8(e0, e1), vorrq_u8(e2, e3)))) != 0) {
-                    row_diff = true;
-                    break;
-                }
-                d += 192;
-            }
-            if (!row_diff) {
-                for (; x < fb_w; ++x) {
-                    const Uint32 p = s[x];
-                    if (d[0] != (Uint8)((p >> 16) & 0xFF) ||
-                        d[1] != (Uint8)((p >> 8) & 0xFF) ||
-                        d[2] != (Uint8)(p & 0xFF)) {
+            if (!use_rgba) {
+                for (; x + 64 <= fb_w; x += 64) {
+                    const uint8x16x4_t b0 = vld4q_u8((const uint8_t *)(s + x));
+                    const uint8x16x3_t o0 = vld3q_u8(d);
+                    const uint8x16x4_t b1 = vld4q_u8((const uint8_t *)(s + x + 16));
+                    const uint8x16x3_t o1 = vld3q_u8(d + 48);
+                    const uint8x16x4_t b2 = vld4q_u8((const uint8_t *)(s + x + 32));
+                    const uint8x16x3_t o2 = vld3q_u8(d + 96);
+                    const uint8x16x4_t b3 = vld4q_u8((const uint8_t *)(s + x + 48));
+                    const uint8x16x3_t o3 = vld3q_u8(d + 144);
+                    const uint8x16_t e0 = vorrq_u8(vorrq_u8(veorq_u8(b0.val[2], o0.val[0]),
+                                                            veorq_u8(b0.val[1], o0.val[1])),
+                                                   veorq_u8(b0.val[0], o0.val[2]));
+                    const uint8x16_t e1 = vorrq_u8(vorrq_u8(veorq_u8(b1.val[2], o1.val[0]),
+                                                            veorq_u8(b1.val[1], o1.val[1])),
+                                                   veorq_u8(b1.val[0], o1.val[2]));
+                    const uint8x16_t e2 = vorrq_u8(vorrq_u8(veorq_u8(b2.val[2], o2.val[0]),
+                                                            veorq_u8(b2.val[1], o2.val[1])),
+                                                   veorq_u8(b2.val[0], o2.val[2]));
+                    const uint8x16_t e3 = vorrq_u8(vorrq_u8(veorq_u8(b3.val[2], o3.val[0]),
+                                                            veorq_u8(b3.val[1], o3.val[1])),
+                                                   veorq_u8(b3.val[0], o3.val[2]));
+                    if (vmaxvq_u32(vreinterpretq_u32_u8(vorrq_u8(vorrq_u8(e0, e1), vorrq_u8(e2, e3)))) != 0) {
                         row_diff = true;
                         break;
                     }
-                    d += 3;
+                    d += 192;
+                }
+                if (!row_diff) {
+                    for (; x < fb_w; ++x) {
+                        const Uint32 p = s[x];
+                        if (d[0] != (Uint8)((p >> 16) & 0xFF) ||
+                            d[1] != (Uint8)((p >> 8) & 0xFF) ||
+                            d[2] != (Uint8)(p & 0xFF)) {
+                            row_diff = true;
+                            break;
+                        }
+                        d += 3;
+                    }
+                }
+            } else {
+                for (; x + 64 <= fb_w; x += 64) {
+                    const uint8x16x4_t b0 = vld4q_u8((const uint8_t *)(s + x));
+                    const uint8x16x4_t o0 = vld4q_u8(d);
+                    const uint8x16x4_t b1 = vld4q_u8((const uint8_t *)(s + x + 16));
+                    const uint8x16x4_t o1 = vld4q_u8(d + 64);
+                    const uint8x16x4_t b2 = vld4q_u8((const uint8_t *)(s + x + 32));
+                    const uint8x16x4_t o2 = vld4q_u8(d + 128);
+                    const uint8x16x4_t b3 = vld4q_u8((const uint8_t *)(s + x + 48));
+                    const uint8x16x4_t o3 = vld4q_u8(d + 192);
+                    const uint8x16_t e0 = vorrq_u8(vorrq_u8(veorq_u8(b0.val[2], o0.val[0]),
+                                                            veorq_u8(b0.val[1], o0.val[1])),
+                                                   vorrq_u8(veorq_u8(b0.val[0], o0.val[2]),
+                                                            veorq_u8(b0.val[3], o0.val[3])));
+                    const uint8x16_t e1 = vorrq_u8(vorrq_u8(veorq_u8(b1.val[2], o1.val[0]),
+                                                            veorq_u8(b1.val[1], o1.val[1])),
+                                                   vorrq_u8(veorq_u8(b1.val[0], o1.val[2]),
+                                                            veorq_u8(b1.val[3], o1.val[3])));
+                    const uint8x16_t e2 = vorrq_u8(vorrq_u8(veorq_u8(b2.val[2], o2.val[0]),
+                                                            veorq_u8(b2.val[1], o2.val[1])),
+                                                   vorrq_u8(veorq_u8(b2.val[0], o2.val[2]),
+                                                            veorq_u8(b2.val[3], o2.val[3])));
+                    const uint8x16_t e3 = vorrq_u8(vorrq_u8(veorq_u8(b3.val[2], o3.val[0]),
+                                                            veorq_u8(b3.val[1], o3.val[1])),
+                                                   vorrq_u8(veorq_u8(b3.val[0], o3.val[2]),
+                                                            veorq_u8(b3.val[3], o3.val[3])));
+                    if (vmaxvq_u32(vreinterpretq_u32_u8(vorrq_u8(vorrq_u8(e0, e1), vorrq_u8(e2, e3)))) != 0) {
+                        row_diff = true;
+                        break;
+                    }
+                    d += 256;
+                }
+                if (!row_diff) {
+                    for (; x < fb_w; ++x) {
+                        const Uint32 p = s[x];
+                        if (d[0] != (Uint8)((p >> 16) & 0xFF) ||
+                            d[1] != (Uint8)((p >> 8) & 0xFF) ||
+                            d[2] != (Uint8)(p & 0xFF) ||
+                            d[3] != (Uint8)((p >> 24) & 0xFF)) {
+                            row_diff = true;
+                            break;
+                        }
+                        d += 4;
+                    }
                 }
             }
             if (!row_diff) {
@@ -1058,19 +1105,17 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
                                  veorq_u8(bgra.val[1], old.val[1])),
                         veorq_u8(bgra.val[0], old.val[2]));
                     if (vmaxvq_u32(vreinterpretq_u32_u8(d)) != 0) {
-                        Uint8 dbuf[16];
+                        const uint8x16_t nz = vtstq_u8(d, d);
+                        const uint8x8_t nib = vshrn_n_u16(vreinterpretq_u16_u8(nz), 4);
+                        const Uint64 mask = vget_lane_u64(vreinterpret_u64_u8(nib), 0);
+                        const int first_lane = (int)(__builtin_ctzll(mask) >> 2);
+                        const int last_lane = 15 - (int)(__builtin_clzll(mask) >> 2);
                         uint8x16x3_t rgb;
-                        int lane;
-                        vst1q_u8(dbuf, d);
-                        for (lane = 0; lane < 16; ++lane) {
-                            if (dbuf[lane]) {
-                                if (x + lane < min_rx) {
-                                    min_rx = x + lane;
-                                }
-                                if (x + lane + 1 > max_rx) {
-                                    max_rx = x + lane + 1;
-                                }
-                            }
+                        if (x + first_lane < min_rx) {
+                            min_rx = x + first_lane;
+                        }
+                        if (x + last_lane + 1 > max_rx) {
+                            max_rx = x + last_lane + 1;
                         }
                         rgb.val[0] = bgra.val[2];
                         rgb.val[1] = bgra.val[1];
@@ -1110,19 +1155,17 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
                         vorrq_u8(veorq_u8(bgra.val[0], old.val[2]),
                                  veorq_u8(bgra.val[3], old.val[3])));
                     if (vmaxvq_u32(vreinterpretq_u32_u8(d)) != 0) {
-                        Uint8 dbuf[16];
+                        const uint8x16_t nz = vtstq_u8(d, d);
+                        const uint8x8_t nib = vshrn_n_u16(vreinterpretq_u16_u8(nz), 4);
+                        const Uint64 mask = vget_lane_u64(vreinterpret_u64_u8(nib), 0);
+                        const int first_lane = (int)(__builtin_ctzll(mask) >> 2);
+                        const int last_lane = 15 - (int)(__builtin_clzll(mask) >> 2);
                         uint8x16x4_t rgba;
-                        int lane;
-                        vst1q_u8(dbuf, d);
-                        for (lane = 0; lane < 16; ++lane) {
-                            if (dbuf[lane]) {
-                                if (x + lane < min_rx) {
-                                    min_rx = x + lane;
-                                }
-                                if (x + lane + 1 > max_rx) {
-                                    max_rx = x + lane + 1;
-                                }
-                            }
+                        if (x + first_lane < min_rx) {
+                            min_rx = x + first_lane;
+                        }
+                        if (x + last_lane + 1 > max_rx) {
+                            max_rx = x + last_lane + 1;
                         }
                         rgba.val[0] = bgra.val[2];
                         rgba.val[1] = bgra.val[1];
