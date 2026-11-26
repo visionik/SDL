@@ -140,6 +140,17 @@ KITTY_DiffOutcome KITTY_TileDiffRects(const Uint8 *prev, const Uint8 *next,
                                       int *out_count, SDL_Rect *bbox_out);
 
 /*
+ * Fused single-pass surface convert + multi-rect tile diff: compares
+ * XRGB8888/ARGB8888 surface pixels directly against rgb_scratch in-place,
+ * writing only changed chunks into rgb_scratch (read-only on static tiles,
+ * write-only on already-dirty tiles) and emitting up to max_rects dirty rects.
+ */
+KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb_scratch,
+                                                bool use_rgba, int tile, float cover_limit,
+                                                SDL_Rect *rects_out, int max_rects,
+                                                int *out_count, SDL_Rect *bbox_out);
+
+/*
  * SDL_KITTY_FB_DIFF: env "0"/off/false/no → false; non-empty otherwise →
  * true; unset → default_on (usually from profile).
  */

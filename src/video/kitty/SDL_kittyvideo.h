@@ -190,10 +190,8 @@ typedef struct SDL_WindowData
     Uint32 image_ids[2];
     int image_index;
     bool placed;
-    /* Retained RGB24/RGBA32: rgb_scratch = last presented; rgb_back = convert target
-     * for tile-diff (pointer-swapped after each present). */
+    /* Retained RGB24/RGBA32 scratch (updated in-place by fused convert+tile-diff). */
     Uint8 *rgb_scratch;
-    Uint8 *rgb_back;
     int rgb_w;
     int rgb_h;
     int scratch_bpp; /* 3 (f=24) or 4 (f=32) */

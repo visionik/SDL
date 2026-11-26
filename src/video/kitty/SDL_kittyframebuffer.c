@@ -42,7 +42,7 @@
 #define KITTY_SURFACE "SDL.internal.window.surface"
 
 /*
- * Free rgb_scratch/rgb_back and reset present state on wdata: dimensions,
+ * Free rgb_scratch/pack_scratch and reset present state on wdata: dimensions,
  * live_image_id, overlay_count, and last_upload_hash. Safe if wdata is NULL.
  */
 static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
@@ -52,8 +52,6 @@ static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
     }
     SDL_free(wdata->rgb_scratch);
     wdata->rgb_scratch = NULL;
-    SDL_free(wdata->rgb_back);
-    wdata->rgb_back = NULL;
     SDL_free(wdata->pack_scratch);
     wdata->pack_scratch = NULL;
     wdata->pack_scratch_cap = 0;
@@ -68,8 +66,8 @@ static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
 }
 
 /*
- * Ensure paired rgb_scratch and rgb_back buffers exist for w×h at bpp 3 or 4.
- * Reuses existing buffers when size/bpp match; otherwise frees and mallocs.
+ * Ensure rgb_scratch buffer exists for w×h at bpp 3 or 4.
+ * Reuses existing buffer when size/bpp match; otherwise frees and mallocs.
  * Clears rgb_valid and live_image_id on realloc. Returns false on OOM/bad args.
  */
 static bool KITTY_EnsureRGBScratch(SDL_WindowData *wdata, int w, int h, int bpp)
@@ -79,14 +77,13 @@ static bool KITTY_EnsureRGBScratch(SDL_WindowData *wdata, int w, int h, int bpp)
         return false;
     }
     need = (size_t)w * (size_t)h * (size_t)bpp;
-    if (wdata->rgb_scratch && wdata->rgb_back && wdata->rgb_w == w && wdata->rgb_h == h &&
+    if (wdata->rgb_scratch && wdata->rgb_w == w && wdata->rgb_h == h &&
         wdata->scratch_bpp == bpp) {
         return true;
     }
     KITTY_FreeRGBScratch(wdata);
     wdata->rgb_scratch = (Uint8 *)SDL_malloc(need);
-    wdata->rgb_back = (Uint8 *)SDL_malloc(need);
-    if (!wdata->rgb_scratch || !wdata->rgb_back) {
+    if (!wdata->rgb_scratch) {
         KITTY_FreeRGBScratch(wdata);
         return false;
     }
@@ -114,21 +111,6 @@ static Uint8 *KITTY_EnsurePackScratch(SDL_WindowData *wdata, size_t need)
     wdata->pack_scratch = p;
     wdata->pack_scratch_cap = need;
     return p;
-}
-
-/*
- * Swap rgb_scratch and rgb_back pointers so the newly converted frame becomes
- * the reference for the next tile-diff. No-op if wdata is NULL.
- */
-static void KITTY_SwapRGBScratch(SDL_WindowData *wdata)
-{
-    Uint8 *tmp;
-    if (!wdata) {
-        return;
-    }
-    tmp = wdata->rgb_scratch;
-    wdata->rgb_scratch = wdata->rgb_back;
-    wdata->rgb_back = tmp;
 }
 
 /*
@@ -259,9 +241,10 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         full.h = surface->h;
 
         /*
-         * Tile-diff for full-frame presents (MAME soft always flips the whole
-         * surface). Convert into rgb_back, memcmp 32x32 tiles vs rgb_scratch,
-         * then sparse a=f on the bbox — or skip if identical.
+         * Fused convert + multi-rect tile-diff for full-frame presents (MAME
+         * soft always flips the whole surface). Compares surface pixels
+         * directly against rgb_scratch in one pass, updating changed tiles
+         * in-place and skipping unchanged writes completely.
          */
         {
             const float app_cov = KITTY_CoverageRatio(surface->w, surface->h, &dirty);
@@ -269,14 +252,8 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                                         ? vdata->cfg_fb_diff
                                         : KITTY_SelectFbDiff(SDL_getenv("SDL_KITTY_FB_DIFF"),
                                                              vdata->term_profile ? vdata->term_profile->fb_diff : true);
-            const bool want_diff = fb_diff_on && wdata->rgb_valid && wdata->rgb_back && app_cov >= 0.90f;
+            const bool want_diff = fb_diff_on && wdata->rgb_valid && app_cov >= 0.90f;
             if (want_diff) {
-                const bool conv_ok = use_rgba
-                                         ? KITTY_ConvertSurfaceRectToRGBA(surface, &full, wdata->rgb_back)
-                                         : KITTY_ConvertSurfaceRectToRGB(surface, &full, wdata->rgb_back);
-                if (!conv_ok) {
-                    return SDL_SetError("kitty RGB convert failed");
-                }
                 {
                     const int tile = vdata->cfg_cached
                                          ? vdata->cfg_fb_diff_tile
@@ -289,10 +266,10 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                                                   SDL_getenv("SDL_KITTY_FB_DIFF_COVER"),
                                                   vdata->term_profile ? vdata->term_profile->fb_diff_cover : 0.45f);
                     const KITTY_DiffOutcome diff =
-                        KITTY_TileDiffRects(wdata->rgb_scratch, wdata->rgb_back, surface->w, surface->h,
-                                            bpp, tile, cover, diff_rects,
-                                            (int)(sizeof(diff_rects) / sizeof(diff_rects[0])),
-                                            &diff_n, &dirty);
+                        KITTY_ConvertAndTileDiffRects(surface, wdata->rgb_scratch, use_rgba,
+                                                      tile, cover, diff_rects,
+                                                      (int)(sizeof(diff_rects) / sizeof(diff_rects[0])),
+                                                      &diff_n, &dirty);
                     if (diff == KITTY_DIFF_NONE) {
 #ifdef SDL_KITTY_RUNTIME_DEBUG
                         if (KITTY_DebugEnabled()) {
@@ -306,7 +283,6 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
 #endif
                         return true;
                     }
-                    KITTY_SwapRGBScratch(wdata); /* scratch now holds the new frame */
                     diff_proved_changed = true;
                     if (diff == KITTY_DIFF_RECT && diff_n > 1) {
                         multi_rects = diff_rects;

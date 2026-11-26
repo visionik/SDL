@@ -888,6 +888,397 @@ KITTY_DiffOutcome KITTY_TileDiffRects(const Uint8 *prev, const Uint8 *next,
     return KITTY_DIFF_RECT;
 }
 
+static inline void KITTY_ConvertRowRGB(const Uint32 *src, Uint8 *dst, int count)
+{
+    int x = 0;
+#ifdef KITTY_HAVE_NEON_LE
+    for (; x + 16 <= count; x += 16) {
+        const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
+        uint8x16x3_t rgb;
+        rgb.val[0] = bgra.val[2];
+        rgb.val[1] = bgra.val[1];
+        rgb.val[2] = bgra.val[0];
+        vst3q_u8(dst, rgb);
+        dst += 48;
+    }
+#endif
+    for (; x < count; ++x) {
+        const Uint32 p = src[x];
+        *dst++ = (Uint8)((p >> 16) & 0xFF);
+        *dst++ = (Uint8)((p >> 8) & 0xFF);
+        *dst++ = (Uint8)(p & 0xFF);
+    }
+}
+
+static inline void KITTY_ConvertRowRGBA(const Uint32 *src, Uint8 *dst, int count)
+{
+    int x = 0;
+#ifdef KITTY_HAVE_NEON_LE
+    for (; x + 16 <= count; x += 16) {
+        const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
+        uint8x16x4_t rgba;
+        rgba.val[0] = bgra.val[2];
+        rgba.val[1] = bgra.val[1];
+        rgba.val[2] = bgra.val[0];
+        rgba.val[3] = bgra.val[3];
+        vst4q_u8(dst, rgba);
+        dst += 64;
+    }
+#endif
+    for (; x < count; ++x) {
+        const Uint32 p = src[x];
+        *dst++ = (Uint8)((p >> 16) & 0xFF);
+        *dst++ = (Uint8)((p >> 8) & 0xFF);
+        *dst++ = (Uint8)(p & 0xFF);
+        *dst++ = (Uint8)((p >> 24) & 0xFF);
+    }
+}
+
+/*
+ * Fused single-pass convert + multi-rect tile diff: compares surface pixels
+ * directly against rgb_scratch in-place, updating changed pixels and leaving
+ * clean tiles read-only. Already-dirty tiles skip reading rgb_scratch.
+ */
+KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb_scratch,
+                                                bool use_rgba, int tile, float cover_limit,
+                                                SDL_Rect *rects_out, int max_rects,
+                                                int *out_count, SDL_Rect *bbox_out)
+{
+    Uint8 stack_dirty[512];
+    Uint8 *tile_dirty = stack_dirty;
+    SDL_Rect acc[64];
+    int n_acc = 0;
+    bool overflow = false;
+    int fb_w, fb_h, bpp, tiles_x;
+    int ty, tx_idx;
+    int min_x, min_y, max_x = 0, max_y = 0;
+    size_t dirty_px = 0;
+    SDL_Rect bbox;
+
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!surface || !rgb_scratch || surface->w <= 0 || surface->h <= 0 || tile <= 0) {
+        if (bbox_out) {
+            bbox_out->x = bbox_out->y = 0;
+            bbox_out->w = surface ? surface->w : 0;
+            bbox_out->h = surface ? surface->h : 0;
+        }
+        return KITTY_DIFF_FULL;
+    }
+
+    fb_w = surface->w;
+    fb_h = surface->h;
+    bpp = use_rgba ? 4 : 3;
+    min_x = fb_w;
+    min_y = fb_h;
+    if (bbox_out) {
+        bbox_out->x = 0;
+        bbox_out->y = 0;
+        bbox_out->w = fb_w;
+        bbox_out->h = fb_h;
+    }
+
+    tiles_x = (fb_w + tile - 1) / tile;
+    if (tiles_x > (int)sizeof(stack_dirty)) {
+        tile_dirty = (Uint8 *)SDL_malloc((size_t)tiles_x);
+        if (!tile_dirty) {
+            return KITTY_DIFF_FULL;
+        }
+    }
+
+    for (ty = 0; ty < fb_h; ty += tile) {
+        const int th = (ty + tile <= fb_h) ? tile : (fb_h - ty);
+        int dirty_in_band = 0;
+        int row;
+
+        SDL_memset(tile_dirty, 0, (size_t)tiles_x);
+
+        for (row = 0; row < th; ++row) {
+            const Uint32 *row_src = (const Uint32 *)((const Uint8 *)surface->pixels +
+                                                     (size_t)(ty + row) * (size_t)surface->pitch);
+            Uint8 *row_dst = rgb_scratch + (size_t)(ty + row) * (size_t)fb_w * (size_t)bpp;
+
+            if (dirty_in_band == tiles_x) {
+                /* Whole band already dirty: contiguous write-only NEON convert. */
+                if (use_rgba) {
+                    KITTY_ConvertRowRGBA(row_src, row_dst, fb_w);
+                } else {
+                    KITTY_ConvertRowRGB(row_src, row_dst, fb_w);
+                }
+                continue;
+            }
+
+            for (tx_idx = 0; tx_idx < tiles_x; ++tx_idx) {
+                const int tx = tx_idx * tile;
+                const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
+                const Uint32 *src = row_src + tx;
+                Uint8 *dst = row_dst + (size_t)tx * (size_t)bpp;
+
+                if (tile_dirty[tx_idx]) {
+                    if (use_rgba) {
+                        KITTY_ConvertRowRGBA(src, dst, tw);
+                    } else {
+                        KITTY_ConvertRowRGB(src, dst, tw);
+                    }
+                    continue;
+                }
+
+                if (!use_rgba) {
+                    int x = 0;
+                    bool changed = false;
+#ifdef KITTY_HAVE_NEON_LE
+                    for (; x + 16 <= tw; x += 16) {
+                        const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
+                        const uint8x16x3_t old = vld3q_u8(dst);
+                        const uint8x16_t d = vorrq_u8(
+                            vorrq_u8(veorq_u8(bgra.val[2], old.val[0]),
+                                     veorq_u8(bgra.val[1], old.val[1])),
+                            veorq_u8(bgra.val[0], old.val[2]));
+                        if (vmaxvq_u32(vreinterpretq_u32_u8(d)) != 0) {
+                            uint8x16x3_t rgb;
+                            rgb.val[0] = bgra.val[2];
+                            rgb.val[1] = bgra.val[1];
+                            rgb.val[2] = bgra.val[0];
+                            vst3q_u8(dst, rgb);
+                            changed = true;
+                            x += 16;
+                            dst += 48;
+                            break;
+                        }
+                        dst += 48;
+                    }
+#endif
+                    if (!changed) {
+                        for (; x < tw; ++x) {
+                            const Uint32 p = src[x];
+                            const Uint8 r = (Uint8)((p >> 16) & 0xFF);
+                            const Uint8 g = (Uint8)((p >> 8) & 0xFF);
+                            const Uint8 b = (Uint8)(p & 0xFF);
+                            if (dst[0] != r || dst[1] != g || dst[2] != b) {
+                                dst[0] = r;
+                                dst[1] = g;
+                                dst[2] = b;
+                                changed = true;
+                                x++;
+                                dst += 3;
+                                break;
+                            }
+                            dst += 3;
+                        }
+                    }
+                    if (changed) {
+                        tile_dirty[tx_idx] = 1;
+                        dirty_in_band++;
+                        if (x < tw) {
+                            KITTY_ConvertRowRGB(src + x, dst, tw - x);
+                        }
+                    }
+                } else {
+                    int x = 0;
+                    bool changed = false;
+#ifdef KITTY_HAVE_NEON_LE
+                    for (; x + 16 <= tw; x += 16) {
+                        const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
+                        const uint8x16x4_t old = vld4q_u8(dst);
+                        const uint8x16_t d = vorrq_u8(
+                            vorrq_u8(veorq_u8(bgra.val[2], old.val[0]),
+                                     veorq_u8(bgra.val[1], old.val[1])),
+                            vorrq_u8(veorq_u8(bgra.val[0], old.val[2]),
+                                     veorq_u8(bgra.val[3], old.val[3])));
+                        if (vmaxvq_u32(vreinterpretq_u32_u8(d)) != 0) {
+                            uint8x16x4_t rgba;
+                            rgba.val[0] = bgra.val[2];
+                            rgba.val[1] = bgra.val[1];
+                            rgba.val[2] = bgra.val[0];
+                            rgba.val[3] = bgra.val[3];
+                            vst4q_u8(dst, rgba);
+                            changed = true;
+                            x += 16;
+                            dst += 64;
+                            break;
+                        }
+                        dst += 64;
+                    }
+#endif
+                    if (!changed) {
+                        for (; x < tw; ++x) {
+                            const Uint32 p = src[x];
+                            const Uint8 r = (Uint8)((p >> 16) & 0xFF);
+                            const Uint8 g = (Uint8)((p >> 8) & 0xFF);
+                            const Uint8 b = (Uint8)(p & 0xFF);
+                            const Uint8 a = (Uint8)((p >> 24) & 0xFF);
+                            if (dst[0] != r || dst[1] != g || dst[2] != b || dst[3] != a) {
+                                dst[0] = r;
+                                dst[1] = g;
+                                dst[2] = b;
+                                dst[3] = a;
+                                changed = true;
+                                x++;
+                                dst += 4;
+                                break;
+                            }
+                            dst += 4;
+                        }
+                    }
+                    if (changed) {
+                        tile_dirty[tx_idx] = 1;
+                        dirty_in_band++;
+                        if (x < tw) {
+                            KITTY_ConvertRowRGBA(src + x, dst, tw - x);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (dirty_in_band == 0) {
+            continue;
+        }
+        if (ty < min_y) {
+            min_y = ty;
+        }
+        if (ty + th > max_y) {
+            max_y = ty + th;
+        }
+        {
+            int run_x = -1;
+            int run_w = 0;
+            for (tx_idx = 0; tx_idx < tiles_x; ++tx_idx) {
+                const int tx = tx_idx * tile;
+                const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
+                if (tile_dirty[tx_idx]) {
+                    dirty_px += (size_t)tw * (size_t)th;
+                    if (tx < min_x) {
+                        min_x = tx;
+                    }
+                    if (tx + tw > max_x) {
+                        max_x = tx + tw;
+                    }
+                    if (run_x < 0) {
+                        run_x = tx;
+                        run_w = tw;
+                    } else {
+                        run_w += tw;
+                    }
+                } else if (run_x >= 0) {
+                    if (!overflow) {
+                        bool extended = false;
+                        int k;
+                        for (k = n_acc - 1; k >= 0; --k) {
+                            if (acc[k].x == run_x && acc[k].w == run_w &&
+                                acc[k].y + acc[k].h == ty) {
+                                acc[k].h += th;
+                                extended = true;
+                                break;
+                            }
+                        }
+                        if (!extended) {
+                            if (n_acc < (int)(sizeof(acc) / sizeof(acc[0]))) {
+                                acc[n_acc].x = run_x;
+                                acc[n_acc].y = ty;
+                                acc[n_acc].w = run_w;
+                                acc[n_acc].h = th;
+                                n_acc++;
+                            } else {
+                                overflow = true;
+                            }
+                        }
+                    }
+                    run_x = -1;
+                    run_w = 0;
+                }
+            }
+            if (run_x >= 0 && !overflow) {
+                bool extended = false;
+                int k;
+                for (k = n_acc - 1; k >= 0; --k) {
+                    if (acc[k].x == run_x && acc[k].w == run_w &&
+                        acc[k].y + acc[k].h == ty) {
+                        acc[k].h += th;
+                        extended = true;
+                        break;
+                    }
+                }
+                if (!extended) {
+                    if (n_acc < (int)(sizeof(acc) / sizeof(acc[0]))) {
+                        acc[n_acc].x = run_x;
+                        acc[n_acc].y = ty;
+                        acc[n_acc].w = run_w;
+                        acc[n_acc].h = th;
+                        n_acc++;
+                    } else {
+                        overflow = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (tile_dirty != stack_dirty) {
+        SDL_free(tile_dirty);
+    }
+
+    if (dirty_px == 0) {
+        if (bbox_out) {
+            bbox_out->x = bbox_out->y = bbox_out->w = bbox_out->h = 0;
+        }
+        return KITTY_DIFF_NONE;
+    }
+
+    bbox.x = min_x;
+    bbox.y = min_y;
+    bbox.w = max_x - min_x;
+    bbox.h = max_y - min_y;
+    if (bbox_out) {
+        *bbox_out = bbox;
+    }
+
+    {
+        const float fb_area = (float)fb_w * (float)fb_h;
+        const float actual_cov = fb_area > 0.0f ? ((float)dirty_px / fb_area) : 1.0f;
+        if (actual_cov >= cover_limit) {
+            if (rects_out && max_rects > 0) {
+                rects_out[0] = bbox;
+            }
+            if (out_count) {
+                *out_count = (rects_out && max_rects > 0) ? 1 : 0;
+            }
+            return KITTY_DIFF_FULL;
+        }
+    }
+
+    if (rects_out && max_rects > 0) {
+        if (overflow) {
+            rects_out[0] = bbox;
+            if (out_count) {
+                *out_count = 1;
+            }
+        } else if (n_acc > max_rects) {
+            const int cn = KITTY_CoalesceRects(fb_w, fb_h, acc, n_acc, tile, rects_out, max_rects);
+            if (cn > 0) {
+                if (out_count) {
+                    *out_count = cn;
+                }
+            } else {
+                rects_out[0] = bbox;
+                if (out_count) {
+                    *out_count = 1;
+                }
+            }
+        } else {
+            int i;
+            for (i = 0; i < n_acc; ++i) {
+                rects_out[i] = acc[i];
+            }
+            if (out_count) {
+                *out_count = n_acc;
+            }
+        }
+    }
+    return KITTY_DIFF_RECT;
+}
+
 /*
  * FULL if SDL_KITTY_DIRTY disables dirty, scratch invalid, or union empty;
  * else DIRTY with dirty_out = union (no coverage threshold).
