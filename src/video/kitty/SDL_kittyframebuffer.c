@@ -204,6 +204,10 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         const bool use_rgba = SDL_ISPIXELFORMAT_ALPHA(surface->format);
         const int bpp = use_rgba ? 4 : 3;
         const int kitty_f = use_rgba ? 32 : 24;
+        bool diff_proved_changed = false;
+        bool upload_skip_enabled = false;
+        bool have_pre_hash = false;
+        Uint64 pre_hash = 0;
 
         if (!KITTY_EnsureRGBScratch(wdata, surface->w, surface->h, bpp)) {
             return false;
@@ -259,6 +263,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                         return true;
                     }
                     KITTY_SwapRGBScratch(wdata); /* scratch now holds the new frame */
+                    diff_proved_changed = true;
                     /* DIFF_FULL / DIFF_RECT both keep the tile-change bbox (do not
                      * expand to the full FB). af_max_coverage then chooses sparse a=f
                      * vs zlib/direct full a=T. Expanding to full used to force
@@ -308,25 +313,25 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         /*
          * Exp 6: if the full scratch matches the last successful upload, skip
          * the wire (covers dirty_cpu full a=T storms when pixels did not change).
+         * Skip hashing completely when tile-diff already proved pixels changed
+         * (tile-diff handles identical full-surface frames in ~80 us), and
+         * reuse pre_hash after upload so we never hash twice in one frame.
          */
-        {
-            const bool want_skip =
-                KITTY_SelectUploadSkip(SDL_getenv("SDL_KITTY_UPLOAD_SKIP"),
-                                       vdata->term_profile
-                                           ? vdata->term_profile->upload_skip
-                                           : true) &&
-                wdata->placed && wdata->last_upload_hash_valid && wdata->rgb_scratch;
-            if (want_skip) {
-                const size_t bytes =
-                    (size_t)surface->w * (size_t)surface->h * (size_t)bpp;
-                const Uint64 h = KITTY_Fnv1a64(wdata->rgb_scratch, bytes);
-                if (h == wdata->last_upload_hash) {
-                    ok = true;
-                    wire_mode = KITTY_WIRE_UPLOAD_SKIP;
-                    upload_px = 0;
-                    vdata->skip_presents += 1;
-                    goto kitty_present_log;
-                }
+        upload_skip_enabled = KITTY_SelectUploadSkip(
+            SDL_getenv("SDL_KITTY_UPLOAD_SKIP"),
+            vdata->term_profile ? vdata->term_profile->upload_skip : true);
+        if (upload_skip_enabled && !diff_proved_changed && wdata->rgb_scratch) {
+            const size_t bytes =
+                (size_t)surface->w * (size_t)surface->h * (size_t)bpp;
+            pre_hash = KITTY_Fnv1a64(wdata->rgb_scratch, bytes);
+            have_pre_hash = true;
+            if (wdata->placed && wdata->last_upload_hash_valid &&
+                pre_hash == wdata->last_upload_hash) {
+                ok = true;
+                wire_mode = KITTY_WIRE_UPLOAD_SKIP;
+                upload_px = 0;
+                vdata->skip_presents += 1;
+                goto kitty_present_log;
             }
         }
 
@@ -734,12 +739,14 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             }
         }
 
-        /* Fingerprint scratch after any successful wire upload (full or sparse). */
-        if (ok && wire_mode != KITTY_WIRE_UPLOAD_SKIP && wdata->rgb_scratch) {
-            const size_t bytes =
-                (size_t)surface->w * (size_t)surface->h * (size_t)bpp;
-            wdata->last_upload_hash = KITTY_Fnv1a64(wdata->rgb_scratch, bytes);
-            wdata->last_upload_hash_valid = true;
+        /* Record fingerprint after successful upload without re-hashing. */
+        if (ok && wire_mode != KITTY_WIRE_UPLOAD_SKIP) {
+            if (upload_skip_enabled && have_pre_hash) {
+                wdata->last_upload_hash = pre_hash;
+                wdata->last_upload_hash_valid = true;
+            } else {
+                wdata->last_upload_hash_valid = false;
+            }
         }
 
     kitty_present_log:
