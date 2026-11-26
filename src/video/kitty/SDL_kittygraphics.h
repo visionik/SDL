@@ -101,6 +101,12 @@ bool KITTY_EnableMouse(SDL_VideoData *data);
 void KITTY_RestoreTerminal(SDL_VideoData *data);
 
 /*
+ * Async-signal-safe terminal restore for SIGINT/SIGTERM handlers: writes
+ * mode-reset escapes and restores saved termios without allocating or logging.
+ */
+void KITTY_EmergencyRestore(int tty_in, int tty_out, bool use_alt_screen, bool leave_images);
+
+/*
  * Full-frame transmit+place (a=T): SHM, zlib direct, or raw base64 per
  * vdata->transmit_mode / SDL_KITTY_TRANSMIT. kitty_f: 24 (RGB) or 32 (RGBA).
  */

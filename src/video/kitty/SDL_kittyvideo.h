@@ -52,6 +52,16 @@ typedef enum KITTY_TransmitMode
 
 struct KITTY_TerminalProfile; /* SDL_kittyprofile.h */
 
+#define KITTY_KEY_HOLD_MAX 64
+
+typedef struct KITTY_KeyHold
+{
+    SDL_Scancode sc;
+    Uint64 earliest_up_ms;
+    bool want_up;
+    bool down;
+} KITTY_KeyHold;
+
 /*
  * Driver-private state for one kitty SDL_VideoDevice: tty fds, terminal
  * profile, cell/pixel geometry, mouse mode, transmit path, and pending CSI.
@@ -123,6 +133,12 @@ typedef struct SDL_VideoData
     Uint64 winch_at_ms;
     unsigned char tty_pending[KITTY_TTY_PENDING_MAX];
     size_t tty_pending_len;
+    bool esc_pending;
+    Uint64 esc_pending_ms;
+    Uint64 ctrl_c_ms;
+    /* Deferred key-up tracking for MAME-style poll-after-drain apps. */
+    KITTY_KeyHold key_holds[KITTY_KEY_HOLD_MAX];
+    int key_hold_n;
     /* Perf counters (SDL_KITTY_DEBUG present lines + kitty_perf_summary.py). */
     size_t last_wire_bytes; /* APC bytes written on last successful upload */
     size_t last_raw_bytes;  /* payload before b64 (zlib size or raw RGB) */

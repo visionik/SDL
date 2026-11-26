@@ -34,11 +34,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -95,7 +95,8 @@ static size_t KITTY_Base64Encode(const Uint8 *src, size_t src_len, char *dst, si
 }
 
 /*
- * Write the full buffer to fd, retrying on EINTR. Sets SDL error on failure.
+ * Write the full buffer to fd, retrying on EINTR and waiting via poll() on
+ * EAGAIN/EWOULDBLOCK so large APCs never abort mid-escape-sequence.
  */
 static bool KITTY_WriteAll(int fd, const void *buf, size_t len)
 {
@@ -106,12 +107,40 @@ static bool KITTY_WriteAll(int fd, const void *buf, size_t len)
             if (errno == EINTR) {
                 continue;
             }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd;
+                int pr;
+                pfd.fd = fd;
+                pfd.events = POLLOUT;
+                pfd.revents = 0;
+                pr = poll(&pfd, 1, 500);
+                if (pr > 0 && !(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                    continue;
+                }
+                if (pr < 0 && errno == EINTR) {
+                    continue;
+                }
+            }
             return SDL_SetError("kitty write failed: %s", strerror(errno));
         }
         p += (size_t)n;
         len -= (size_t)n;
     }
     return true;
+}
+
+static bool KITTY_PollReadable(int fd, int timeout_ms)
+{
+    struct pollfd pfd;
+    int pr;
+    if (fd < 0) {
+        return false;
+    }
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    pr = poll(&pfd, 1, timeout_ms);
+    return pr > 0 && (pfd.revents & POLLIN) != 0;
 }
 
 /*
@@ -269,7 +298,8 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
     }
     fd = vdata->tty_fd;
 
-    SDL_snprintf(name, sizeof(name), "/sdl-kitty-%d-%u-%u", (int)getpid(), (unsigned)image_id,
+    /* Keep name well under macOS PSHMNAMLEN (31 bytes). */
+    SDL_snprintf(name, sizeof(name), "/sk-%x-%x-%x", (unsigned)getpid(), (unsigned)image_id,
                  (unsigned)seq);
     shm_unlink(name);
 
@@ -372,13 +402,7 @@ static void KITTY_DrainTTY(SDL_VideoData *data)
 {
     unsigned char junk[256];
     for (;;) {
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(data->tty_in, &fds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 0;
-        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+        if (!KITTY_PollReadable(data->tty_in, 0)) {
             break;
         }
         if (read(data->tty_in, junk, sizeof(junk)) <= 0) {
@@ -406,13 +430,7 @@ static bool KITTY_QueryPixelSizeCSI(SDL_VideoData *data)
     }
 
     for (int attempt = 0; attempt < 60 && !(got_cell && got_area); ++attempt) {
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(data->tty_in, &fds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 25000;
-        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+        if (!KITTY_PollReadable(data->tty_in, 25)) {
             continue;
         }
         {
@@ -957,13 +975,7 @@ static void KITTY_DrainInput(SDL_VideoData *data)
      * (delete / last a=T without q=2 often arrive after restore starts). */
     for (passes = 0; passes < max_passes; ++passes) {
         for (;;) {
-            fd_set fds;
-            struct timeval tv;
-            FD_ZERO(&fds);
-            FD_SET(data->tty_in, &fds);
-            tv.tv_sec = 0;
-            tv.tv_usec = 0;
-            if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+            if (!KITTY_PollReadable(data->tty_in, 0)) {
                 break;
             }
             if (read(data->tty_in, junk, sizeof(junk)) <= 0) {
@@ -971,13 +983,11 @@ static void KITTY_DrainInput(SDL_VideoData *data)
             }
         }
         if (passes < max_passes - 1) {
-            fd_set fds;
-            struct timeval tv;
-            FD_ZERO(&fds);
-            FD_SET(data->tty_in, &fds);
-            tv.tv_sec = 0;
-            tv.tv_usec = quiet_us;
-            if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+            int quiet_ms = (quiet_us + 999) / 1000;
+            if (quiet_ms < 1) {
+                quiet_ms = 1;
+            }
+            if (!KITTY_PollReadable(data->tty_in, quiet_ms)) {
                 break;
             }
             (void)read(data->tty_in, junk, sizeof(junk));
@@ -1017,13 +1027,7 @@ static bool KITTY_ModeRecognized(SDL_VideoData *data, int mode)
         return false;
     }
     for (int attempt = 0; attempt < 20; ++attempt) {
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(data->tty_in, &fds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 25000;
-        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+        if (!KITTY_PollReadable(data->tty_in, 25)) {
             continue;
         }
         const ssize_t n = read(data->tty_in, buf + total, sizeof(buf) - 1 - total);
@@ -1064,13 +1068,7 @@ static bool KITTY_ProbeKittyKeyboard(SDL_VideoData *data)
         return false;
     }
     for (int attempt = 0; attempt < 16; ++attempt) {
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(data->tty_in, &fds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 25000;
-        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+        if (!KITTY_PollReadable(data->tty_in, 25)) {
             continue;
         }
         {
@@ -1242,6 +1240,42 @@ void KITTY_RestoreTerminal(SDL_VideoData *data)
     data->placed_cols = 0;
     data->placed_rows = 0;
     KITTY_LeaveRawMode(data);
+}
+
+/*
+ * Async-signal-safe emergency restore for SIGINT/SIGTERM handlers.
+ * Uses only raw write() and tcsetattr() so Ctrl+C / kill never wedges the tty.
+ */
+void KITTY_EmergencyRestore(int tty_in, int tty_out, bool use_alt_screen, bool leave_images)
+{
+    static const char del_all[] = "\033_Ga=d,d=A,q=2\033\\";
+    static const char restore_modes[] =
+        "\033[?1016l"
+        "\033[?1006l"
+        "\033[?1003l"
+        "\033[?1002l"
+        "\033[?1000l"
+        "\033[<u"
+        "\033[?25h";
+    static const char leave_alt[] = "\033[?1049l";
+
+    if (tty_out >= 0) {
+        ssize_t r;
+        if (!leave_images) {
+            r = write(tty_out, del_all, sizeof(del_all) - 1);
+            (void)r;
+        }
+        r = write(tty_out, restore_modes, sizeof(restore_modes) - 1);
+        (void)r;
+        if (use_alt_screen) {
+            r = write(tty_out, leave_alt, sizeof(leave_alt) - 1);
+            (void)r;
+        }
+    }
+    if (KITTY_termios_saved && tty_in >= 0) {
+        (void)tcsetattr(tty_in, TCSANOW, &KITTY_saved_termios);
+        KITTY_termios_saved = false;
+    }
 }
 
 /*

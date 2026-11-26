@@ -54,8 +54,18 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this);
  */
 static void KITTY_VideoQuit(SDL_VideoDevice *_this);
 
-static SDL_VideoData *KITTY_winch_data = NULL;
+static SDL_VideoData * volatile KITTY_winch_data = NULL;
 static void (*KITTY_prev_winch)(int) = SIG_DFL;
+
+static volatile sig_atomic_t KITTY_term_sig_installed = 0;
+static volatile sig_atomic_t KITTY_term_tty_in = -1;
+static volatile sig_atomic_t KITTY_term_tty_out = -1;
+static volatile sig_atomic_t KITTY_term_alt_screen = 1;
+static volatile sig_atomic_t KITTY_term_leave_images = 0;
+static struct sigaction KITTY_prev_sigint;
+static struct sigaction KITTY_prev_sigterm;
+static bool KITTY_have_prev_sigint = false;
+static bool KITTY_have_prev_sigterm = false;
 
 /*
  * SIGWINCH handler: mark the active SDL_VideoData so PumpEvents/VideoInit can
@@ -66,6 +76,66 @@ static void KITTY_HandleSIGWINCH(int sig)
     (void)sig;
     if (KITTY_winch_data) {
         KITTY_winch_data->got_winch = 1;
+    }
+}
+
+/*
+ * Async-signal-safe SIGINT/SIGTERM cleanup so Ctrl+C or kill never leaves
+ * the user's shell stuck in raw mode / alt-screen / SGR mouse tracking.
+ */
+static void KITTY_HandleTermSignal(int sig)
+{
+    struct sigaction dfl;
+    if (KITTY_term_sig_installed) {
+        KITTY_term_sig_installed = 0;
+        KITTY_EmergencyRestore((int)KITTY_term_tty_in, (int)KITTY_term_tty_out,
+                               KITTY_term_alt_screen != 0, KITTY_term_leave_images != 0);
+    }
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    dfl.sa_flags = 0;
+    sigaction(sig, &dfl, NULL);
+    raise(sig);
+}
+
+static void KITTY_InstallTermSignals(const SDL_VideoData *data)
+{
+    struct sigaction sa, old;
+    KITTY_term_tty_in = data->tty_in;
+    KITTY_term_tty_out = data->tty_out;
+    KITTY_term_alt_screen = data->use_alt_screen ? 1 : 0;
+    KITTY_term_leave_images = data->leave_images ? 1 : 0;
+    KITTY_term_sig_installed = 1;
+
+    SDL_zero(sa);
+    sa.sa_handler = KITTY_HandleTermSignal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    KITTY_have_prev_sigint = false;
+    if (sigaction(SIGINT, NULL, &old) == 0 && old.sa_handler != SIG_IGN) {
+        if (sigaction(SIGINT, &sa, &KITTY_prev_sigint) == 0) {
+            KITTY_have_prev_sigint = true;
+        }
+    }
+    KITTY_have_prev_sigterm = false;
+    if (sigaction(SIGTERM, NULL, &old) == 0 && old.sa_handler != SIG_IGN) {
+        if (sigaction(SIGTERM, &sa, &KITTY_prev_sigterm) == 0) {
+            KITTY_have_prev_sigterm = true;
+        }
+    }
+}
+
+static void KITTY_UninstallTermSignals(void)
+{
+    KITTY_term_sig_installed = 0;
+    if (KITTY_have_prev_sigint) {
+        sigaction(SIGINT, &KITTY_prev_sigint, NULL);
+        KITTY_have_prev_sigint = false;
+    }
+    if (KITTY_have_prev_sigterm) {
+        sigaction(SIGTERM, &KITTY_prev_sigterm, NULL);
+        KITTY_have_prev_sigterm = false;
     }
 }
 
@@ -204,6 +274,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
     }
     data->terminal_owned = true;
     data->keyboard_enabled = true;
+    KITTY_InstallTermSignals(data);
 
     /* Install WINCH before sizing waits so Rex pane layout is observed. */
     KITTY_winch_data = data;
@@ -218,6 +289,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
 
     /* Size before mouse: any-event mode floods the tty and can starve CSI 14t. */
     if (!KITTY_QueryTerminalSize(data)) {
+        KITTY_UninstallTermSignals();
         KITTY_RestoreTerminal(data);
         data->terminal_owned = false;
         return false;
@@ -288,6 +360,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
                                                SDL_strcasecmp(no_mouse, "no") == 0));
         if (want_mouse) {
             if (!KITTY_EnableMouse(data)) {
+                KITTY_UninstallTermSignals();
                 KITTY_RestoreTerminal(data);
                 data->terminal_owned = false;
                 return false;
@@ -305,6 +378,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
     mode.w = data->pixel_w;
     mode.h = data->pixel_h;
     if (SDL_AddBasicVideoDisplay(&mode) == 0) {
+        KITTY_UninstallTermSignals();
         KITTY_RestoreTerminal(data);
         data->terminal_owned = false;
         return false;
@@ -343,6 +417,8 @@ static void KITTY_VideoQuit(SDL_VideoDevice *_this)
         KITTY_winch_data = NULL;
         KITTY_prev_winch = SIG_DFL;
     }
+
+    KITTY_UninstallTermSignals();
 
     if (data && data->terminal_owned) {
         KITTY_RestoreTerminal(data);

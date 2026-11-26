@@ -71,10 +71,11 @@ static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
  */
 static bool KITTY_EnsureRGBScratch(SDL_WindowData *wdata, int w, int h, int bpp)
 {
-    const size_t need = (size_t)w * (size_t)h * (size_t)bpp;
+    size_t need;
     if (!wdata || w <= 0 || h <= 0 || (bpp != 3 && bpp != 4)) {
         return false;
     }
+    need = (size_t)w * (size_t)h * (size_t)bpp;
     if (wdata->rgb_scratch && wdata->rgb_back && wdata->rgb_w == w && wdata->rgb_h == h &&
         wdata->scratch_bpp == bpp) {
         return true;
