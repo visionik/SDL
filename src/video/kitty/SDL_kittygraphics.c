@@ -724,6 +724,15 @@ static bool KITTY_TransmitDirectZlib(SDL_VideoData *vdata, int fd, Uint32 image_
     if (!KITTY_ZlibCompress(vdata, rgb, raw_len, &compressed, &out_len)) {
         return false;
     }
+    /* Adaptive bypass: if zlib expanded incompressible pixels, send raw without o=z. */
+    if (out_len >= raw_len) {
+        if (out_raw_bytes) {
+            *out_raw_bytes = raw_len;
+        }
+        return KITTY_TransmitDirectPayload(vdata, fd, image_id, w, h, place_cols, place_rows,
+                                           "", rgb, raw_len, kitty_f,
+                                           home_cursor, chunk_bytes, out_wire_bytes);
+    }
     if (out_raw_bytes) {
         *out_raw_bytes = out_len; /* compressed payload size (pre-b64) */
     }
@@ -1938,14 +1947,18 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     /* Compress the edit (o=z) where the terminal shows compressed edits, as full a=T does with
      * prefer_zlib. A desktop's changed rectangles are mostly text and flat colour, which zlib shrinks
      * several times over. */
-    zlib_edit = KITTY_EditsCompressed(vdata);
+    zlib_edit = KITTY_EditsCompressed(vdata) && payload_len > 48u;
     if (zlib_edit) {
         size_t zlen = 0;
         if (!KITTY_ZlibCompress(vdata, packed_rgb, payload_len, &compressed, &zlen)) {
             return false;
         }
-        body = compressed;
-        body_len = zlen;
+        if (zlen < payload_len) {
+            body = compressed;
+            body_len = zlen;
+        } else {
+            zlib_edit = false;
+        }
     }
 
     b64_len = ((body_len + 2) / 3) * 4;
