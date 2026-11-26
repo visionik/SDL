@@ -33,14 +33,12 @@
 
 #if defined(SDL_VIDEO_DRIVER_KITTY) || defined(KITTY_RECT_STANDALONE)
 
+#include "SDL_kittyparallel.h"
 #include "SDL_kittyrect.h"
 
 #if defined(__ARM_NEON) && (SDL_BYTEORDER == SDL_LIL_ENDIAN)
 #include <arm_neon.h>
 #define KITTY_HAVE_NEON_LE 1
-#endif
-#ifdef __APPLE__
-#include <dispatch/dispatch.h>
 #endif
 
 /*
@@ -1262,7 +1260,6 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
     return dirty_in_band;
 }
 
-#ifdef __APPLE__
 typedef struct KITTY_ParallelDiffCtx
 {
     SDL_Surface *surface;
@@ -1294,7 +1291,6 @@ static void KITTY_ParallelDiffWorker(void *arg, size_t widx)
                                                        ctx->tile, ctx->tiles_x, ty, th, ts);
     }
 }
-#endif
 
 /*
  * Fused single-pass convert + multi-rect tile diff with exact 2D pixel
@@ -1364,7 +1360,6 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
         }
     }
 
-#ifdef __APPLE__
     if ((size_t)fb_w * (size_t)fb_h >= (size_t)640 * 480 && num_bands >= 4) {
         KITTY_ParallelDiffCtx ctx;
         ctx.surface = surface;
@@ -1379,11 +1374,8 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
         ctx.n_workers = 4;
         ctx.all_spans = all_spans;
         ctx.band_counts = band_counts;
-        dispatch_apply_f((size_t)ctx.n_workers,
-                         dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
-                         &ctx, KITTY_ParallelDiffWorker);
+        KITTY_ParallelFor((size_t)ctx.n_workers, KITTY_ParallelDiffWorker, &ctx);
     } else
-#endif
     {
         for (b = 0; b < num_bands; ++b) {
             const int ty = b * tile;

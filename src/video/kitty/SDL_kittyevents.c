@@ -36,6 +36,7 @@
 #include "../../events/SDL_windowevents_c.h"
 #include "SDL_kittyevents_c.h"
 #include "SDL_kittygraphics.h"
+#include "SDL_kittyoverlay.h"
 #include "SDL_kittyprobe.h"
 #include "SDL_kittyprofile.h"
 
@@ -207,6 +208,13 @@ static void KITTY_SendKey(SDL_Scancode scancode, bool pressed)
 {
     if (scancode == SDL_SCANCODE_UNKNOWN) {
         return;
+    }
+    if (pressed) {
+        SDL_VideoData *vd = KITTY_ActiveVideoData();
+        if (vd && vd->overlay &&
+            KITTY_OverlayHandleKey((KITTY_ToastOverlay *)vd->overlay, scancode, SDL_GetTicks())) {
+            return;
+        }
     }
     SDL_SendKeyboardKey(0, SDL_GLOBAL_KEYBOARD_ID, 0, scancode, pressed);
 }

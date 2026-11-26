@@ -28,6 +28,7 @@
 #ifdef SDL_VIDEO_DRIVER_KITTY
 
 #include "SDL_kittygraphics.h"
+#include "SDL_kittyparallel.h"
 #include "SDL_kittyprobe.h"
 #include "SDL_kittyprofile.h"
 #include "SDL_kittyrect.h"
@@ -44,9 +45,6 @@
 #include <termios.h>
 #include <unistd.h>
 #include <zlib.h>
-#ifdef __APPLE__
-#include <dispatch/dispatch.h>
-#endif
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #include <arm_neon.h>
 #define KITTY_HAVE_NEON64 1
@@ -256,7 +254,6 @@ static bool KITTY_PollReadable(int fd, int timeout_ms)
     return pr > 0 && (pfd.revents & POLLIN) != 0;
 }
 
-#ifdef __APPLE__
 #define KITTY_PZ_MAX_SLICES 16
 #define KITTY_PZ_MIN_BYTES ((size_t)128 * 1024)
 
@@ -491,7 +488,6 @@ static void KITTY_MultiRectWorker(void *arg, size_t idx)
         s->ok = true;
     }
 }
-#endif /* __APPLE__ */
 
 /*
  * Depth-1 double-buffered async PTY writer thread. Overlaps CPU work
@@ -738,10 +734,8 @@ void KITTY_FreeTransmitBuffers(SDL_VideoData *vdata)
         return;
     }
     KITTY_DestroyAsyncWriter(vdata);
-#ifdef __APPLE__
     KITTY_FreeParallelZlib(vdata);
     KITTY_FreeMultiRectCtx(vdata);
-#endif
     if (vdata->tx_zstream) {
         deflateEnd((z_stream *)vdata->tx_zstream);
         SDL_free(vdata->tx_zstream);
@@ -801,8 +795,7 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
         return false;
     }
 
-#ifdef __APPLE__
-    /* Multi-core RFC 1950 zlib for large full-frame payloads: up to 12 raw
+    /* Multi-core RFC 1950 zlib for large full-frame payloads: up to 16 raw
      * deflate slices concatenated via Z_SYNC_FLUSH + Z_FINISH + adler32_combine. */
     if (src_len >= KITTY_PZ_MIN_BYTES) {
         KITTY_ParallelZlibCtx *ctx = (KITTY_ParallelZlibCtx *)vdata->tx_pz_ctx;
@@ -870,9 +863,7 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
             if (cap_ok) {
                 bool all_ok = true;
                 size_t total = 2u + 4u; /* 2B zlib header + 4B adler32 trailer */
-                dispatch_apply_f((size_t)n_slices,
-                                 dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
-                                 ctx, KITTY_ParallelZlibWorker);
+                KITTY_ParallelFor((size_t)n_slices, KITTY_ParallelZlibWorker, ctx);
                 for (i = 0; i < n_slices; ++i) {
                     if (!ctx->slices[i].ok) {
                         all_ok = false;
@@ -907,7 +898,6 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
             }
         }
     }
-#endif /* __APPLE__ */
     if (!vdata->tx_zstream) {
         const int serial_level = (vdata->cfg_zlib_level >= 1 && vdata->cfg_zlib_level <= 9)
                                      ? vdata->cfg_zlib_level
@@ -2569,7 +2559,6 @@ bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                                  const SDL_Rect *rects, int n_rects, int kitty_f,
                                  size_t *out_upload_px)
 {
-#ifdef __APPLE__
     KITTY_MultiRectCtx *ctx;
     KITTY_AsyncWriter *aw;
     SDL_Rect fb;
@@ -2630,9 +2619,7 @@ bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                       : Z_BEST_SPEED;
     ctx->want_zlib = true;
 
-    dispatch_apply_f((size_t)valid_n,
-                     dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
-                     ctx, KITTY_MultiRectWorker);
+    KITTY_ParallelFor((size_t)valid_n, KITTY_MultiRectWorker, ctx);
 
     for (i = 0; i < valid_n; ++i) {
         if (!ctx->slots[i].ok) {
@@ -2673,18 +2660,6 @@ bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
         *out_upload_px = total_px;
     }
     return true;
-#else
-    (void)vdata;
-    (void)image_id;
-    (void)rgb_scratch;
-    (void)fb_w;
-    (void)fb_h;
-    (void)rects;
-    (void)n_rects;
-    (void)kitty_f;
-    (void)out_upload_px;
-    return false;
-#endif
 }
 
 /*

@@ -24,6 +24,10 @@
 
 #include "SDL_kittyoverlay.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 typedef enum KITTY_OverlayPos
 {
     KITTY_OV_POS_BOTTOM = 0,
@@ -38,17 +42,24 @@ typedef enum KITTY_OverlayPos
 struct KITTY_ToastOverlay
 {
     char text[512];
+    char file_path[512];
     KITTY_OverlayPos pos;
     Uint64 delay_ms;
     Uint64 duration_ms; /* 0 = stay visible forever */
     Uint64 fade_ms;
     int req_scale; /* 0 = auto */
+    SDL_Scancode toggle_key;
     Uint8 bg[4];
     Uint8 border[4];
     Uint8 fg[4];
 
     bool started;
+    bool hidden_by_user;
     Uint64 start_ms;
+    Uint64 last_file_poll_ms;
+    time_t last_file_mtime;
+    off_t last_file_size;
+    bool file_loaded;
 
     /* Cached rendered RGBA toast bitmap for (cache_fb_w, cache_fb_h). */
     int cache_fb_w;
@@ -259,6 +270,94 @@ static void KITTY_CopyTextEscaped(char *dst, size_t dst_cap, const char *src, si
     dst[o] = '\0';
 }
 
+static SDL_Scancode KITTY_ParseOverlayKey(const char *s)
+{
+    if (!s || !s[0]) {
+        return SDL_SCANCODE_UNKNOWN;
+    }
+    if ((s[0] == 'F' || s[0] == 'f') && s[1] >= '1' && s[1] <= '9') {
+        int n = SDL_atoi(s + 1);
+        if (n >= 1 && n <= 12) {
+            return (SDL_Scancode)(SDL_SCANCODE_F1 + (n - 1));
+        }
+    }
+    if (s[1] == '\0') {
+        if (s[0] >= 'a' && s[0] <= 'z') {
+            return (SDL_Scancode)(SDL_SCANCODE_A + (s[0] - 'a'));
+        }
+        if (s[0] >= 'A' && s[0] <= 'Z') {
+            return (SDL_Scancode)(SDL_SCANCODE_A + (s[0] - 'A'));
+        }
+        if (s[0] == '`') {
+            return SDL_SCANCODE_GRAVE;
+        }
+    }
+    if (SDL_strcasecmp(s, "grave") == 0 || SDL_strcasecmp(s, "tilde") == 0) {
+        return SDL_SCANCODE_GRAVE;
+    }
+    if (SDL_strcasecmp(s, "tab") == 0) {
+        return SDL_SCANCODE_TAB;
+    }
+    return SDL_SCANCODE_UNKNOWN;
+}
+
+static bool KITTY_OverlayPollFile(KITTY_ToastOverlay *ov, Uint64 now_ms)
+{
+    struct stat st;
+    int fd;
+    char buf[512];
+    ssize_t n;
+
+    if (!ov || !ov->file_path[0]) {
+        return false;
+    }
+    if (ov->last_file_poll_ms != 0 && (now_ms - ov->last_file_poll_ms) < 200u) {
+        return false;
+    }
+    ov->last_file_poll_ms = now_ms;
+
+    if (stat(ov->file_path, &st) != 0) {
+        if (ov->file_loaded) {
+            ov->file_loaded = false;
+            ov->text[0] = '\0';
+            ov->hidden_by_user = true;
+            ov->cache_fb_w = 0;
+            return true;
+        }
+        return false;
+    }
+    if (ov->file_loaded && st.st_mtime == ov->last_file_mtime && st.st_size == ov->last_file_size) {
+        return false;
+    }
+    fd = open(ov->file_path, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    n = read(fd, buf, sizeof(buf) - 1u);
+    close(fd);
+    if (n < 0) {
+        return false;
+    }
+    buf[n] = '\0';
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' ')) {
+        buf[--n] = '\0';
+    }
+    ov->last_file_mtime = st.st_mtime;
+    ov->last_file_size = st.st_size;
+    ov->file_loaded = true;
+    KITTY_CopyTextEscaped(ov->text, sizeof(ov->text), buf, (size_t)n);
+    ov->cache_fb_w = 0;
+    if (ov->text[0]) {
+        ov->hidden_by_user = false;
+        ov->started = true;
+        ov->start_ms = now_ms;
+        ov->delay_ms = 0;
+    } else {
+        ov->hidden_by_user = true;
+    }
+    return true;
+}
+
 KITTY_ToastOverlay *KITTY_OverlayCreate(const char *spec)
 {
     KITTY_ToastOverlay *ov;
@@ -336,6 +435,15 @@ KITTY_ToastOverlay *KITTY_OverlayCreate(const char *spec)
             } else if (klen == 5 && SDL_strncasecmp(p, "theme", 5) == 0) {
                 KITTY_OverlaySetTheme(ov, vbuf);
                 has_kv = true;
+            } else if ((klen == 6 && SDL_strncasecmp(p, "toggle", 6) == 0) ||
+                       (klen == 3 && SDL_strncasecmp(p, "key", 3) == 0)) {
+                ov->toggle_key = KITTY_ParseOverlayKey(vbuf);
+                has_kv = true;
+            } else if (klen == 4 && SDL_strncasecmp(p, "file", 4) == 0) {
+                const size_t flen = vlen < sizeof(ov->file_path) - 1 ? vlen : sizeof(ov->file_path) - 1;
+                SDL_memcpy(ov->file_path, v, flen);
+                ov->file_path[flen] = '\0';
+                has_kv = true;
             }
         }
         if (!semi) {
@@ -347,7 +455,7 @@ KITTY_ToastOverlay *KITTY_OverlayCreate(const char *spec)
     if (!has_kv) {
         KITTY_CopyTextEscaped(ov->text, sizeof(ov->text), spec, SDL_strlen(spec));
     }
-    if (!ov->text[0]) {
+    if (!ov->text[0] && !ov->file_path[0]) {
         SDL_free(ov);
         return NULL;
     }
@@ -487,49 +595,56 @@ static bool KITTY_OverlayRenderBitmap(KITTY_ToastOverlay *ov, int fb_w, int fb_h
     }
     SDL_memset(ov->rgba, 0, need);
 
-    /* Draw rounded translucent box + crisp accent border. */
+    /* Draw subpixel anti-aliased rounded translucent box + crisp accent border. */
     {
-        const int r_out = rad;
-        const int r_in = (rad > border_px) ? (rad - border_px) : 0;
+        const float r_out = (float)rad;
+        const float r_in = (rad > border_px) ? (float)(rad - border_px) : 0.0f;
         int y, x;
         for (y = 0; y < bh; ++y) {
             Uint8 *row = ov->rgba + (size_t)y * (size_t)bw * 4u;
             for (x = 0; x < bw; ++x) {
-                int dx = 0, dy = 0;
-                int dist2;
-                bool inside_outer = true;
-                bool inside_inner = true;
+                float dx = 0.0f, dy = 0.0f;
+                float cov_out = 1.0f;
+                float cov_in = 1.0f;
 
-                if (x < r_out) dx = r_out - 1 - x;
-                else if (x >= bw - r_out) dx = x - (bw - r_out);
-                if (y < r_out) dy = r_out - 1 - y;
-                else if (y >= bh - r_out) dy = y - (bh - r_out);
+                if (x < rad) dx = (float)(rad - 1 - x) + 0.5f;
+                else if (x >= bw - rad) dx = (float)(x - (bw - rad)) + 0.5f;
+                if (y < rad) dy = (float)(rad - 1 - y) + 0.5f;
+                else if (y >= bh - rad) dy = (float)(y - (bh - rad)) + 0.5f;
 
-                dist2 = dx * dx + dy * dy;
-                if (dx > 0 && dy > 0 && dist2 > r_out * r_out) {
-                    inside_outer = false;
-                }
-                if (!inside_outer) {
-                    continue;
+                if (dx > 0.0f && dy > 0.0f) {
+                    const float dist = SDL_sqrtf(dx * dx + dy * dy);
+                    cov_out = r_out - dist + 0.5f;
+                    if (cov_out <= 0.0f) {
+                        continue;
+                    }
+                    if (cov_out > 1.0f) {
+                        cov_out = 1.0f;
+                    }
+                    cov_in = r_in - dist + 0.5f;
+                    if (cov_in < 0.0f) cov_in = 0.0f;
+                    if (cov_in > 1.0f) cov_in = 1.0f;
                 }
                 if (x < border_px || x >= bw - border_px ||
                     y < border_px || y >= bh - border_px) {
-                    inside_inner = false;
-                } else if (dx > 0 && dy > 0 && dist2 > r_in * r_in) {
-                    inside_inner = false;
+                    cov_in = 0.0f;
                 }
                 {
-                    const Uint8 *col = inside_inner ? ov->bg : ov->border;
-                    row[x * 4 + 0] = col[0];
-                    row[x * 4 + 1] = col[1];
-                    row[x * 4 + 2] = col[2];
-                    row[x * 4 + 3] = col[3];
+                    const float inv_in = 1.0f - cov_in;
+                    const float r = ov->bg[0] * cov_in + ov->border[0] * inv_in;
+                    const float g = ov->bg[1] * cov_in + ov->border[1] * inv_in;
+                    const float b = ov->bg[2] * cov_in + ov->border[2] * inv_in;
+                    const float a = (ov->bg[3] * cov_in + ov->border[3] * inv_in) * cov_out;
+                    row[x * 4 + 0] = (Uint8)(r + 0.5f);
+                    row[x * 4 + 1] = (Uint8)(g + 0.5f);
+                    row[x * 4 + 2] = (Uint8)(b + 0.5f);
+                    row[x * 4 + 3] = (Uint8)(a + 0.5f);
                 }
             }
         }
     }
 
-    /* Rasterize text lines centered horizontally inside the pill. */
+    /* Rasterize text lines centered horizontally with subtle drop shadow + edge AA. */
     {
         int li;
         for (li = 0; li < n_lines; ++li) {
@@ -546,6 +661,30 @@ static bool KITTY_OverlayRenderBitmap(KITTY_ToastOverlay *ov, int fb_w, int fb_h
                 int row_i, col_i;
                 if (!glyph) {
                     break;
+                }
+                /* Subtle 1px drop shadow behind glyphs when scale >= 2 */
+                if (scale >= 2) {
+                    for (row_i = 0; row_i < 8; ++row_i) {
+                        const Uint8 bits = glyph[row_i];
+                        if (!bits) continue;
+                        for (col_i = 0; col_i < 8; ++col_i) {
+                            if (bits & (0x80u >> col_i)) {
+                                int sy, sx;
+                                for (sy = 0; sy < scale; ++sy) {
+                                    const int py = gy0 + row_i * scale + sy + 1;
+                                    if (py < border_px || py >= bh - border_px) continue;
+                                    Uint8 *drow = ov->rgba + (size_t)py * (size_t)bw * 4u;
+                                    for (sx = 0; sx < scale; ++sx) {
+                                        const int px = gx + col_i * scale + sx + 1;
+                                        if (px < border_px || px >= bw - border_px) continue;
+                                        drow[px * 4 + 0] = (Uint8)(drow[px * 4 + 0] / 2);
+                                        drow[px * 4 + 1] = (Uint8)(drow[px * 4 + 1] / 2);
+                                        drow[px * 4 + 2] = (Uint8)(drow[px * 4 + 2] / 2);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 for (row_i = 0; row_i < 8; ++row_i) {
                     const Uint8 bits = glyph[row_i];
@@ -632,10 +771,21 @@ bool KITTY_OverlayEvaluate(KITTY_ToastOverlay *ov, int fb_w, int fb_h, Uint64 no
 {
     Uint64 elapsed;
     Uint8 alpha = 0;
+    bool file_changed = false;
 
     if (out_alpha) *out_alpha = 0;
     if (out_needs_redraw) *out_needs_redraw = false;
     if (!ov || fb_w <= 0 || fb_h <= 0) {
+        return false;
+    }
+    if (ov->file_path[0]) {
+        file_changed = KITTY_OverlayPollFile(ov, now_ms);
+    }
+    if (!ov->text[0] || ov->hidden_by_user) {
+        if (ov->last_drawn_alpha > 0) {
+            if (out_rect) *out_rect = ov->last_drawn_rect;
+            if (out_needs_redraw) *out_needs_redraw = true;
+        }
         return false;
     }
     if (!ov->started) {
@@ -646,6 +796,7 @@ bool KITTY_OverlayEvaluate(KITTY_ToastOverlay *ov, int fb_w, int fb_h, Uint64 no
         if (!KITTY_OverlayRenderBitmap(ov, fb_w, fb_h)) {
             return false;
         }
+        file_changed = true;
     }
 
     elapsed = (now_ms >= ov->start_ms) ? (now_ms - ov->start_ms) : 0;
@@ -691,7 +842,7 @@ bool KITTY_OverlayEvaluate(KITTY_ToastOverlay *ov, int fb_w, int fb_h, Uint64 no
         const bool rect_changed =
             (ov->last_drawn_rect.x != ov->rect.x || ov->last_drawn_rect.y != ov->rect.y ||
              ov->last_drawn_rect.w != ov->rect.w || ov->last_drawn_rect.h != ov->rect.h);
-        *out_needs_redraw = (alpha != ov->last_drawn_alpha) || (alpha > 0 && rect_changed);
+        *out_needs_redraw = file_changed || (alpha != ov->last_drawn_alpha) || (alpha > 0 && rect_changed);
     }
     return alpha > 0;
 }
@@ -785,6 +936,27 @@ void KITTY_OverlayMarkDrawn(KITTY_ToastOverlay *ov, Uint8 alpha)
     }
     ov->last_drawn_alpha = alpha;
     ov->last_drawn_rect = ov->rect;
+}
+
+bool KITTY_OverlayHandleKey(KITTY_ToastOverlay *ov, SDL_Scancode scancode, Uint64 now_ms)
+{
+    if (!ov || ov->toggle_key == SDL_SCANCODE_UNKNOWN || scancode != ov->toggle_key) {
+        return false;
+    }
+    if (!ov->text[0]) {
+        return false;
+    }
+    if (ov->last_drawn_alpha > 0 && !ov->hidden_by_user) {
+        /* Currently visible -> dismiss cleanly. */
+        ov->hidden_by_user = true;
+    } else {
+        /* Currently hidden/expired -> re-show with a fresh timer. */
+        ov->hidden_by_user = false;
+        ov->started = true;
+        ov->start_ms = now_ms;
+        ov->delay_ms = 0;
+    }
+    return true;
 }
 
 #endif /* SDL_VIDEO_DRIVER_KITTY */

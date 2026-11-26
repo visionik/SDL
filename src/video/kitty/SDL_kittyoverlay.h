@@ -57,6 +57,12 @@ void KITTY_OverlayRestore(KITTY_ToastOverlay *ov, Uint8 *rgb_scratch, int fb_w, 
 /* Record the alpha actually transmitted on the last successful present. */
 void KITTY_OverlayMarkDrawn(KITTY_ToastOverlay *ov, Uint8 alpha);
 
+/*
+ * Check if scancode matches the configured toggle= hotkey (e.g. F1).
+ * On match, toggles overlay visibility (shows or fades out) and returns true.
+ */
+bool KITTY_OverlayHandleKey(KITTY_ToastOverlay *ov, SDL_Scancode scancode, Uint64 now_ms);
+
 #endif /* SDL_kittyoverlay_h_ */
 
 #endif /* SDL_VIDEO_DRIVER_KITTY */
