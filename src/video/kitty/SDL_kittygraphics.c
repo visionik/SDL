@@ -43,6 +43,9 @@
 #include <termios.h>
 #include <unistd.h>
 #include <zlib.h>
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#endif
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #include <arm_neon.h>
 #define KITTY_HAVE_NEON64 1
@@ -235,6 +238,77 @@ static bool KITTY_PollReadable(int fd, int timeout_ms)
     return pr > 0 && (pfd.revents & POLLIN) != 0;
 }
 
+#ifdef __APPLE__
+#define KITTY_PZ_SLICES 4
+#define KITTY_PZ_MIN_BYTES ((size_t)256 * 1024)
+
+typedef struct KITTY_ParallelZlibCtx
+{
+    z_stream streams[KITTY_PZ_SLICES];
+    bool stream_init[KITTY_PZ_SLICES];
+    Uint8 *out_buf[KITTY_PZ_SLICES];
+    size_t out_cap[KITTY_PZ_SLICES];
+    /* Per-call dispatch parameters */
+    const Uint8 *src;
+    size_t slice_off[KITTY_PZ_SLICES];
+    size_t slice_in_len[KITTY_PZ_SLICES];
+    size_t slice_out_len[KITTY_PZ_SLICES];
+    uLong slice_adler[KITTY_PZ_SLICES];
+    bool slice_ok[KITTY_PZ_SLICES];
+} KITTY_ParallelZlibCtx;
+
+static void KITTY_FreeParallelZlib(SDL_VideoData *vdata)
+{
+    KITTY_ParallelZlibCtx *ctx;
+    int i;
+    if (!vdata || !vdata->tx_pz_ctx) {
+        return;
+    }
+    ctx = (KITTY_ParallelZlibCtx *)vdata->tx_pz_ctx;
+    for (i = 0; i < KITTY_PZ_SLICES; ++i) {
+        if (ctx->stream_init[i]) {
+            deflateEnd(&ctx->streams[i]);
+            ctx->stream_init[i] = false;
+        }
+        SDL_free(ctx->out_buf[i]);
+        ctx->out_buf[i] = NULL;
+        ctx->out_cap[i] = 0;
+    }
+    SDL_free(ctx);
+    vdata->tx_pz_ctx = NULL;
+}
+
+static void KITTY_ParallelZlibWorker(void *arg, size_t idx)
+{
+    KITTY_ParallelZlibCtx *ctx = (KITTY_ParallelZlibCtx *)arg;
+    z_stream *zs = &ctx->streams[idx];
+    const Uint8 *in = ctx->src + ctx->slice_off[idx];
+    const size_t in_len = ctx->slice_in_len[idx];
+    const int flush = (idx + 1u == KITTY_PZ_SLICES) ? Z_FINISH : Z_SYNC_FLUSH;
+    int zerr;
+
+    ctx->slice_ok[idx] = false;
+    ctx->slice_out_len[idx] = 0;
+    ctx->slice_adler[idx] = adler32(adler32(0L, Z_NULL, 0), in, (uInt)in_len);
+
+    zerr = deflateReset(zs);
+    if (zerr != Z_OK) {
+        return;
+    }
+    zs->next_in = (Bytef *)in;
+    zs->avail_in = (uInt)in_len;
+    zs->next_out = (Bytef *)ctx->out_buf[idx];
+    zs->avail_out = (uInt)ctx->out_cap[idx];
+
+    zerr = deflate(zs, flush);
+    if (flush == Z_FINISH ? (zerr != Z_STREAM_END) : (zerr != Z_OK || zs->avail_in != 0)) {
+        return;
+    }
+    ctx->slice_out_len[idx] = (size_t)zs->total_out;
+    ctx->slice_ok[idx] = true;
+}
+#endif /* __APPLE__ */
+
 /*
  * Free persistent transmit scratch buffers and reusable z_stream on vdata.
  */
@@ -243,6 +317,9 @@ void KITTY_FreeTransmitBuffers(SDL_VideoData *vdata)
     if (!vdata) {
         return;
     }
+#ifdef __APPLE__
+    KITTY_FreeParallelZlib(vdata);
+#endif
     if (vdata->tx_zstream) {
         deflateEnd((z_stream *)vdata->tx_zstream);
         SDL_free(vdata->tx_zstream);
@@ -301,6 +378,96 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
     if (!vdata || !src || src_len == 0 || !out_buf || !out_len) {
         return false;
     }
+
+#ifdef __APPLE__
+    /* Multi-core RFC 1950 zlib for large full-frame payloads: 4 independent raw
+     * deflate slices concatenated via Z_SYNC_FLUSH + Z_FINISH + adler32_combine. */
+    if (src_len >= KITTY_PZ_MIN_BYTES) {
+        KITTY_ParallelZlibCtx *ctx = (KITTY_ParallelZlibCtx *)vdata->tx_pz_ctx;
+        int i;
+        if (!ctx) {
+            ctx = (KITTY_ParallelZlibCtx *)SDL_calloc(1, sizeof(KITTY_ParallelZlibCtx));
+            if (ctx) {
+                bool init_ok = true;
+                for (i = 0; i < KITTY_PZ_SLICES; ++i) {
+                    if (deflateInit2(&ctx->streams[i], Z_BEST_SPEED, Z_DEFLATED, -15, 8,
+                                     Z_DEFAULT_STRATEGY) != Z_OK) {
+                        init_ok = false;
+                        break;
+                    }
+                    ctx->stream_init[i] = true;
+                }
+                if (init_ok) {
+                    vdata->tx_pz_ctx = ctx;
+                } else {
+                    vdata->tx_pz_ctx = ctx;
+                    KITTY_FreeParallelZlib(vdata);
+                    ctx = NULL;
+                }
+            }
+        }
+        if (ctx) {
+            const size_t base = src_len / KITTY_PZ_SLICES;
+            size_t off = 0;
+            bool cap_ok = true;
+            ctx->src = src;
+            for (i = 0; i < KITTY_PZ_SLICES; ++i) {
+                const size_t slen = (i + 1 == KITTY_PZ_SLICES) ? (src_len - off) : base;
+                const size_t sbound = (size_t)deflateBound(&ctx->streams[i], (uLong)slen) + 16u;
+                ctx->slice_off[i] = off;
+                ctx->slice_in_len[i] = slen;
+                off += slen;
+                if (ctx->out_cap[i] < sbound) {
+                    Uint8 *nb = (Uint8 *)SDL_realloc(ctx->out_buf[i], sbound);
+                    if (!nb) {
+                        cap_ok = false;
+                        break;
+                    }
+                    ctx->out_buf[i] = nb;
+                    ctx->out_cap[i] = sbound;
+                }
+            }
+            if (cap_ok) {
+                bool all_ok = true;
+                size_t total = 2u + 4u; /* 2B zlib header + 4B adler32 trailer */
+                dispatch_apply_f(KITTY_PZ_SLICES,
+                                 dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                                 ctx, KITTY_ParallelZlibWorker);
+                for (i = 0; i < KITTY_PZ_SLICES; ++i) {
+                    if (!ctx->slice_ok[i]) {
+                        all_ok = false;
+                        break;
+                    }
+                    total += ctx->slice_out_len[i];
+                }
+                if (all_ok) {
+                    dst = KITTY_EnsureZBuf(vdata, total);
+                    if (dst) {
+                        uLong combined = ctx->slice_adler[0];
+                        size_t pos = 2u;
+                        dst[0] = 0x78u; /* CM=8 deflate, CINFO=7 (32K window) */
+                        dst[1] = 0x01u; /* FLEVEL=0, FCHECK=1 (0x7801 % 31 == 0) */
+                        for (i = 0; i < KITTY_PZ_SLICES; ++i) {
+                            SDL_memcpy(dst + pos, ctx->out_buf[i], ctx->slice_out_len[i]);
+                            pos += ctx->slice_out_len[i];
+                            if (i > 0) {
+                                combined = adler32_combine(combined, ctx->slice_adler[i],
+                                                           (z_off_t)ctx->slice_in_len[i]);
+                            }
+                        }
+                        dst[pos + 0] = (Uint8)((combined >> 24) & 0xFFu);
+                        dst[pos + 1] = (Uint8)((combined >> 16) & 0xFFu);
+                        dst[pos + 2] = (Uint8)((combined >> 8) & 0xFFu);
+                        dst[pos + 3] = (Uint8)(combined & 0xFFu);
+                        *out_buf = dst;
+                        *out_len = total;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+#endif /* __APPLE__ */
     if (!vdata->tx_zstream) {
         zs = (z_stream *)SDL_calloc(1, sizeof(z_stream));
         if (!zs) {
