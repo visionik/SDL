@@ -394,21 +394,21 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
         const float sh = (float)fb_h / 720.0f;
         const float sw = (float)fb_w / 1080.0f;
         s = (sh < sw) ? sh : sw;
-        if (s < 0.62f) s = 0.62f;
+        if (s < 0.55f) s = 0.55f;
         if (s > 1.20f) s = 1.20f;
     }
 
     shadow_pad = (int)(6.0f * s + 0.5f);
     card_w = (int)(226.0f * s + 0.5f);
     card_h = (int)(104.0f * s + 0.5f);
-    if (card_w > (fb_w * 45) / 100 && fb_w >= 360) {
+    if (card_w > (fb_w * 45) / 100 && fb_w >= 260) {
         card_w = (fb_w * 45) / 100;
         s = (float)card_w / 226.0f;
         card_h = (int)(104.0f * s + 0.5f);
     }
-    if (card_w > fb_w - 16) card_w = fb_w - 16;
-    if (card_h > fb_h - 16) card_h = fb_h - 16;
-    if (card_w < 136 || card_h < 68) {
+    if (card_w > fb_w - 12) card_w = fb_w - 12;
+    if (card_h > fb_h - 12) card_h = fb_h - 12;
+    if (card_w < 96 || card_h < 48) {
         return false;
     }
 
