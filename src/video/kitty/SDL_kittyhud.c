@@ -389,26 +389,26 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
         return true;
     }
 
-    /* Compact sleek glassmorphic Performance HUD (~1/2 area, crisp at arcade & HiDPI res) */
+    /* Sleek compact glassmorphic Performance HUD: compact via tight layout
+     * (header + sparkline + single telemetry strip) while keeping crisp
+     * readable Geist-Regular font sizes (never below 11px). */
     {
-        const float sh = (float)fb_h / 720.0f;
-        const float sw = (float)fb_w / 1080.0f;
-        s = (sh < sw) ? sh : sw;
-        if (s < 0.55f) s = 0.55f;
-        if (s > 1.20f) s = 1.20f;
+        const float sh = (float)fb_h / 900.0f;
+        s = sh;
+        if (s < 0.85f) s = 0.85f;
+        if (s > 1.35f) s = 1.35f;
     }
 
-    shadow_pad = (int)(6.0f * s + 0.5f);
-    card_w = (int)(226.0f * s + 0.5f);
-    card_h = (int)(104.0f * s + 0.5f);
-    if (card_w > (fb_w * 45) / 100 && fb_w >= 260) {
-        card_w = (fb_w * 45) / 100;
-        s = (float)card_w / 226.0f;
-        card_h = (int)(104.0f * s + 0.5f);
+    shadow_pad = (int)(7.0f * s + 0.5f);
+    card_w = (int)(264.0f * s + 0.5f);
+    card_h = (int)(98.0f * s + 0.5f);
+    if (card_w > fb_w - 16) {
+        card_w = fb_w - 16;
+        s = (float)card_w / 264.0f;
+        card_h = (int)(98.0f * s + 0.5f);
     }
-    if (card_w > fb_w - 12) card_w = fb_w - 12;
-    if (card_h > fb_h - 12) card_h = fb_h - 12;
-    if (card_w < 96 || card_h < 48) {
+    if (card_h > fb_h - 16) card_h = fb_h - 16;
+    if (card_w < 120 || card_h < 56) {
         return false;
     }
 
@@ -434,23 +434,23 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
     cy = shadow_pad;
 
     /* 1) Floating glassmorphic card */
-    KITTY_CanvasDrawRoundedCard(&canvas, cx, cy, card_w, card_h, 9.5f * s,
+    KITTY_CanvasDrawRoundedCard(&canvas, cx, cy, card_w, card_h, 11.0f * s,
                                 hud->pal.bg_top, hud->pal.bg_bot,
                                 hud->pal.border, shadow_pad, hud->pal.sheen);
 
     {
-        const int pad = (int)(9.0f * s + 0.5f);
+        const int pad = (int)(11.0f * s + 0.5f);
         const int inner_x = cx + pad;
         const int inner_w = card_w - pad * 2;
 
-        /* 2) Header row: Glowing status orb + FPS + fixed-width petite pill badge */
+        /* 2) Header row: Glowing status orb + crisp FPS + petite fixed-width pill */
         {
             const double fps = hud->ewma_fps;
             Uint8 orb_col[4] = { 74, 222, 128, 255 }; /* Emerald >= 55 */
             char fps_str[16];
-            const float fps_px = 16.5f * s;
-            const float unit_px = 8.5f * s;
-            const float head_base = (float)cy + 21.0f * s;
+            const float fps_px = 19.5f * s;
+            const float unit_px = 11.0f * s;
+            const float head_base = (float)cy + 24.5f * s;
             float nx;
 
             if (fps < 29.5 && hud->ring_count > 4) {
@@ -458,23 +458,23 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
             } else if (fps < 54.0 && hud->ring_count > 4) {
                 orb_col[0] = 251; orb_col[1] = 191; orb_col[2] = 36; /* Amber */
             }
-            KITTY_CanvasDrawGlowDot(&canvas, (float)inner_x + 4.5f * s,
-                                    (float)cy + 15.5f * s, 3.0f * s, 7.5f * s, orb_col);
+            KITTY_CanvasDrawGlowDot(&canvas, (float)inner_x + 5.0f * s,
+                                    (float)cy + 18.0f * s, 3.6f * s, 8.5f * s, orb_col);
 
             SDL_snprintf(fps_str, sizeof(fps_str), "%.1f", fps > 999.9 ? 999.9 : fps);
-            nx = KITTY_FontDrawUTF8(&canvas, (float)inner_x + 13.0f * s, head_base,
+            nx = KITTY_FontDrawUTF8(&canvas, (float)inner_x + 15.0f * s, head_base,
                                     fps_str, SDL_strlen(fps_str), fps_px,
                                     hud->pal.fg, true, true);
-            KITTY_FontDrawUTF8(&canvas, nx + 3.5f * s, head_base - 0.5f * s,
+            KITTY_FontDrawUTF8(&canvas, nx + 4.0f * s, head_base - 0.5f * s,
                                "FPS", 3, unit_px, hud->pal.muted, false, false);
 
-            /* Fixed-width petite transport badge pill (sized for max label, never jumps) */
+            /* Fixed-width petite transport badge pill (sized for "A=F +Z", never jumps) */
             {
                 char badge[24];
-                Uint8 pill_bg[4] = { hud->pal.accent2[0], hud->pal.accent2[1], hud->pal.accent2[2], 36 };
-                Uint8 pill_bd[4] = { hud->pal.accent2[0], hud->pal.accent2[1], hud->pal.accent2[2], 165 };
+                Uint8 pill_bg[4] = { hud->pal.accent2[0], hud->pal.accent2[1], hud->pal.accent2[2], 38 };
+                Uint8 pill_bd[4] = { hud->pal.accent2[0], hud->pal.accent2[1], hud->pal.accent2[2], 170 };
                 Uint8 pill_fg[4] = { 196, 245, 255, 255 };
-                const float badge_px = 8.2f * s;
+                const float badge_px = 10.8f * s;
                 const float max_tw = KITTY_FontMeasureUTF8("A=F +Z", 6, badge_px, true);
                 float btw;
                 int pw, ph, px, py;
@@ -491,10 +491,10 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
                 }
 
                 btw = KITTY_FontMeasureUTF8(badge, SDL_strlen(badge), badge_px, true);
-                pw = (int)((max_tw > btw ? max_tw : btw) + 10.0f * s + 0.5f);
-                ph = (int)(14.0f * s + 0.5f);
+                pw = (int)((max_tw > btw ? max_tw : btw) + 12.0f * s + 0.5f);
+                ph = (int)(17.5f * s + 0.5f);
                 px = inner_x + inner_w - pw;
-                py = cy + (int)(8.5f * s + 0.5f);
+                py = cy + (int)(9.0f * s + 0.5f);
                 KITTY_CanvasDrawPill(&canvas, px, py, pw, ph, (float)ph * 0.5f, pill_bg, pill_bd);
                 KITTY_FontDrawUTF8(&canvas, (float)px + ((float)pw - btw) * 0.5f,
                                    (float)py + (float)ph * 0.5f + badge_px * 0.34f,
@@ -505,9 +505,9 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
         /* 3) Silky-smooth Sparkline Chart Well */
         {
             const int chart_x = inner_x;
-            const int chart_y = cy + (int)(28.0f * s + 0.5f);
+            const int chart_y = cy + (int)(32.0f * s + 0.5f);
             const int chart_w = inner_w;
-            const int chart_h = (int)(34.0f * s + 0.5f);
+            const int chart_h = (int)(36.0f * s + 0.5f);
             float raw_ft[KITTY_HUD_SAMPLES];
             float smooth_ft[KITTY_HUD_SAMPLES];
             float smooth_tx[KITTY_HUD_SAMPLES];
@@ -516,7 +516,7 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
             float max_ms;
             int i;
 
-            KITTY_CanvasDrawPill(&canvas, chart_x, chart_y, chart_w, chart_h, 5.5f * s,
+            KITTY_CanvasDrawPill(&canvas, chart_x, chart_y, chart_w, chart_h, 6.0f * s,
                                  hud->pal.well_bg, hud->pal.well_border);
 
             if (n >= 2) {
@@ -537,7 +537,7 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
                     }
                 }
                 if (peak_ms > 55.0f) peak_ms = 55.0f;
-                /* Asymmetric smooth Y-axis ceiling: rises gently, decays slowly (zero vertical bounce) */
+                /* Asymmetric smooth Y-axis ceiling: rises gently, decays slowly */
                 if (hud->smooth_max_ms < 20.0f) {
                     hud->smooth_max_ms = peak_ms;
                 } else if (peak_ms > hud->smooth_max_ms) {
@@ -556,7 +556,7 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
                     if (gy > chart_y + 2 && gy < chart_y + chart_h - 2) {
                         for (gx = chart_x + 3; gx < chart_x + chart_w - 3; ++gx) {
                             if (((gx - chart_x) & 7) < 4) {
-                                KITTY_CanvasBlendPixel(&canvas, gx, gy, 255, 255, 255, 30);
+                                KITTY_CanvasBlendPixel(&canvas, gx, gy, 255, 255, 255, 32);
                             }
                         }
                     }
@@ -573,69 +573,55 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
                                           hud->pal.spark_line,
                                           hud->pal.spark_top, hud->pal.spark_bot, true);
             }
-            /* Tiny top-right chart legend ("60Hz") */
             {
                 const char *leg = "60Hz";
-                const float lpx = 7.5f * s;
+                const float lpx = 9.5f * s;
                 const float lw = KITTY_FontMeasureUTF8(leg, 4, lpx, true);
-                KITTY_FontDrawUTF8(&canvas, (float)(chart_x + chart_w) - lw - 4.0f * s,
-                                   (float)chart_y + 9.0f * s, leg, 4, lpx,
+                KITTY_FontDrawUTF8(&canvas, (float)(chart_x + chart_w) - lw - 5.0f * s,
+                                   (float)chart_y + 11.0f * s, leg, 4, lpx,
                                    hud->pal.muted, false, true);
             }
         }
 
-        /* 4) Compact Bottom 3-column Telemetry Row + Dirty Gradient Bar + Footer */
+        /* 4) Crisp single-row Telemetry Strip (TX · WIRE · DIRTY bar) */
         {
-            const float lbl_px = 7.2f * s;
-            const float val_px = 9.5f * s;
-            const float row_lbl_y = (float)cy + 72.5f * s;
-            const float row_val_y = (float)cy + 83.5f * s;
-            const int col0 = inner_x;
-            const int col1 = inner_x + (int)((float)inner_w * 0.30f);
-            const int col2 = inner_x + (int)((float)inner_w * 0.68f);
-            char tx_buf[20], wire_buf[24], dirty_buf[12], foot_buf[44];
+            const float val_px = 12.0f * s;
+            const float row_y = (float)cy + 86.5f * s;
+            char tx_buf[20], wire_buf[24];
+            float xcur = (float)inner_x;
             float dirty_t;
+            int bar_x, bar_w;
 
             SDL_snprintf(tx_buf, sizeof(tx_buf), "%.2fms", hud->ewma_tx_ms);
-            KITTY_FontDrawUTF8(&canvas, (float)col0, row_lbl_y, "TX", 2, lbl_px, hud->pal.muted, false, false);
-            KITTY_FontDrawUTF8(&canvas, (float)col0, row_val_y, tx_buf, SDL_strlen(tx_buf), val_px, hud->pal.tx_line, true, true);
+            xcur = KITTY_FontDrawUTF8(&canvas, xcur, row_y, tx_buf, SDL_strlen(tx_buf),
+                                      val_px, hud->pal.tx_line, true, true);
+            xcur = KITTY_FontDrawUTF8(&canvas, xcur + 5.0f * s, row_y, "·", SDL_strlen("·"),
+                                      val_px, hud->pal.muted, false, false);
 
             if (hud->bw_mbps >= 0.1) {
-                SDL_snprintf(wire_buf, sizeof(wire_buf), "%.1fK·%.1fM/s", hud->ewma_wire_kb, hud->bw_mbps);
+                SDL_snprintf(wire_buf, sizeof(wire_buf), "%.1fK", hud->ewma_wire_kb);
             } else {
-                SDL_snprintf(wire_buf, sizeof(wire_buf), "%.1f KB/f", hud->ewma_wire_kb);
+                SDL_snprintf(wire_buf, sizeof(wire_buf), "%.0fK", hud->ewma_wire_kb);
             }
-            KITTY_FontDrawUTF8(&canvas, (float)col1, row_lbl_y, "WIRE", 4, lbl_px, hud->pal.muted, false, false);
-            KITTY_FontDrawUTF8(&canvas, (float)col1, row_val_y, wire_buf, SDL_strlen(wire_buf), val_px, hud->pal.fg, true, true);
+            xcur = KITTY_FontDrawUTF8(&canvas, xcur + 5.0f * s, row_y, wire_buf, SDL_strlen(wire_buf),
+                                      val_px, hud->pal.fg, true, true);
 
-            dirty_t = (float)(hud->ewma_dirty_pct / 100.0);
-            if (dirty_t < 0.0f) dirty_t = 0.0f;
-            if (dirty_t > 1.0f) dirty_t = 1.0f;
-            SDL_snprintf(dirty_buf, sizeof(dirty_buf), "%.0f%%", hud->ewma_dirty_pct);
-            KITTY_FontDrawUTF8(&canvas, (float)col2, row_lbl_y, "DIRTY", 5, lbl_px, hud->pal.muted, false, false);
-            KITTY_FontDrawUTF8(&canvas, (float)col2 + (float)(inner_x + inner_w - col2) -
-                               KITTY_FontMeasureUTF8(dirty_buf, SDL_strlen(dirty_buf), lbl_px, true),
-                               row_lbl_y, dirty_buf, SDL_strlen(dirty_buf), lbl_px, hud->pal.accent2, false, true);
-            KITTY_CanvasDrawProgressBar(&canvas, col2, cy + (int)(77.0f * s + 0.5f),
-                                        (inner_x + inner_w) - col2, (int)(5.5f * s + 0.5f),
-                                        dirty_t, hud->pal.track, hud->pal.accent, hud->pal.accent2);
-
-            {
-                const int fy = cy + (int)(89.5f * s + 0.5f);
-                int hx;
-                for (hx = inner_x; hx < inner_x + inner_w; ++hx) {
-                    KITTY_CanvasBlendPixel(&canvas, hx, fy, 255, 255, 255, 18);
-                }
-                SDL_snprintf(foot_buf, sizeof(foot_buf), "%dx%d · F10 PNG · F12 HUD", fb_w, fb_h);
-                KITTY_FontDrawUTF8(&canvas, (float)inner_x, (float)cy + 98.5f * s,
-                                   foot_buf, SDL_strlen(foot_buf), 7.4f * s,
-                                   hud->pal.muted, false, true);
+            /* Compact dirty-coverage gradient bar on the right */
+            bar_x = (int)(xcur + 10.0f * s);
+            bar_w = (inner_x + inner_w) - bar_x;
+            if (bar_w >= (int)(28.0f * s)) {
+                dirty_t = (float)(hud->ewma_dirty_pct / 100.0);
+                if (dirty_t < 0.0f) dirty_t = 0.0f;
+                if (dirty_t > 1.0f) dirty_t = 1.0f;
+                KITTY_CanvasDrawProgressBar(&canvas, bar_x, cy + (int)(79.0f * s + 0.5f),
+                                            bar_w, (int)(6.5f * s + 0.5f),
+                                            dirty_t, hud->pal.track, hud->pal.accent, hud->pal.accent2);
             }
         }
     }
 
-    margin_x = SDL_max(6, (int)(10.0f * s));
-    margin_y = SDL_max(6, (int)(10.0f * s));
+    margin_x = SDL_max(8, (int)(12.0f * s));
+    margin_y = SDL_max(8, (int)(12.0f * s));
     switch (hud->pos) {
     case KITTY_HUD_TOP_LEFT:
         ox = margin_x;
