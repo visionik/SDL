@@ -493,15 +493,135 @@ float KITTY_SelectFbDiffCover(const char *env, float default_cover)
 }
 
 /*
- * Compare prev/next by tile×tile memcmp (bpp 3 or 4). NONE if identical;
- * RECT with dirty_out bbox if coverage < cover_limit; FULL if coverage
- * high or args invalid (dirty_out defaults to full FB then).
+ * Fast streaming byte-difference finder: returns offset of first differing
+ * byte in [0, len), or len if a[0..len) == b[0..len). Uses ARM64 NEON 64B/iter
+ * when available, else 8B word compares.
+ */
+static size_t KITTY_FindFirstDiff(const Uint8 *a, const Uint8 *b, size_t len)
+{
+    size_t i = 0;
+#ifdef KITTY_HAVE_NEON_LE
+    while (i + 64u <= len) {
+        const uint8x16_t d0 = veorq_u8(vld1q_u8(a + i), vld1q_u8(b + i));
+        const uint8x16_t d1 = veorq_u8(vld1q_u8(a + i + 16), vld1q_u8(b + i + 16));
+        const uint8x16_t d2 = veorq_u8(vld1q_u8(a + i + 32), vld1q_u8(b + i + 32));
+        const uint8x16_t d3 = veorq_u8(vld1q_u8(a + i + 48), vld1q_u8(b + i + 48));
+        const uint8x16_t any = vorrq_u8(vorrq_u8(d0, d1), vorrq_u8(d2, d3));
+        if (vmaxvq_u32(vreinterpretq_u32_u8(any)) != 0) {
+            if (vmaxvq_u32(vreinterpretq_u32_u8(d0)) == 0) {
+                i += 16u;
+                if (vmaxvq_u32(vreinterpretq_u32_u8(d1)) == 0) {
+                    i += 16u;
+                    if (vmaxvq_u32(vreinterpretq_u32_u8(d2)) == 0) {
+                        i += 16u;
+                    }
+                }
+            }
+            while (i < len && a[i] == b[i]) {
+                i++;
+            }
+            return i;
+        }
+        i += 64u;
+    }
+    while (i + 16u <= len) {
+        const uint8x16_t d = veorq_u8(vld1q_u8(a + i), vld1q_u8(b + i));
+        if (vmaxvq_u32(vreinterpretq_u32_u8(d)) != 0) {
+            while (i < len && a[i] == b[i]) {
+                i++;
+            }
+            return i;
+        }
+        i += 16u;
+    }
+#else
+    while (i + 8u <= len) {
+        Uint64 wa, wb;
+        SDL_memcpy(&wa, a + i, 8);
+        SDL_memcpy(&wb, b + i, 8);
+        if (wa != wb) {
+            while (i < len && a[i] == b[i]) {
+                i++;
+            }
+            return i;
+        }
+        i += 8u;
+    }
+#endif
+    while (i < len && a[i] == b[i]) {
+        i++;
+    }
+    return i;
+}
+
+/*
+ * Row-major cache-sequential scan of one horizontal band of tiles [ty, ty+th).
+ * Marks tile_dirty[0..tiles_x-1] = 1 for changed tiles and returns count of
+ * dirty tiles in the band. Exits early once all tiles in the band are dirty.
+ */
+static int KITTY_ScanTileRowBand(const Uint8 *prev, const Uint8 *next,
+                                 int fb_w, int ty, int th, int bpp, int tile,
+                                 int tiles_x, Uint8 *tile_dirty)
+{
+    const size_t row_bytes = (size_t)fb_w * (size_t)bpp;
+    const size_t tile_bytes = (size_t)tile * (size_t)bpp;
+    int dirty_in_band = 0;
+    int row;
+
+    SDL_memset(tile_dirty, 0, (size_t)tiles_x);
+
+    for (row = 0; row < th && dirty_in_band < tiles_x; ++row) {
+        const Uint8 *pa = prev + (size_t)(ty + row) * row_bytes;
+        const Uint8 *pb = next + (size_t)(ty + row) * row_bytes;
+        size_t pos = 0;
+        while (pos < row_bytes) {
+            int tx_idx = (int)(pos / tile_bytes);
+            int span_end_idx;
+            size_t span_end;
+            size_t rel;
+
+            while (tx_idx < tiles_x && tile_dirty[tx_idx]) {
+                tx_idx++;
+            }
+            if (tx_idx >= tiles_x) {
+                break;
+            }
+            pos = (size_t)tx_idx * tile_bytes;
+            span_end_idx = tx_idx + 1;
+            while (span_end_idx < tiles_x && !tile_dirty[span_end_idx]) {
+                span_end_idx++;
+            }
+            span_end = (size_t)span_end_idx * tile_bytes;
+            if (span_end > row_bytes) {
+                span_end = row_bytes;
+            }
+            rel = KITTY_FindFirstDiff(pa + pos, pb + pos, span_end - pos);
+            if (pos + rel < span_end) {
+                const int hit_idx = (int)((pos + rel) / tile_bytes);
+                tile_dirty[hit_idx] = 1;
+                dirty_in_band++;
+                pos = (size_t)(hit_idx + 1) * tile_bytes;
+            } else {
+                pos = span_end;
+            }
+        }
+    }
+    return dirty_in_band;
+}
+
+/*
+ * Compare prev/next by tile×tile streaming row-major scan (bpp 3 or 4).
+ * NONE if identical; RECT with dirty_out bbox if coverage < cover_limit;
+ * FULL if coverage high or args invalid (dirty_out defaults to full FB then).
  */
 KITTY_DiffOutcome KITTY_TileDiffBBox(const Uint8 *prev, const Uint8 *next,
                                      int fb_w, int fb_h, int bpp, int tile,
                                      float cover_limit, SDL_Rect *dirty_out)
 {
-    int ty, tx;
+    Uint8 stack_dirty[512];
+    Uint8 *tile_dirty = stack_dirty;
+    int tiles_x;
+    int ty, tx_idx;
     int min_x = fb_w, min_y = fb_h, max_x = 0, max_y = 0;
     int dirty_tiles = 0;
     SDL_Rect bbox;
@@ -516,35 +636,43 @@ KITTY_DiffOutcome KITTY_TileDiffBBox(const Uint8 *prev, const Uint8 *next,
         return KITTY_DIFF_FULL;
     }
 
+    tiles_x = (fb_w + tile - 1) / tile;
+    if (tiles_x > (int)sizeof(stack_dirty)) {
+        tile_dirty = (Uint8 *)SDL_malloc((size_t)tiles_x);
+        if (!tile_dirty) {
+            return KITTY_DIFF_FULL;
+        }
+    }
+
     for (ty = 0; ty < fb_h; ty += tile) {
         const int th = (ty + tile <= fb_h) ? tile : (fb_h - ty);
-        for (tx = 0; tx < fb_w; tx += tile) {
-            const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
-            int row;
-            bool changed = false;
-            for (row = 0; row < th; ++row) {
-                const size_t off = ((size_t)(ty + row) * (size_t)fb_w + (size_t)tx) * (size_t)bpp;
-                if (SDL_memcmp(prev + off, next + off, (size_t)tw * (size_t)bpp) != 0) {
-                    changed = true;
-                    break;
-                }
-            }
-            if (changed) {
-                dirty_tiles++;
+        const int band_dirty = KITTY_ScanTileRowBand(prev, next, fb_w, ty, th, bpp, tile, tiles_x, tile_dirty);
+        if (band_dirty == 0) {
+            continue;
+        }
+        dirty_tiles += band_dirty;
+        if (ty < min_y) {
+            min_y = ty;
+        }
+        if (ty + th > max_y) {
+            max_y = ty + th;
+        }
+        for (tx_idx = 0; tx_idx < tiles_x; ++tx_idx) {
+            if (tile_dirty[tx_idx]) {
+                const int tx = tx_idx * tile;
+                const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
                 if (tx < min_x) {
                     min_x = tx;
-                }
-                if (ty < min_y) {
-                    min_y = ty;
                 }
                 if (tx + tw > max_x) {
                     max_x = tx + tw;
                 }
-                if (ty + th > max_y) {
-                    max_y = ty + th;
-                }
             }
         }
+    }
+
+    if (tile_dirty != stack_dirty) {
+        SDL_free(tile_dirty);
     }
 
     if (dirty_tiles == 0) {
@@ -568,9 +696,9 @@ KITTY_DiffOutcome KITTY_TileDiffBBox(const Uint8 *prev, const Uint8 *next,
 }
 
 /*
- * Multi-rect tile diff: merge contiguous dirty tiles into horizontal runs
- * and extend matching runs vertically across tile rows. Falls back to
- * coalescing or the full bbox when more than max_rects regions exist.
+ * Multi-rect tile diff: row-major streaming NEON/word scan per tile band,
+ * merging contiguous dirty tiles into horizontal runs and extending matching
+ * runs vertically across tile rows.
  */
 KITTY_DiffOutcome KITTY_TileDiffRects(const Uint8 *prev, const Uint8 *next,
                                       int fb_w, int fb_h, int bpp, int tile,
@@ -578,10 +706,13 @@ KITTY_DiffOutcome KITTY_TileDiffRects(const Uint8 *prev, const Uint8 *next,
                                       SDL_Rect *rects_out, int max_rects,
                                       int *out_count, SDL_Rect *bbox_out)
 {
+    Uint8 stack_dirty[512];
+    Uint8 *tile_dirty = stack_dirty;
     SDL_Rect acc[64];
     int n_acc = 0;
     bool overflow = false;
-    int ty, tx;
+    int tiles_x;
+    int ty, tx_idx;
     int min_x = fb_w, min_y = fb_h, max_x = 0, max_y = 0;
     size_t dirty_px = 0;
     SDL_Rect bbox;
@@ -599,35 +730,40 @@ KITTY_DiffOutcome KITTY_TileDiffRects(const Uint8 *prev, const Uint8 *next,
         return KITTY_DIFF_FULL;
     }
 
+    tiles_x = (fb_w + tile - 1) / tile;
+    if (tiles_x > (int)sizeof(stack_dirty)) {
+        tile_dirty = (Uint8 *)SDL_malloc((size_t)tiles_x);
+        if (!tile_dirty) {
+            return KITTY_DIFF_FULL;
+        }
+    }
+
     for (ty = 0; ty < fb_h; ty += tile) {
         const int th = (ty + tile <= fb_h) ? tile : (fb_h - ty);
+        const int band_dirty = KITTY_ScanTileRowBand(prev, next, fb_w, ty, th, bpp, tile, tiles_x, tile_dirty);
         int run_x = -1;
         int run_w = 0;
 
-        for (tx = 0; tx < fb_w; tx += tile) {
+        if (band_dirty == 0) {
+            continue;
+        }
+        if (ty < min_y) {
+            min_y = ty;
+        }
+        if (ty + th > max_y) {
+            max_y = ty + th;
+        }
+
+        for (tx_idx = 0; tx_idx < tiles_x; ++tx_idx) {
+            const int tx = tx_idx * tile;
             const int tw = (tx + tile <= fb_w) ? tile : (fb_w - tx);
-            int row;
-            bool changed = false;
-            for (row = 0; row < th; ++row) {
-                const size_t off = ((size_t)(ty + row) * (size_t)fb_w + (size_t)tx) * (size_t)bpp;
-                if (SDL_memcmp(prev + off, next + off, (size_t)tw * (size_t)bpp) != 0) {
-                    changed = true;
-                    break;
-                }
-            }
-            if (changed) {
+            if (tile_dirty[tx_idx]) {
                 dirty_px += (size_t)tw * (size_t)th;
                 if (tx < min_x) {
                     min_x = tx;
                 }
-                if (ty < min_y) {
-                    min_y = ty;
-                }
                 if (tx + tw > max_x) {
                     max_x = tx + tw;
-                }
-                if (ty + th > max_y) {
-                    max_y = ty + th;
                 }
                 if (run_x < 0) {
                     run_x = tx;
@@ -636,7 +772,6 @@ KITTY_DiffOutcome KITTY_TileDiffRects(const Uint8 *prev, const Uint8 *next,
                     run_w += tw;
                 }
             } else if (run_x >= 0) {
-                /* Flush horizontal run and try vertical extension of matching rect. */
                 bool extended = false;
                 if (!overflow) {
                     int k;
@@ -687,6 +822,10 @@ KITTY_DiffOutcome KITTY_TileDiffRects(const Uint8 *prev, const Uint8 *next,
                 }
             }
         }
+    }
+
+    if (tile_dirty != stack_dirty) {
+        SDL_free(tile_dirty);
     }
 
     if (dirty_px == 0) {
