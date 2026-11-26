@@ -199,6 +199,16 @@ bool KITTY_ConvertSurfaceRectCheckChanged(SDL_Surface *surface, const SDL_Rect *
                                           bool *out_changed);
 
 /*
+ * Fused convert + change-check + tight pack: reads surface->pixels once,
+ * updates changed pixels in rgb_scratch, and writes tightly packed RGB24/RGBA32
+ * directly into packed_out from the same NEON registers (no scratch read-back).
+ */
+bool KITTY_ConvertSurfaceRectCheckAndPack(SDL_Surface *surface, const SDL_Rect *rect,
+                                          Uint8 *rgb_scratch, Uint8 *packed_out,
+                                          size_t packed_cap, bool use_rgba,
+                                          bool *out_changed, size_t *out_len);
+
+/*
  * Pack a rect from a full-frame RGB24 scratch into a tightly packed buffer
  * (rw*rh*3). out must hold at least that many bytes; out_len optional.
  */

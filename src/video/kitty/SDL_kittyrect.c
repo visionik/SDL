@@ -1868,6 +1868,238 @@ bool KITTY_ConvertSurfaceRectCheckChanged(SDL_Surface *surface, const SDL_Rect *
     return true;
 }
 
+static inline void KITTY_ConvertRowDualRGB(const Uint32 *src, Uint8 *dst_s, Uint8 *dst_p, int count)
+{
+    int x = 0;
+#ifdef KITTY_HAVE_NEON_LE
+    for (; x + 16 <= count; x += 16) {
+        const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
+        uint8x16x3_t rgb;
+        rgb.val[0] = bgra.val[2];
+        rgb.val[1] = bgra.val[1];
+        rgb.val[2] = bgra.val[0];
+        vst3q_u8(dst_s, rgb);
+        vst3q_u8(dst_p, rgb);
+        dst_s += 48;
+        dst_p += 48;
+    }
+#endif
+    for (; x < count; ++x) {
+        const Uint32 p = src[x];
+        const Uint8 r = (Uint8)((p >> 16) & 0xFF);
+        const Uint8 g = (Uint8)((p >> 8) & 0xFF);
+        const Uint8 b = (Uint8)(p & 0xFF);
+        dst_s[0] = r; dst_s[1] = g; dst_s[2] = b;
+        dst_p[0] = r; dst_p[1] = g; dst_p[2] = b;
+        dst_s += 3;
+        dst_p += 3;
+    }
+}
+
+static inline void KITTY_ConvertRowDualRGBA(const Uint32 *src, Uint8 *dst_s, Uint8 *dst_p, int count)
+{
+    int x = 0;
+#ifdef KITTY_HAVE_NEON_LE
+    for (; x + 16 <= count; x += 16) {
+        const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
+        uint8x16x4_t rgba;
+        rgba.val[0] = bgra.val[2];
+        rgba.val[1] = bgra.val[1];
+        rgba.val[2] = bgra.val[0];
+        rgba.val[3] = bgra.val[3];
+        vst4q_u8(dst_s, rgba);
+        vst4q_u8(dst_p, rgba);
+        dst_s += 64;
+        dst_p += 64;
+    }
+#endif
+    for (; x < count; ++x) {
+        const Uint32 p = src[x];
+        const Uint8 r = (Uint8)((p >> 16) & 0xFF);
+        const Uint8 g = (Uint8)((p >> 8) & 0xFF);
+        const Uint8 b = (Uint8)(p & 0xFF);
+        const Uint8 a = (Uint8)((p >> 24) & 0xFF);
+        dst_s[0] = r; dst_s[1] = g; dst_s[2] = b; dst_s[3] = a;
+        dst_p[0] = r; dst_p[1] = g; dst_p[2] = b; dst_p[3] = a;
+        dst_s += 4;
+        dst_p += 4;
+    }
+}
+
+/*
+ * Fused convert + change-check + tight pack: single read of surface->pixels
+ * updates rgb_scratch in-place and emits tightly packed RGB24/RGBA32 directly
+ * into packed_out from the same NEON registers (no scratch read-back).
+ */
+bool KITTY_ConvertSurfaceRectCheckAndPack(SDL_Surface *surface, const SDL_Rect *rect,
+                                          Uint8 *rgb_scratch, Uint8 *packed_out,
+                                          size_t packed_cap, bool use_rgba,
+                                          bool *out_changed, size_t *out_len)
+{
+    SDL_Rect fb, area;
+    const size_t bpp = use_rgba ? 4u : 3u;
+    size_t need;
+    size_t src_stride, dst_stride, pack_stride;
+    const Uint8 *src_row;
+    Uint8 *dst_row;
+    Uint8 *pack_row;
+    bool changed = false;
+    int y;
+
+    if (out_changed) {
+        *out_changed = false;
+    }
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (!surface || !rgb_scratch || !packed_out || !rect || surface->w <= 0 || surface->h <= 0) {
+        return false;
+    }
+    fb.x = 0;
+    fb.y = 0;
+    fb.w = surface->w;
+    fb.h = surface->h;
+    if (!SDL_GetRectIntersection(rect, &fb, &area) || area.w <= 0 || area.h <= 0) {
+        return false;
+    }
+    need = (size_t)area.w * (size_t)area.h * bpp;
+    if (need > packed_cap) {
+        return false;
+    }
+
+    src_stride = (size_t)surface->pitch;
+    dst_stride = (size_t)surface->w * bpp;
+    pack_stride = (size_t)area.w * bpp;
+    src_row = (const Uint8 *)surface->pixels + (size_t)area.y * src_stride + (size_t)area.x * 4u;
+    dst_row = rgb_scratch + ((size_t)area.y * (size_t)surface->w + (size_t)area.x) * bpp;
+    pack_row = packed_out;
+
+    for (y = 0; y < area.h; ++y) {
+        const Uint32 *src = (const Uint32 *)src_row;
+        Uint8 *dst = dst_row;
+        Uint8 *pck = pack_row;
+        if (changed) {
+            if (use_rgba) {
+                KITTY_ConvertRowDualRGBA(src, dst, pck, area.w);
+            } else {
+                KITTY_ConvertRowDualRGB(src, dst, pck, area.w);
+            }
+        } else if (!use_rgba) {
+            int x = 0;
+#ifdef KITTY_HAVE_NEON_LE
+            for (; x + 16 <= area.w; x += 16) {
+                const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
+                const uint8x16x3_t old = vld3q_u8(dst);
+                const uint8x16_t d = vorrq_u8(
+                    vorrq_u8(veorq_u8(bgra.val[2], old.val[0]),
+                             veorq_u8(bgra.val[1], old.val[1])),
+                    veorq_u8(bgra.val[0], old.val[2]));
+                uint8x16x3_t rgb;
+                rgb.val[0] = bgra.val[2];
+                rgb.val[1] = bgra.val[1];
+                rgb.val[2] = bgra.val[0];
+                vst3q_u8(pck, rgb);
+                if (vmaxvq_u32(vreinterpretq_u32_u8(d)) != 0) {
+                    vst3q_u8(dst, rgb);
+                    changed = true;
+                    x += 16;
+                    dst += 48;
+                    pck += 48;
+                    break;
+                }
+                dst += 48;
+                pck += 48;
+            }
+#endif
+            if (!changed) {
+                for (; x < area.w; ++x) {
+                    const Uint32 p = src[x];
+                    const Uint8 r = (Uint8)((p >> 16) & 0xFF);
+                    const Uint8 g = (Uint8)((p >> 8) & 0xFF);
+                    const Uint8 b = (Uint8)(p & 0xFF);
+                    pck[0] = r; pck[1] = g; pck[2] = b;
+                    if (dst[0] != r || dst[1] != g || dst[2] != b) {
+                        dst[0] = r; dst[1] = g; dst[2] = b;
+                        changed = true;
+                        x++;
+                        dst += 3;
+                        pck += 3;
+                        break;
+                    }
+                    dst += 3;
+                    pck += 3;
+                }
+            }
+            if (changed && x < area.w) {
+                KITTY_ConvertRowDualRGB(src + x, dst, pck, area.w - x);
+            }
+        } else {
+            int x = 0;
+#ifdef KITTY_HAVE_NEON_LE
+            for (; x + 16 <= area.w; x += 16) {
+                const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
+                const uint8x16x4_t old = vld4q_u8(dst);
+                const uint8x16_t d = vorrq_u8(
+                    vorrq_u8(veorq_u8(bgra.val[2], old.val[0]),
+                             veorq_u8(bgra.val[1], old.val[1])),
+                    vorrq_u8(veorq_u8(bgra.val[0], old.val[2]),
+                             veorq_u8(bgra.val[3], old.val[3])));
+                uint8x16x4_t rgba;
+                rgba.val[0] = bgra.val[2];
+                rgba.val[1] = bgra.val[1];
+                rgba.val[2] = bgra.val[0];
+                rgba.val[3] = bgra.val[3];
+                vst4q_u8(pck, rgba);
+                if (vmaxvq_u32(vreinterpretq_u32_u8(d)) != 0) {
+                    vst4q_u8(dst, rgba);
+                    changed = true;
+                    x += 16;
+                    dst += 64;
+                    pck += 64;
+                    break;
+                }
+                dst += 64;
+                pck += 64;
+            }
+#endif
+            if (!changed) {
+                for (; x < area.w; ++x) {
+                    const Uint32 p = src[x];
+                    const Uint8 r = (Uint8)((p >> 16) & 0xFF);
+                    const Uint8 g = (Uint8)((p >> 8) & 0xFF);
+                    const Uint8 b = (Uint8)(p & 0xFF);
+                    const Uint8 a = (Uint8)((p >> 24) & 0xFF);
+                    pck[0] = r; pck[1] = g; pck[2] = b; pck[3] = a;
+                    if (dst[0] != r || dst[1] != g || dst[2] != b || dst[3] != a) {
+                        dst[0] = r; dst[1] = g; dst[2] = b; dst[3] = a;
+                        changed = true;
+                        x++;
+                        dst += 4;
+                        pck += 4;
+                        break;
+                    }
+                    dst += 4;
+                    pck += 4;
+                }
+            }
+            if (changed && x < area.w) {
+                KITTY_ConvertRowDualRGBA(src + x, dst, pck, area.w - x);
+            }
+        }
+        src_row += src_stride;
+        dst_row += dst_stride;
+        pack_row += pack_stride;
+    }
+
+    if (out_changed) {
+        *out_changed = changed;
+    }
+    if (out_len) {
+        *out_len = need;
+    }
+    return true;
+}
+
 /*
  * Copy a clipped rect from a full-frame RGBA32 scratch into tightly packed
  * out (rw*rh*4). Fails if out_cap is too small.
