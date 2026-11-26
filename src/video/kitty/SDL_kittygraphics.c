@@ -239,24 +239,30 @@ static bool KITTY_PollReadable(int fd, int timeout_ms)
 }
 
 #ifdef __APPLE__
-#define KITTY_PZ_MAX_SLICES 8
+#define KITTY_PZ_MAX_SLICES 12
 #define KITTY_PZ_MIN_BYTES ((size_t)128 * 1024)
+
+/* 128-byte aligned per-worker slice eliminates false sharing on Apple Silicon
+ * (where L1 cache lines are 128 B and sizeof(z_stream) == 112 B). */
+typedef struct __attribute__((aligned(128))) KITTY_ParallelZlibSlice
+{
+    z_stream stream;
+    bool stream_init;
+    Uint8 *out_buf;
+    size_t out_cap;
+    size_t off;
+    size_t in_len;
+    size_t out_len;
+    uLong adler;
+    bool ok;
+} KITTY_ParallelZlibSlice;
 
 typedef struct KITTY_ParallelZlibCtx
 {
-    z_stream streams[KITTY_PZ_MAX_SLICES];
-    bool stream_init[KITTY_PZ_MAX_SLICES];
-    Uint8 *out_buf[KITTY_PZ_MAX_SLICES];
-    size_t out_cap[KITTY_PZ_MAX_SLICES];
+    KITTY_ParallelZlibSlice slices[KITTY_PZ_MAX_SLICES];
     int max_slices;
-    /* Per-call dispatch parameters */
     const Uint8 *src;
     int active_slices;
-    size_t slice_off[KITTY_PZ_MAX_SLICES];
-    size_t slice_in_len[KITTY_PZ_MAX_SLICES];
-    size_t slice_out_len[KITTY_PZ_MAX_SLICES];
-    uLong slice_adler[KITTY_PZ_MAX_SLICES];
-    bool slice_ok[KITTY_PZ_MAX_SLICES];
 } KITTY_ParallelZlibCtx;
 
 static void KITTY_FreeParallelZlib(SDL_VideoData *vdata)
@@ -268,13 +274,13 @@ static void KITTY_FreeParallelZlib(SDL_VideoData *vdata)
     }
     ctx = (KITTY_ParallelZlibCtx *)vdata->tx_pz_ctx;
     for (i = 0; i < KITTY_PZ_MAX_SLICES; ++i) {
-        if (ctx->stream_init[i]) {
-            deflateEnd(&ctx->streams[i]);
-            ctx->stream_init[i] = false;
+        if (ctx->slices[i].stream_init) {
+            deflateEnd(&ctx->slices[i].stream);
+            ctx->slices[i].stream_init = false;
         }
-        SDL_free(ctx->out_buf[i]);
-        ctx->out_buf[i] = NULL;
-        ctx->out_cap[i] = 0;
+        SDL_free(ctx->slices[i].out_buf);
+        ctx->slices[i].out_buf = NULL;
+        ctx->slices[i].out_cap = 0;
     }
     SDL_free(ctx);
     vdata->tx_pz_ctx = NULL;
@@ -283,15 +289,16 @@ static void KITTY_FreeParallelZlib(SDL_VideoData *vdata)
 static void KITTY_ParallelZlibWorker(void *arg, size_t idx)
 {
     KITTY_ParallelZlibCtx *ctx = (KITTY_ParallelZlibCtx *)arg;
-    z_stream *zs = &ctx->streams[idx];
-    const Uint8 *in = ctx->src + ctx->slice_off[idx];
-    const size_t in_len = ctx->slice_in_len[idx];
+    KITTY_ParallelZlibSlice *sl = &ctx->slices[idx];
+    z_stream *zs = &sl->stream;
+    const Uint8 *in = ctx->src + sl->off;
+    const size_t in_len = sl->in_len;
     const int flush = ((int)idx + 1 == ctx->active_slices) ? Z_FINISH : Z_SYNC_FLUSH;
     int zerr;
 
-    ctx->slice_ok[idx] = false;
-    ctx->slice_out_len[idx] = 0;
-    ctx->slice_adler[idx] = adler32(adler32(0L, Z_NULL, 0), in, (uInt)in_len);
+    sl->ok = false;
+    sl->out_len = 0;
+    sl->adler = adler32(adler32(0L, Z_NULL, 0), in, (uInt)in_len);
 
     zerr = deflateReset(zs);
     if (zerr != Z_OK) {
@@ -299,15 +306,15 @@ static void KITTY_ParallelZlibWorker(void *arg, size_t idx)
     }
     zs->next_in = (Bytef *)in;
     zs->avail_in = (uInt)in_len;
-    zs->next_out = (Bytef *)ctx->out_buf[idx];
-    zs->avail_out = (uInt)ctx->out_cap[idx];
+    zs->next_out = (Bytef *)sl->out_buf;
+    zs->avail_out = (uInt)sl->out_cap;
 
     zerr = deflate(zs, flush);
     if (flush == Z_FINISH ? (zerr != Z_STREAM_END) : (zerr != Z_OK || zs->avail_in != 0)) {
         return;
     }
-    ctx->slice_out_len[idx] = (size_t)zs->total_out;
-    ctx->slice_ok[idx] = true;
+    sl->out_len = (size_t)zs->total_out;
+    sl->ok = true;
 }
 #endif /* __APPLE__ */
 
@@ -382,7 +389,7 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
     }
 
 #ifdef __APPLE__
-    /* Multi-core RFC 1950 zlib for large full-frame payloads: up to 8 raw
+    /* Multi-core RFC 1950 zlib for large full-frame payloads: up to 12 raw
      * deflate slices concatenated via Z_SYNC_FLUSH + Z_FINISH + adler32_combine. */
     if (src_len >= KITTY_PZ_MIN_BYTES) {
         KITTY_ParallelZlibCtx *ctx = (KITTY_ParallelZlibCtx *)vdata->tx_pz_ctx;
@@ -396,12 +403,12 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
                 bool init_ok = true;
                 ctx->max_slices = max_s;
                 for (i = 0; i < max_s; ++i) {
-                    if (deflateInit2(&ctx->streams[i], Z_BEST_SPEED, Z_DEFLATED, -15, 8,
+                    if (deflateInit2(&ctx->slices[i].stream, Z_BEST_SPEED, Z_DEFLATED, -15, 8,
                                      Z_DEFAULT_STRATEGY) != Z_OK) {
                         init_ok = false;
                         break;
                     }
-                    ctx->stream_init[i] = true;
+                    ctx->slices[i].stream_init = true;
                 }
                 if (init_ok) {
                     vdata->tx_pz_ctx = ctx;
@@ -413,7 +420,8 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
             }
         }
         if (ctx) {
-            int n_slices = (src_len >= 512u * 1024u) ? ctx->max_slices : 4;
+            int n_slices = (src_len >= 1536u * 1024u) ? ctx->max_slices
+                                                      : (src_len >= 512u * 1024u ? 8 : 4);
             if (n_slices > ctx->max_slices) {
                 n_slices = ctx->max_slices;
             }
@@ -423,19 +431,20 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
             ctx->src = src;
             ctx->active_slices = n_slices;
             for (i = 0; i < n_slices; ++i) {
+                KITTY_ParallelZlibSlice *sl = &ctx->slices[i];
                 const size_t slen = (i + 1 == n_slices) ? (src_len - off) : base;
-                const size_t sbound = (size_t)deflateBound(&ctx->streams[i], (uLong)slen) + 16u;
-                ctx->slice_off[i] = off;
-                ctx->slice_in_len[i] = slen;
+                const size_t sbound = (size_t)deflateBound(&sl->stream, (uLong)slen) + 16u;
+                sl->off = off;
+                sl->in_len = slen;
                 off += slen;
-                if (ctx->out_cap[i] < sbound) {
-                    Uint8 *nb = (Uint8 *)SDL_realloc(ctx->out_buf[i], sbound);
+                if (sl->out_cap < sbound) {
+                    Uint8 *nb = (Uint8 *)SDL_realloc(sl->out_buf, sbound);
                     if (!nb) {
                         cap_ok = false;
                         break;
                     }
-                    ctx->out_buf[i] = nb;
-                    ctx->out_cap[i] = sbound;
+                    sl->out_buf = nb;
+                    sl->out_cap = sbound;
                 }
             }
             if (cap_ok) {
@@ -445,25 +454,25 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
                                  dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
                                  ctx, KITTY_ParallelZlibWorker);
                 for (i = 0; i < n_slices; ++i) {
-                    if (!ctx->slice_ok[i]) {
+                    if (!ctx->slices[i].ok) {
                         all_ok = false;
                         break;
                     }
-                    total += ctx->slice_out_len[i];
+                    total += ctx->slices[i].out_len;
                 }
                 if (all_ok) {
                     dst = KITTY_EnsureZBuf(vdata, total);
                     if (dst) {
-                        uLong combined = ctx->slice_adler[0];
+                        uLong combined = ctx->slices[0].adler;
                         size_t pos = 2u;
                         dst[0] = 0x78u; /* CM=8 deflate, CINFO=7 (32K window) */
                         dst[1] = 0x01u; /* FLEVEL=0, FCHECK=1 (0x7801 % 31 == 0) */
                         for (i = 0; i < n_slices; ++i) {
-                            SDL_memcpy(dst + pos, ctx->out_buf[i], ctx->slice_out_len[i]);
-                            pos += ctx->slice_out_len[i];
+                            SDL_memcpy(dst + pos, ctx->slices[i].out_buf, ctx->slices[i].out_len);
+                            pos += ctx->slices[i].out_len;
                             if (i > 0) {
-                                combined = adler32_combine(combined, ctx->slice_adler[i],
-                                                           (z_off_t)ctx->slice_in_len[i]);
+                                combined = adler32_combine(combined, ctx->slices[i].adler,
+                                                           (z_off_t)ctx->slices[i].in_len);
                             }
                         }
                         dst[pos + 0] = (Uint8)((combined >> 24) & 0xFFu);
