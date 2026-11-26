@@ -828,6 +828,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             ok = KITTY_TransmitRGB(vdata, image_id, wdata->rgb_scratch, surface->w, surface->h, kitty_f);
             if (ok) {
                 if (pingpong && wdata->placed && prev != 0 && prev != image_id) {
+                    KITTY_FlushAsyncWriter(vdata);
                     KITTY_DeleteImage(vdata->tty_fd, prev);
                 }
                 wdata->placed = true;

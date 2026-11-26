@@ -35,6 +35,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -319,6 +320,186 @@ static void KITTY_ParallelZlibWorker(void *arg, size_t idx)
 #endif /* __APPLE__ */
 
 /*
+ * Depth-1 double-buffered async PTY writer thread. Overlaps CPU work
+ * (convert/diff/zlib/base64) of frame N+1 with kernel PTY write of frame N,
+ * while strictly preserving FIFO order and backpressure (max 1 buffer in flight).
+ */
+#define KITTY_ASYNC_MAX_BYTES ((size_t)262144u)
+
+typedef struct KITTY_AsyncWriter
+{
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t cv_work;
+    pthread_cond_t cv_idle;
+    int fd;
+    char *buf;
+    size_t cap;
+    size_t len;
+    char *stage_buf;
+    size_t stage_cap;
+    bool busy;
+    bool stop;
+    bool write_err;
+    bool started;
+} KITTY_AsyncWriter;
+
+static void *KITTY_AsyncWriterMain(void *arg)
+{
+    KITTY_AsyncWriter *w = (KITTY_AsyncWriter *)arg;
+    pthread_mutex_lock(&w->mu);
+    for (;;) {
+        while (!w->busy && !w->stop) {
+            pthread_cond_wait(&w->cv_work, &w->mu);
+        }
+        if (!w->busy && w->stop) {
+            break;
+        }
+        {
+            const int fd = w->fd;
+            const char *buf = w->buf;
+            const size_t len = w->len;
+            bool ok;
+            pthread_mutex_unlock(&w->mu);
+            ok = KITTY_WriteAll(fd, buf, len);
+            pthread_mutex_lock(&w->mu);
+            if (!ok) {
+                w->write_err = true;
+            }
+            w->busy = false;
+            w->len = 0;
+            pthread_cond_signal(&w->cv_idle);
+        }
+    }
+    pthread_mutex_unlock(&w->mu);
+    return NULL;
+}
+
+static KITTY_AsyncWriter *KITTY_GetAsyncWriter(SDL_VideoData *vdata)
+{
+    KITTY_AsyncWriter *w;
+    if (!vdata) {
+        return NULL;
+    }
+    if (vdata->tx_async) {
+        return (KITTY_AsyncWriter *)vdata->tx_async;
+    }
+    w = (KITTY_AsyncWriter *)SDL_calloc(1, sizeof(KITTY_AsyncWriter));
+    if (!w) {
+        return NULL;
+    }
+    if (pthread_mutex_init(&w->mu, NULL) != 0) {
+        SDL_free(w);
+        return NULL;
+    }
+    if (pthread_cond_init(&w->cv_work, NULL) != 0) {
+        pthread_mutex_destroy(&w->mu);
+        SDL_free(w);
+        return NULL;
+    }
+    if (pthread_cond_init(&w->cv_idle, NULL) != 0) {
+        pthread_cond_destroy(&w->cv_work);
+        pthread_mutex_destroy(&w->mu);
+        SDL_free(w);
+        return NULL;
+    }
+    if (pthread_create(&w->thread, NULL, KITTY_AsyncWriterMain, w) != 0) {
+        pthread_cond_destroy(&w->cv_idle);
+        pthread_cond_destroy(&w->cv_work);
+        pthread_mutex_destroy(&w->mu);
+        SDL_free(w);
+        return NULL;
+    }
+    w->started = true;
+    vdata->tx_async = w;
+    return w;
+}
+
+static char *KITTY_AsyncEnsureStage(KITTY_AsyncWriter *w, size_t need)
+{
+    size_t cap;
+    char *p;
+    if (w->stage_buf && w->stage_cap >= need) {
+        return w->stage_buf;
+    }
+    cap = w->stage_cap ? w->stage_cap : 16384u;
+    while (cap < need) {
+        cap *= 2u;
+    }
+    p = (char *)SDL_realloc(w->stage_buf, cap);
+    if (!p) {
+        return NULL;
+    }
+    w->stage_buf = p;
+    w->stage_cap = cap;
+    return p;
+}
+
+static bool KITTY_AsyncSubmitStage(KITTY_AsyncWriter *w, int fd, size_t len)
+{
+    bool prev_err;
+    char *tmp_buf;
+    size_t tmp_cap;
+
+    pthread_mutex_lock(&w->mu);
+    while (w->busy) {
+        pthread_cond_wait(&w->cv_idle, &w->mu);
+    }
+    prev_err = w->write_err;
+    w->write_err = false;
+    tmp_buf = w->buf;
+    tmp_cap = w->cap;
+    w->buf = w->stage_buf;
+    w->cap = w->stage_cap;
+    w->stage_buf = tmp_buf;
+    w->stage_cap = tmp_cap;
+    w->fd = fd;
+    w->len = len;
+    w->busy = true;
+    pthread_cond_signal(&w->cv_work);
+    pthread_mutex_unlock(&w->mu);
+    return !prev_err;
+}
+
+void KITTY_FlushAsyncWriter(SDL_VideoData *vdata)
+{
+    KITTY_AsyncWriter *w;
+    if (!vdata || !vdata->tx_async) {
+        return;
+    }
+    w = (KITTY_AsyncWriter *)vdata->tx_async;
+    pthread_mutex_lock(&w->mu);
+    while (w->busy) {
+        pthread_cond_wait(&w->cv_idle, &w->mu);
+    }
+    pthread_mutex_unlock(&w->mu);
+}
+
+static void KITTY_DestroyAsyncWriter(SDL_VideoData *vdata)
+{
+    KITTY_AsyncWriter *w;
+    if (!vdata || !vdata->tx_async) {
+        return;
+    }
+    w = (KITTY_AsyncWriter *)vdata->tx_async;
+    if (w->started) {
+        pthread_mutex_lock(&w->mu);
+        w->stop = true;
+        pthread_cond_signal(&w->cv_work);
+        pthread_mutex_unlock(&w->mu);
+        pthread_join(w->thread, NULL);
+        w->started = false;
+    }
+    pthread_cond_destroy(&w->cv_idle);
+    pthread_cond_destroy(&w->cv_work);
+    pthread_mutex_destroy(&w->mu);
+    SDL_free(w->buf);
+    SDL_free(w->stage_buf);
+    SDL_free(w);
+    vdata->tx_async = NULL;
+}
+
+/*
  * Free persistent transmit scratch buffers and reusable z_stream on vdata.
  */
 void KITTY_FreeTransmitBuffers(SDL_VideoData *vdata)
@@ -326,6 +507,7 @@ void KITTY_FreeTransmitBuffers(SDL_VideoData *vdata)
     if (!vdata) {
         return;
     }
+    KITTY_DestroyAsyncWriter(vdata);
 #ifdef __APPLE__
     KITTY_FreeParallelZlib(vdata);
 #endif
@@ -553,11 +735,57 @@ static bool KITTY_TransmitDirectPayload(SDL_VideoData *vdata, int fd, Uint32 ima
     /* Prefer KITTY_WritePlaceOrigin at the call site (viewport CUP). This
      * fallback homes to 1;1 when a caller still passes home_cursor. */
     if (home_cursor) {
+        KITTY_FlushAsyncWriter(vdata);
         if (!KITTY_WriteAll(fd, "\033[H", 3)) {
             return false;
         }
         wire += 3;
     }
+
+    /* Single-chunk payloads <= 256 KB (all 720p/1080p zlib frames): encode
+     * directly into the double-buffered async PTY writer stage buffer so the
+     * previous frame's PTY drain overlaps this frame's CPU work. */
+    if (b64_total <= KITTY_ASYNC_MAX_BYTES && b64_total <= chunk_cap && !home_cursor) {
+        KITTY_AsyncWriter *aw = KITTY_GetAsyncWriter(vdata);
+        if (aw) {
+            char header[256];
+            char ctrl[192];
+            const int ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 'd', image_id,
+                                                            w, h, place_cols, place_rows,
+                                                            false, extra_keys, 0, kitty_f);
+            int header_len;
+            char *dst;
+            size_t encoded;
+            if (ctrl_len <= 0) {
+                return SDL_SetError("transmit header format failed");
+            }
+            header_len = SDL_snprintf(header, sizeof(header), "\033_G%s;", ctrl);
+            if (header_len <= 0) {
+                return SDL_SetError("header snprintf failed");
+            }
+            dst = KITTY_AsyncEnsureStage(aw, (size_t)header_len + b64_total + 3u);
+            if (!dst) {
+                return false;
+            }
+            SDL_memcpy(dst, header, (size_t)header_len);
+            encoded = KITTY_Base64Encode(payload, payload_len, dst + header_len, b64_total + 1u);
+            if (encoded == 0) {
+                return SDL_SetError("base64 encode failed");
+            }
+            dst[(size_t)header_len + encoded] = '\033';
+            dst[(size_t)header_len + encoded + 1u] = '\\';
+            wire = (size_t)header_len + encoded + 2u;
+            if (!KITTY_AsyncSubmitStage(aw, fd, wire)) {
+                return SDL_SetError("kitty async write failed");
+            }
+            if (out_wire_bytes) {
+                *out_wire_bytes = wire;
+            }
+            return true;
+        }
+    }
+
+    KITTY_FlushAsyncWriter(vdata);
 
     /* Small payloads (e.g. zlib-compressed frames <= 192 KB) fit in L2 and
      * go out in a single writev() call; large raw payloads stream in 48 KB raw
@@ -831,6 +1059,7 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
             SDL_SetError("shm apc snprintf failed");
             goto done;
         }
+        KITTY_FlushAsyncWriter(vdata);
         if (!KITTY_WriteAll(fd, apc, (size_t)apc_len)) {
             goto done;
         }
@@ -1242,6 +1471,7 @@ bool KITTY_WritePlaceOrigin(SDL_VideoData *data)
     if (!data) {
         return false;
     }
+    KITTY_FlushAsyncWriter(data);
     if (data->vp_cols > 0 && data->vp_rows > 0 && data->vp_col > 0 && data->vp_row > 0) {
         n = SDL_snprintf(buf, sizeof(buf), "\033[%d;%dH", data->vp_row, data->vp_col);
     } else {
@@ -1267,6 +1497,7 @@ bool KITTY_DrawViewportChrome(SDL_VideoData *data)
     if (fd < 0) {
         return false;
     }
+    KITTY_FlushAsyncWriter(data);
 
     x0 = data->vp_col - 1;
     y0 = data->vp_row - 1;
@@ -1685,6 +1916,7 @@ void KITTY_RestoreTerminal(SDL_VideoData *data)
         "\033[<u"
         "\033[?25h";
     static const char leave_alt[] = "\033[?1049l";
+    KITTY_FlushAsyncWriter(data);
     if (!data->leave_images) {
         KITTY_DeleteAllImages(data->tty_out);
     }
@@ -1791,7 +2023,8 @@ void KITTY_ClearOverlays(SDL_VideoData *vdata, SDL_WindowData *wdata)
     if (!wdata) {
         return;
     }
-    if (vdata) {
+    if (vdata && wdata->overlay_count > 0) {
+        KITTY_FlushAsyncWriter(vdata);
         for (i = 0; i < wdata->overlay_count; ++i) {
             if (wdata->overlay_ids[i] != 0) {
                 KITTY_DeleteImage(vdata->tty_fd, wdata->overlay_ids[i]);
@@ -1849,6 +2082,7 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
     }
 
     /* Save/restore cursor so CUP for overlays does not drift the base origin. */
+    KITTY_FlushAsyncWriter(vdata);
     if (!KITTY_WriteAll(vdata->tty_fd, "\0337", 2)) {
         return false;
     }
@@ -1962,72 +2196,114 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     }
 
     b64_len = ((body_len + 2) / 3) * 4;
-    b64 = KITTY_EnsureB64Buf(vdata, b64_len + 1);
-    if (!b64) {
-        return false;
-    }
-    encoded = KITTY_Base64Encode(body, body_len, b64, b64_len + 1);
-    if (encoded == 0) {
-        return SDL_SetError("base64 encode failed");
-    }
-
-    /* Edit root frame in place — do not home cursor or re-place. */
     {
         const size_t chunk_cap = vdata->cfg_cached
                                      ? vdata->cfg_apc_chunk_bytes
                                      : KITTY_ProfileApcChunkBytes(vdata->term_profile);
-        size_t wire = 0;
-        const Uint64 t0 = SDL_GetTicksNS();
 
-        while (offset < encoded) {
-            size_t chunk = encoded - offset;
-            char header[256];
-            int header_len;
-            int more;
-            if (chunk > chunk_cap) {
-                chunk = chunk_cap;
-            }
-            more = (offset + chunk < encoded) ? 1 : 0;
-            if (first) {
-                /* r=1 edits root; X=1 overwrite; q=2 quiet (no APC OK). */
-                header_len = SDL_snprintf(header, sizeof(header),
-                                          "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2%s;",
-                                          kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id, x, y, rw, rh,
-                                          more ? ",m=1" : "");
-                first = false;
-            } else {
-                header_len = SDL_snprintf(header, sizeof(header), "\033_Ga=f,m=%d;", more);
-            }
-            if (header_len <= 0) {
-                return SDL_SetError("frame-edit header snprintf failed");
-            }
-            {
-                struct iovec iov[3];
-                iov[0].iov_base = header;
-                iov[0].iov_len = (size_t)header_len;
-                iov[1].iov_base = b64 + offset;
-                iov[1].iov_len = chunk;
-                iov[2].iov_base = (void *)"\033\\";
-                iov[2].iov_len = 2;
-                if (!KITTY_WritevAll(vdata->tty_fd, iov, 3)) {
+        if (b64_len <= KITTY_ASYNC_MAX_BYTES && b64_len <= chunk_cap) {
+            KITTY_AsyncWriter *aw = KITTY_GetAsyncWriter(vdata);
+            if (aw) {
+                char header[160];
+                const int header_len = SDL_snprintf(header, sizeof(header),
+                                                    "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
+                                                    kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id,
+                                                    x, y, rw, rh);
+                char *dst;
+                size_t wire;
+                if (header_len <= 0) {
+                    return SDL_SetError("frame-edit header snprintf failed");
+                }
+                dst = KITTY_AsyncEnsureStage(aw, (size_t)header_len + b64_len + 3u);
+                if (!dst) {
                     return false;
                 }
+                SDL_memcpy(dst, header, (size_t)header_len);
+                encoded = KITTY_Base64Encode(body, body_len, dst + header_len, b64_len + 1u);
+                if (encoded == 0) {
+                    return SDL_SetError("base64 encode failed");
+                }
+                dst[(size_t)header_len + encoded] = '\033';
+                dst[(size_t)header_len + encoded + 1u] = '\\';
+                wire = (size_t)header_len + encoded + 2u;
+                if (!KITTY_AsyncSubmitStage(aw, vdata->tty_fd, wire)) {
+                    return SDL_SetError("kitty async rect-edit write failed");
+                }
+                vdata->last_wire_bytes += wire;
+                vdata->last_raw_bytes += payload_len;
+                vdata->last_ms_ack = -1.0;
+                vdata->total_wire_bytes += wire;
+                vdata->wire_presents += 1;
+                return true;
             }
-            wire += (size_t)header_len + chunk + 2;
-            offset += chunk;
         }
 
+        KITTY_FlushAsyncWriter(vdata);
+
+        b64 = KITTY_EnsureB64Buf(vdata, b64_len + 1);
+        if (!b64) {
+            return false;
+        }
+        encoded = KITTY_Base64Encode(body, body_len, b64, b64_len + 1);
+        if (encoded == 0) {
+            return SDL_SetError("base64 encode failed");
+        }
+
+        /* Edit root frame in place — do not home cursor or re-place. */
         {
-            const Uint64 t1 = SDL_GetTicksNS();
-            const double ms = (double)(t1 - t0) / 1000000.0;
-            /* Accumulate: framebuffer zeros last_* at present start (multi a=f). */
-            vdata->last_wire_bytes += wire;
-            vdata->last_raw_bytes += payload_len;
-            vdata->last_ms_tx += ms;
-            vdata->last_ms_ack = -1.0;
-            vdata->total_wire_bytes += wire;
-            vdata->total_ms_tx += ms;
-            vdata->wire_presents += 1;
+            size_t wire = 0;
+            const Uint64 t0 = SDL_GetTicksNS();
+
+            while (offset < encoded) {
+                size_t chunk = encoded - offset;
+                char header[256];
+                int header_len;
+                int more;
+                if (chunk > chunk_cap) {
+                    chunk = chunk_cap;
+                }
+                more = (offset + chunk < encoded) ? 1 : 0;
+                if (first) {
+                    /* r=1 edits root; X=1 overwrite; q=2 quiet (no APC OK). */
+                    header_len = SDL_snprintf(header, sizeof(header),
+                                              "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2%s;",
+                                              kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id, x, y, rw, rh,
+                                              more ? ",m=1" : "");
+                    first = false;
+                } else {
+                    header_len = SDL_snprintf(header, sizeof(header), "\033_Ga=f,m=%d;", more);
+                }
+                if (header_len <= 0) {
+                    return SDL_SetError("frame-edit header snprintf failed");
+                }
+                {
+                    struct iovec iov[3];
+                    iov[0].iov_base = header;
+                    iov[0].iov_len = (size_t)header_len;
+                    iov[1].iov_base = b64 + offset;
+                    iov[1].iov_len = chunk;
+                    iov[2].iov_base = (void *)"\033\\";
+                    iov[2].iov_len = 2;
+                    if (!KITTY_WritevAll(vdata->tty_fd, iov, 3)) {
+                        return false;
+                    }
+                }
+                wire += (size_t)header_len + chunk + 2;
+                offset += chunk;
+            }
+
+            {
+                const Uint64 t1 = SDL_GetTicksNS();
+                const double ms = (double)(t1 - t0) / 1000000.0;
+                /* Accumulate: framebuffer zeros last_* at present start (multi a=f). */
+                vdata->last_wire_bytes += wire;
+                vdata->last_raw_bytes += payload_len;
+                vdata->last_ms_tx += ms;
+                vdata->last_ms_ack = -1.0;
+                vdata->total_wire_bytes += wire;
+                vdata->total_ms_tx += ms;
+                vdata->wire_presents += 1;
+            }
         }
     }
 

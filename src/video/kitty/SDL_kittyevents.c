@@ -1069,6 +1069,7 @@ static void KITTY_HandleWinch(SDL_VideoDevice *_this)
 #endif
         if (data->vp_cols_req > 0 && data->vp_rows_req > 0) {
             if (wdata->live_image_id != 0) {
+                KITTY_FlushAsyncWriter(data);
                 (void)KITTY_DeleteImage(data->tty_out, wdata->live_image_id);
                 wdata->live_image_id = 0;
             }

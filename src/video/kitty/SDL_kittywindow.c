@@ -137,6 +137,7 @@ void KITTY_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
             vdata->focus_window = NULL;
         }
         if (!vdata->leave_images) {
+            KITTY_FlushAsyncWriter(vdata);
             KITTY_DeleteAllImages(vdata->tty_fd);
         }
     }
