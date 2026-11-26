@@ -239,22 +239,24 @@ static bool KITTY_PollReadable(int fd, int timeout_ms)
 }
 
 #ifdef __APPLE__
-#define KITTY_PZ_SLICES 4
-#define KITTY_PZ_MIN_BYTES ((size_t)256 * 1024)
+#define KITTY_PZ_MAX_SLICES 8
+#define KITTY_PZ_MIN_BYTES ((size_t)128 * 1024)
 
 typedef struct KITTY_ParallelZlibCtx
 {
-    z_stream streams[KITTY_PZ_SLICES];
-    bool stream_init[KITTY_PZ_SLICES];
-    Uint8 *out_buf[KITTY_PZ_SLICES];
-    size_t out_cap[KITTY_PZ_SLICES];
+    z_stream streams[KITTY_PZ_MAX_SLICES];
+    bool stream_init[KITTY_PZ_MAX_SLICES];
+    Uint8 *out_buf[KITTY_PZ_MAX_SLICES];
+    size_t out_cap[KITTY_PZ_MAX_SLICES];
+    int max_slices;
     /* Per-call dispatch parameters */
     const Uint8 *src;
-    size_t slice_off[KITTY_PZ_SLICES];
-    size_t slice_in_len[KITTY_PZ_SLICES];
-    size_t slice_out_len[KITTY_PZ_SLICES];
-    uLong slice_adler[KITTY_PZ_SLICES];
-    bool slice_ok[KITTY_PZ_SLICES];
+    int active_slices;
+    size_t slice_off[KITTY_PZ_MAX_SLICES];
+    size_t slice_in_len[KITTY_PZ_MAX_SLICES];
+    size_t slice_out_len[KITTY_PZ_MAX_SLICES];
+    uLong slice_adler[KITTY_PZ_MAX_SLICES];
+    bool slice_ok[KITTY_PZ_MAX_SLICES];
 } KITTY_ParallelZlibCtx;
 
 static void KITTY_FreeParallelZlib(SDL_VideoData *vdata)
@@ -265,7 +267,7 @@ static void KITTY_FreeParallelZlib(SDL_VideoData *vdata)
         return;
     }
     ctx = (KITTY_ParallelZlibCtx *)vdata->tx_pz_ctx;
-    for (i = 0; i < KITTY_PZ_SLICES; ++i) {
+    for (i = 0; i < KITTY_PZ_MAX_SLICES; ++i) {
         if (ctx->stream_init[i]) {
             deflateEnd(&ctx->streams[i]);
             ctx->stream_init[i] = false;
@@ -284,7 +286,7 @@ static void KITTY_ParallelZlibWorker(void *arg, size_t idx)
     z_stream *zs = &ctx->streams[idx];
     const Uint8 *in = ctx->src + ctx->slice_off[idx];
     const size_t in_len = ctx->slice_in_len[idx];
-    const int flush = (idx + 1u == KITTY_PZ_SLICES) ? Z_FINISH : Z_SYNC_FLUSH;
+    const int flush = ((int)idx + 1 == ctx->active_slices) ? Z_FINISH : Z_SYNC_FLUSH;
     int zerr;
 
     ctx->slice_ok[idx] = false;
@@ -380,7 +382,7 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
     }
 
 #ifdef __APPLE__
-    /* Multi-core RFC 1950 zlib for large full-frame payloads: 4 independent raw
+    /* Multi-core RFC 1950 zlib for large full-frame payloads: up to 8 raw
      * deflate slices concatenated via Z_SYNC_FLUSH + Z_FINISH + adler32_combine. */
     if (src_len >= KITTY_PZ_MIN_BYTES) {
         KITTY_ParallelZlibCtx *ctx = (KITTY_ParallelZlibCtx *)vdata->tx_pz_ctx;
@@ -388,8 +390,12 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
         if (!ctx) {
             ctx = (KITTY_ParallelZlibCtx *)SDL_calloc(1, sizeof(KITTY_ParallelZlibCtx));
             if (ctx) {
+                long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+                int max_s = (ncpu >= KITTY_PZ_MAX_SLICES) ? KITTY_PZ_MAX_SLICES
+                                                          : (ncpu >= 2 ? (int)ncpu : 2);
                 bool init_ok = true;
-                for (i = 0; i < KITTY_PZ_SLICES; ++i) {
+                ctx->max_slices = max_s;
+                for (i = 0; i < max_s; ++i) {
                     if (deflateInit2(&ctx->streams[i], Z_BEST_SPEED, Z_DEFLATED, -15, 8,
                                      Z_DEFAULT_STRATEGY) != Z_OK) {
                         init_ok = false;
@@ -407,12 +413,17 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
             }
         }
         if (ctx) {
-            const size_t base = src_len / KITTY_PZ_SLICES;
+            int n_slices = (src_len >= 512u * 1024u) ? ctx->max_slices : 4;
+            if (n_slices > ctx->max_slices) {
+                n_slices = ctx->max_slices;
+            }
+            const size_t base = src_len / (size_t)n_slices;
             size_t off = 0;
             bool cap_ok = true;
             ctx->src = src;
-            for (i = 0; i < KITTY_PZ_SLICES; ++i) {
-                const size_t slen = (i + 1 == KITTY_PZ_SLICES) ? (src_len - off) : base;
+            ctx->active_slices = n_slices;
+            for (i = 0; i < n_slices; ++i) {
+                const size_t slen = (i + 1 == n_slices) ? (src_len - off) : base;
                 const size_t sbound = (size_t)deflateBound(&ctx->streams[i], (uLong)slen) + 16u;
                 ctx->slice_off[i] = off;
                 ctx->slice_in_len[i] = slen;
@@ -430,10 +441,10 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
             if (cap_ok) {
                 bool all_ok = true;
                 size_t total = 2u + 4u; /* 2B zlib header + 4B adler32 trailer */
-                dispatch_apply_f(KITTY_PZ_SLICES,
+                dispatch_apply_f((size_t)n_slices,
                                  dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
                                  ctx, KITTY_ParallelZlibWorker);
-                for (i = 0; i < KITTY_PZ_SLICES; ++i) {
+                for (i = 0; i < n_slices; ++i) {
                     if (!ctx->slice_ok[i]) {
                         all_ok = false;
                         break;
@@ -447,7 +458,7 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
                         size_t pos = 2u;
                         dst[0] = 0x78u; /* CM=8 deflate, CINFO=7 (32K window) */
                         dst[1] = 0x01u; /* FLEVEL=0, FCHECK=1 (0x7801 % 31 == 0) */
-                        for (i = 0; i < KITTY_PZ_SLICES; ++i) {
+                        for (i = 0; i < n_slices; ++i) {
                             SDL_memcpy(dst + pos, ctx->out_buf[i], ctx->slice_out_len[i]);
                             pos += ctx->slice_out_len[i];
                             if (i > 0) {
