@@ -82,6 +82,10 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
     window->windowed.y = window->floating.y = window->y;
 
     data->sdl_window = window;
+    /* So the app can size its updates for how edits go: compressed edits pay off for
+     * much larger rectangles than raw ones. */
+    SDL_SetBooleanProperty(SDL_GetWindowProperties(window), KITTY_PROP_WINDOW_AF_ZLIB,
+                           KITTY_EditsCompressed(vdata));
     data->image_ids[0] = 1;
     data->image_ids[1] = 2;
     data->image_index = 0;
