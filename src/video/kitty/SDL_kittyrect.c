@@ -35,6 +35,11 @@
 
 #include "SDL_kittyrect.h"
 
+#if defined(__ARM_NEON) && (SDL_BYTEORDER == SDL_LIL_ENDIAN)
+#include <arm_neon.h>
+#define KITTY_HAVE_NEON_LE 1
+#endif
+
 /*
  * Clamp rects to the FB and compute their axis-aligned union into *out.
  * Empty/null rect list → full FB. Returns false if nothing remains in-bounds.
@@ -604,9 +609,22 @@ bool KITTY_ConvertSurfaceRectToRGB(SDL_Surface *surface, const SDL_Rect *rect, U
     }
 
     for (y = area.y; y < area.y + area.h; ++y) {
-        const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + (size_t)y * (size_t)surface->pitch);
+        const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + (size_t)y * (size_t)surface->pitch) + area.x;
         Uint8 *dst = rgb_scratch + ((size_t)y * (size_t)surface->w + (size_t)area.x) * 3u;
-        for (x = area.x; x < area.x + area.w; ++x) {
+        const int count = area.w;
+        x = 0;
+#ifdef KITTY_HAVE_NEON_LE
+        for (; x + 16 <= count; x += 16) {
+            const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
+            uint8x16x3_t rgb;
+            rgb.val[0] = bgra.val[2]; /* R */
+            rgb.val[1] = bgra.val[1]; /* G */
+            rgb.val[2] = bgra.val[0]; /* B */
+            vst3q_u8(dst, rgb);
+            dst += 48;
+        }
+#endif
+        for (; x < count; ++x) {
             const Uint32 p = src[x];
             *dst++ = (Uint8)((p >> 16) & 0xFF);
             *dst++ = (Uint8)((p >> 8) & 0xFF);
@@ -643,9 +661,23 @@ bool KITTY_ConvertSurfaceRectToRGBA(SDL_Surface *surface, const SDL_Rect *rect, 
 
     /* ARGB8888 packed: A in top byte, then R,G,B. Kitty f=32 wants R,G,B,A bytes. */
     for (y = area.y; y < area.y + area.h; ++y) {
-        const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + (size_t)y * (size_t)surface->pitch);
+        const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + (size_t)y * (size_t)surface->pitch) + area.x;
         Uint8 *dst = rgba_scratch + ((size_t)y * (size_t)surface->w + (size_t)area.x) * 4u;
-        for (x = area.x; x < area.x + area.w; ++x) {
+        const int count = area.w;
+        x = 0;
+#ifdef KITTY_HAVE_NEON_LE
+        for (; x + 16 <= count; x += 16) {
+            const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
+            uint8x16x4_t rgba;
+            rgba.val[0] = bgra.val[2]; /* R */
+            rgba.val[1] = bgra.val[1]; /* G */
+            rgba.val[2] = bgra.val[0]; /* B */
+            rgba.val[3] = bgra.val[3]; /* A */
+            vst4q_u8(dst, rgba);
+            dst += 64;
+        }
+#endif
+        for (; x < count; ++x) {
             const Uint32 p = src[x];
             *dst++ = (Uint8)((p >> 16) & 0xFF); /* R */
             *dst++ = (Uint8)((p >> 8) & 0xFF);  /* G */
