@@ -112,6 +112,11 @@ void KITTY_FreeTransmitBuffers(SDL_VideoData *vdata);
 /* Wait for any in-flight pipelined async PTY write to finish (ordering barrier). */
 void KITTY_FlushAsyncWriter(SDL_VideoData *vdata);
 
+/* Coalesce multi-rect a=f APCs into the async writer stage buffer for one submit/frame. */
+void KITTY_BeginAsyncBatch(SDL_VideoData *vdata);
+bool KITTY_CommitAsyncBatch(SDL_VideoData *vdata);
+void KITTY_CancelAsyncBatch(SDL_VideoData *vdata);
+
 /*
  * Full-frame transmit+place (a=T): SHM, zlib direct, or raw base64 per
  * vdata->transmit_mode / SDL_KITTY_TRANSMIT. kitty_f: 24 (RGB) or 32 (RGBA).

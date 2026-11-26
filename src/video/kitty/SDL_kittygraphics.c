@@ -338,6 +338,8 @@ typedef struct KITTY_AsyncWriter
     size_t len;
     char *stage_buf;
     size_t stage_cap;
+    size_t stage_len;
+    bool batching;
     bool busy;
     bool writer_sleeping;
     bool main_waiting;
@@ -464,11 +466,53 @@ static bool KITTY_AsyncSubmitStage(KITTY_AsyncWriter *w, int fd, size_t len)
     w->fd = fd;
     w->len = len;
     w->busy = true;
+    w->stage_len = 0;
     if (w->writer_sleeping) {
         pthread_cond_signal(&w->cv_work);
     }
     pthread_mutex_unlock(&w->mu);
     return !prev_err;
+}
+
+void KITTY_BeginAsyncBatch(SDL_VideoData *vdata)
+{
+    KITTY_AsyncWriter *w = KITTY_GetAsyncWriter(vdata);
+    if (!w) {
+        return;
+    }
+    w->stage_len = 0;
+    w->batching = true;
+}
+
+void KITTY_CancelAsyncBatch(SDL_VideoData *vdata)
+{
+    KITTY_AsyncWriter *w;
+    if (!vdata || !vdata->tx_async) {
+        return;
+    }
+    w = (KITTY_AsyncWriter *)vdata->tx_async;
+    w->stage_len = 0;
+    w->batching = false;
+}
+
+bool KITTY_CommitAsyncBatch(SDL_VideoData *vdata)
+{
+    KITTY_AsyncWriter *w;
+    size_t len;
+    if (!vdata || !vdata->tx_async) {
+        return true;
+    }
+    w = (KITTY_AsyncWriter *)vdata->tx_async;
+    len = w->stage_len;
+    w->batching = false;
+    w->stage_len = 0;
+    if (len == 0) {
+        return true;
+    }
+    if (!KITTY_AsyncSubmitStage(w, vdata->tty_fd, len)) {
+        return SDL_SetError("kitty async batch write failed");
+    }
+    return true;
 }
 
 void KITTY_FlushAsyncWriter(SDL_VideoData *vdata)
@@ -2222,25 +2266,38 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                                                     "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
                                                     kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id,
                                                     x, y, rw, rh);
+                size_t add;
                 char *dst;
                 size_t wire;
                 if (header_len <= 0) {
                     return SDL_SetError("frame-edit header snprintf failed");
                 }
-                dst = KITTY_AsyncEnsureStage(aw, (size_t)header_len + b64_len + 3u);
-                if (!dst) {
-                    return false;
+                add = (size_t)header_len + b64_len + 2u;
+                if (aw->batching && aw->stage_len + add > KITTY_ASYNC_MAX_BYTES && aw->stage_len > 0) {
+                    if (!KITTY_AsyncSubmitStage(aw, vdata->tty_fd, aw->stage_len)) {
+                        return SDL_SetError("kitty async rect-edit flush failed");
+                    }
                 }
-                SDL_memcpy(dst, header, (size_t)header_len);
-                encoded = KITTY_Base64Encode(body, body_len, dst + header_len, b64_len + 1u);
-                if (encoded == 0) {
-                    return SDL_SetError("base64 encode failed");
-                }
-                dst[(size_t)header_len + encoded] = '\033';
-                dst[(size_t)header_len + encoded + 1u] = '\\';
-                wire = (size_t)header_len + encoded + 2u;
-                if (!KITTY_AsyncSubmitStage(aw, vdata->tty_fd, wire)) {
-                    return SDL_SetError("kitty async rect-edit write failed");
+                {
+                    const size_t base = aw->batching ? aw->stage_len : 0u;
+                    dst = KITTY_AsyncEnsureStage(aw, base + add + 1u);
+                    if (!dst) {
+                        return false;
+                    }
+                    dst += base;
+                    SDL_memcpy(dst, header, (size_t)header_len);
+                    encoded = KITTY_Base64Encode(body, body_len, dst + header_len, b64_len + 1u);
+                    if (encoded == 0) {
+                        return SDL_SetError("base64 encode failed");
+                    }
+                    dst[(size_t)header_len + encoded] = '\033';
+                    dst[(size_t)header_len + encoded + 1u] = '\\';
+                    wire = (size_t)header_len + encoded + 2u;
+                    if (aw->batching) {
+                        aw->stage_len = base + wire;
+                    } else if (!KITTY_AsyncSubmitStage(aw, vdata->tty_fd, wire)) {
+                        return SDL_SetError("kitty async rect-edit write failed");
+                    }
                 }
                 vdata->last_wire_bytes += wire;
                 vdata->last_raw_bytes += payload_len;

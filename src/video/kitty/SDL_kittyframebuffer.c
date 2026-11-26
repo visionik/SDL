@@ -508,6 +508,10 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     }
                 }
 
+                if (multi_ok) {
+                    KITTY_BeginAsyncBatch(vdata);
+                }
+
                 for (ri = 0; multi_ok && ri < af_n; ++ri) {
                     SDL_Rect clipped;
                     size_t rpx;
@@ -546,11 +550,17 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 }
 
                 if (multi_ok && multi_upload > 0 && multi_upload <= max_af_px) {
-                    ok = true;
-                    wire_mode = KITTY_WIRE_DIRTY_BW;
-                    upload_px = multi_upload;
-                    wdata->rgb_valid = true;
-                    KITTY_ClearOverlays(vdata, wdata);
+                    if (KITTY_CommitAsyncBatch(vdata)) {
+                        ok = true;
+                        wire_mode = KITTY_WIRE_DIRTY_BW;
+                        upload_px = multi_upload;
+                        wdata->rgb_valid = true;
+                        KITTY_ClearOverlays(vdata, wdata);
+                    } else {
+                        SDL_ClearError();
+                    }
+                } else {
+                    KITTY_CancelAsyncBatch(vdata);
                 }
             }
 
