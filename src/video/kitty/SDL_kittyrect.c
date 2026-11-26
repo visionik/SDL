@@ -225,6 +225,68 @@ Uint64 KITTY_Fnv1a64(const Uint8 *data, size_t len)
 }
 
 /*
+ * Fast 64-bit 4-lane parallel word hash (32 bytes/iter) for upload_skip.
+ * Breaks the 3-cycle serial multiply dependency of byte-wise FNV-1a.
+ */
+static inline Uint64 KITTY_Rotl64(Uint64 x, unsigned r)
+{
+    return (x << r) | (x >> (64u - r));
+}
+
+Uint64 KITTY_FastHash64(const Uint8 *data, size_t len)
+{
+    static const Uint64 P1 = 11400714785074694791ULL;
+    static const Uint64 P2 = 14029467366897019727ULL;
+    static const Uint64 P3 = 1609587929392839161ULL;
+    static const Uint64 P4 = 9650029242287828579ULL;
+    Uint64 h0 = P1 ^ (Uint64)len;
+    Uint64 h1 = P2;
+    Uint64 h2 = P3;
+    Uint64 h3 = P4;
+    size_t i = 0;
+
+    if (!data) {
+        return h0;
+    }
+
+    while (i + 32u <= len) {
+        Uint64 w0, w1, w2, w3;
+        SDL_memcpy(&w0, data + i, 8);
+        SDL_memcpy(&w1, data + i + 8, 8);
+        SDL_memcpy(&w2, data + i + 16, 8);
+        SDL_memcpy(&w3, data + i + 24, 8);
+        h0 = KITTY_Rotl64(h0 + w0 * P2, 31) * P1;
+        h1 = KITTY_Rotl64(h1 + w1 * P2, 31) * P1;
+        h2 = KITTY_Rotl64(h2 + w2 * P2, 31) * P1;
+        h3 = KITTY_Rotl64(h3 + w3 * P2, 31) * P1;
+        i += 32u;
+    }
+
+    {
+        Uint64 h = KITTY_Rotl64(h0, 1) + KITTY_Rotl64(h1, 7) +
+                   KITTY_Rotl64(h2, 12) + KITTY_Rotl64(h3, 18);
+        while (i + 8u <= len) {
+            Uint64 w;
+            SDL_memcpy(&w, data + i, 8);
+            h ^= KITTY_Rotl64(w * P2, 31) * P1;
+            h = KITTY_Rotl64(h, 27) * P1 + P4;
+            i += 8u;
+        }
+        while (i < len) {
+            h ^= (Uint64)data[i] * P3;
+            h = KITTY_Rotl64(h, 11) * P1;
+            i++;
+        }
+        h ^= h >> 33;
+        h *= P2;
+        h ^= h >> 29;
+        h *= P3;
+        h ^= h >> 32;
+        return h;
+    }
+}
+
+/*
  * True if the place box touches any screen edge (or dims are non-positive).
  * Used by Exp 3 to skip edge-touching union overlays.
  */

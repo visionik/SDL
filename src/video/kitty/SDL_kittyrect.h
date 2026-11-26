@@ -92,6 +92,9 @@ bool KITTY_FbPixelToCellCursor(int x, int y, int cell_w, int cell_h,
  */
 Uint64 KITTY_Fnv1a64(const Uint8 *data, size_t len);
 
+/* Fast 64-bit 4-lane word hash for upload_skip frame fingerprinting. */
+Uint64 KITTY_FastHash64(const Uint8 *data, size_t len);
+
 /*
  * Merge overlapping / near rects (expanded by gap_px). Writes up to max_out
  * coalesced rects into out; if more remain, collapses to a single union.

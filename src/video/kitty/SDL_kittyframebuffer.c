@@ -323,7 +323,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         if (upload_skip_enabled && !diff_proved_changed && wdata->rgb_scratch) {
             const size_t bytes =
                 (size_t)surface->w * (size_t)surface->h * (size_t)bpp;
-            pre_hash = KITTY_Fnv1a64(wdata->rgb_scratch, bytes);
+            pre_hash = KITTY_FastHash64(wdata->rgb_scratch, bytes);
             have_pre_hash = true;
             if (wdata->placed && wdata->last_upload_hash_valid &&
                 pre_hash == wdata->last_upload_hash) {
