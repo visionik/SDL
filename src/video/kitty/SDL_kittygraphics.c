@@ -240,7 +240,7 @@ static bool KITTY_PollReadable(int fd, int timeout_ms)
 }
 
 #ifdef __APPLE__
-#define KITTY_PZ_MAX_SLICES 12
+#define KITTY_PZ_MAX_SLICES 16
 #define KITTY_PZ_MIN_BYTES ((size_t)128 * 1024)
 
 /* 128-byte aligned per-worker slice eliminates false sharing on Apple Silicon
@@ -339,6 +339,8 @@ typedef struct KITTY_AsyncWriter
     char *stage_buf;
     size_t stage_cap;
     bool busy;
+    bool writer_sleeping;
+    bool main_waiting;
     bool stop;
     bool write_err;
     bool started;
@@ -350,7 +352,9 @@ static void *KITTY_AsyncWriterMain(void *arg)
     pthread_mutex_lock(&w->mu);
     for (;;) {
         while (!w->busy && !w->stop) {
+            w->writer_sleeping = true;
             pthread_cond_wait(&w->cv_work, &w->mu);
+            w->writer_sleeping = false;
         }
         if (!w->busy && w->stop) {
             break;
@@ -368,7 +372,9 @@ static void *KITTY_AsyncWriterMain(void *arg)
             }
             w->busy = false;
             w->len = 0;
-            pthread_cond_signal(&w->cv_idle);
+            if (w->main_waiting) {
+                pthread_cond_signal(&w->cv_idle);
+            }
         }
     }
     pthread_mutex_unlock(&w->mu);
@@ -443,7 +449,9 @@ static bool KITTY_AsyncSubmitStage(KITTY_AsyncWriter *w, int fd, size_t len)
 
     pthread_mutex_lock(&w->mu);
     while (w->busy) {
+        w->main_waiting = true;
         pthread_cond_wait(&w->cv_idle, &w->mu);
+        w->main_waiting = false;
     }
     prev_err = w->write_err;
     w->write_err = false;
@@ -456,7 +464,9 @@ static bool KITTY_AsyncSubmitStage(KITTY_AsyncWriter *w, int fd, size_t len)
     w->fd = fd;
     w->len = len;
     w->busy = true;
-    pthread_cond_signal(&w->cv_work);
+    if (w->writer_sleeping) {
+        pthread_cond_signal(&w->cv_work);
+    }
     pthread_mutex_unlock(&w->mu);
     return !prev_err;
 }
@@ -470,7 +480,9 @@ void KITTY_FlushAsyncWriter(SDL_VideoData *vdata)
     w = (KITTY_AsyncWriter *)vdata->tx_async;
     pthread_mutex_lock(&w->mu);
     while (w->busy) {
+        w->main_waiting = true;
         pthread_cond_wait(&w->cv_idle, &w->mu);
+        w->main_waiting = false;
     }
     pthread_mutex_unlock(&w->mu);
 }
@@ -602,8 +614,9 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
             }
         }
         if (ctx) {
-            int n_slices = (src_len >= 1536u * 1024u) ? ctx->max_slices
-                                                      : (src_len >= 512u * 1024u ? 8 : 4);
+            int n_slices = (src_len >= 3072u * 1024u)
+                               ? ctx->max_slices
+                               : (src_len >= 1536u * 1024u ? 12 : (src_len >= 512u * 1024u ? 8 : 4));
             if (n_slices > ctx->max_slices) {
                 n_slices = ctx->max_slices;
             }
@@ -2499,6 +2512,7 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
                 if (ack_env && (ack_env[0] == '1' || SDL_strcasecmp(ack_env, "true") == 0 ||
                                 SDL_strcasecmp(ack_env, "yes") == 0 ||
                                 SDL_strcasecmp(ack_env, "on") == 0)) {
+                    KITTY_FlushAsyncWriter(vdata);
                     const Uint64 a0 = SDL_GetTicksNS();
                     const KITTY_GraphicsQueryStatus st =
                         KITTY_AwaitGraphicsAck(vdata->tty_in, image_id, 100);
