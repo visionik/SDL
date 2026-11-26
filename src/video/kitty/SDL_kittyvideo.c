@@ -394,6 +394,13 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
         } else {
             data->cfg_af_zlib = prof && prof->af_zlib;
         }
+        env = SDL_getenv("SDL_KITTY_ZLIB_LEVEL");
+        if (env && env[0]) {
+            const long lv = SDL_strtol(env, NULL, 10);
+            if (lv >= 1 && lv <= 9) {
+                data->cfg_zlib_level = (int)lv;
+            }
+        }
         env = SDL_getenv("SDL_KITTY_TRANSMIT");
         if (env && env[0]) {
             if (SDL_strcasecmp(env, "direct") == 0) {

@@ -174,6 +174,7 @@ typedef struct SDL_VideoData
     bool cfg_dirty_at;
     bool cfg_pingpong;
     bool cfg_af_zlib;
+    int cfg_zlib_level; /* 0 = auto (3 parallel full-frame, 1 serial/a=f); 1..9 override */
     bool cfg_perf_ack;
     size_t cfg_max_direct_bytes;
     size_t cfg_apc_chunk_bytes;

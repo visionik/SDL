@@ -362,6 +362,7 @@ typedef struct KITTY_MultiRectCtx
     int kitty_f;
     Uint32 image_id;
     size_t chunk_cap;
+    int zlevel;
     bool want_zlib;
 } KITTY_MultiRectCtx;
 
@@ -427,7 +428,7 @@ static void KITTY_MultiRectWorker(void *arg, size_t idx)
     if (use_z) {
         uLongf bound;
         if (!s->zs_init) {
-            if (deflateInit2(&s->zs, Z_BEST_SPEED, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+            if (deflateInit2(&s->zs, ctx->zlevel, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
                 return;
             }
             s->zs_init = true;
@@ -813,11 +814,15 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
                 int max_s = (ncpu >= KITTY_PZ_MAX_SLICES) ? KITTY_PZ_MAX_SLICES
                                                           : (ncpu >= 2 ? (int)ncpu : 2);
                 bool init_ok = true;
+                const int pz_level = (vdata->cfg_zlib_level >= 1 && vdata->cfg_zlib_level <= 9)
+                                         ? vdata->cfg_zlib_level
+                                         : 3;
                 ctx->max_slices = max_s;
                 for (i = 0; i < max_s; ++i) {
-                    /* Level 3 stays on Apple's fast deflate path while shrinking
-                     * wire bytes enough to reduce overlapped PTY drain time. */
-                    if (deflateInit2(&ctx->slices[i].stream, 3, Z_DEFLATED, -15, 8,
+                    /* Default level 3 stays on Apple's fast deflate path while shrinking
+                     * wire bytes enough to reduce overlapped PTY drain time; override
+                     * with SDL_KITTY_ZLIB_LEVEL=1..9 (e.g. 4 for ~2x smaller wire over SSH). */
+                    if (deflateInit2(&ctx->slices[i].stream, pz_level, Z_DEFLATED, -15, 8,
                                      Z_DEFAULT_STRATEGY) != Z_OK) {
                         init_ok = false;
                         break;
@@ -904,11 +909,14 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
     }
 #endif /* __APPLE__ */
     if (!vdata->tx_zstream) {
+        const int serial_level = (vdata->cfg_zlib_level >= 1 && vdata->cfg_zlib_level <= 9)
+                                     ? vdata->cfg_zlib_level
+                                     : Z_BEST_SPEED;
         zs = (z_stream *)SDL_calloc(1, sizeof(z_stream));
         if (!zs) {
             return false;
         }
-        zerr = deflateInit2(zs, Z_BEST_SPEED, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY);
+        zerr = deflateInit2(zs, serial_level, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY);
         if (zerr != Z_OK) {
             SDL_free(zs);
             return SDL_SetError("zlib deflateInit2 failed (%d)", zerr);
@@ -2617,6 +2625,9 @@ bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     ctx->chunk_cap = vdata->cfg_cached
                          ? vdata->cfg_apc_chunk_bytes
                          : KITTY_ProfileApcChunkBytes(vdata->term_profile);
+    ctx->zlevel = (vdata->cfg_zlib_level >= 1 && vdata->cfg_zlib_level <= 9)
+                      ? vdata->cfg_zlib_level
+                      : Z_BEST_SPEED;
     ctx->want_zlib = true;
 
     dispatch_apply_f((size_t)valid_n,
