@@ -1330,7 +1330,9 @@ bool KITTY_PackRGBRect(const Uint8 *rgb_scratch, int fb_w, int fb_h,
     SDL_Rect fb, area;
     int y;
     size_t need;
-    size_t off = 0;
+    size_t row_bytes, src_stride;
+    const Uint8 *src;
+    Uint8 *dst;
 
     if (!rgb_scratch || !rect || !out || fb_w <= 0 || fb_h <= 0) {
         return false;
@@ -1346,13 +1348,21 @@ bool KITTY_PackRGBRect(const Uint8 *rgb_scratch, int fb_w, int fb_h,
     if (need > out_cap) {
         return false;
     }
-    for (y = area.y; y < area.y + area.h; ++y) {
-        const Uint8 *src = rgb_scratch + ((size_t)y * (size_t)fb_w + (size_t)area.x) * 3u;
-        SDL_memcpy(out + off, src, (size_t)area.w * 3u);
-        off += (size_t)area.w * 3u;
+    if (area.x == 0 && area.w == fb_w) {
+        SDL_memcpy(out, rgb_scratch + (size_t)area.y * (size_t)fb_w * 3u, need);
+    } else {
+        row_bytes = (size_t)area.w * 3u;
+        src_stride = (size_t)fb_w * 3u;
+        src = rgb_scratch + ((size_t)area.y * (size_t)fb_w + (size_t)area.x) * 3u;
+        dst = out;
+        for (y = 0; y < area.h; ++y) {
+            SDL_memcpy(dst, src, row_bytes);
+            src += src_stride;
+            dst += row_bytes;
+        }
     }
     if (out_len) {
-        *out_len = off;
+        *out_len = need;
     }
     return true;
 }
@@ -1365,7 +1375,7 @@ bool KITTY_ConvertSurfaceRectToRGB(SDL_Surface *surface, const SDL_Rect *rect, U
 {
     SDL_Rect area;
     SDL_Rect fb;
-    int x, y;
+    int y;
 
     if (!surface || !rgb_scratch || !rect) {
         return false;
@@ -1382,27 +1392,19 @@ bool KITTY_ConvertSurfaceRectToRGB(SDL_Surface *surface, const SDL_Rect *rect, U
         return false;
     }
 
-    for (y = area.y; y < area.y + area.h; ++y) {
-        const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + (size_t)y * (size_t)surface->pitch) + area.x;
-        Uint8 *dst = rgb_scratch + ((size_t)y * (size_t)surface->w + (size_t)area.x) * 3u;
-        const int count = area.w;
-        x = 0;
-#ifdef KITTY_HAVE_NEON_LE
-        for (; x + 16 <= count; x += 16) {
-            const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
-            uint8x16x3_t rgb;
-            rgb.val[0] = bgra.val[2]; /* R */
-            rgb.val[1] = bgra.val[1]; /* G */
-            rgb.val[2] = bgra.val[0]; /* B */
-            vst3q_u8(dst, rgb);
-            dst += 48;
-        }
-#endif
-        for (; x < count; ++x) {
-            const Uint32 p = src[x];
-            *dst++ = (Uint8)((p >> 16) & 0xFF);
-            *dst++ = (Uint8)((p >> 8) & 0xFF);
-            *dst++ = (Uint8)(p & 0xFF);
+    if (area.x == 0 && area.w == surface->w && (size_t)surface->pitch == (size_t)surface->w * 4u) {
+        const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + (size_t)area.y * (size_t)surface->pitch);
+        Uint8 *dst = rgb_scratch + (size_t)area.y * (size_t)surface->w * 3u;
+        KITTY_ConvertRowRGB(src, dst, area.w * area.h);
+    } else {
+        const Uint8 *src_row = (const Uint8 *)surface->pixels + (size_t)area.y * (size_t)surface->pitch + (size_t)area.x * 4u;
+        Uint8 *dst = rgb_scratch + ((size_t)area.y * (size_t)surface->w + (size_t)area.x) * 3u;
+        const size_t src_stride = (size_t)surface->pitch;
+        const size_t dst_stride = (size_t)surface->w * 3u;
+        for (y = 0; y < area.h; ++y) {
+            KITTY_ConvertRowRGB((const Uint32 *)src_row, dst, area.w);
+            src_row += src_stride;
+            dst += dst_stride;
         }
     }
     return true;
@@ -1416,7 +1418,7 @@ bool KITTY_ConvertSurfaceRectToRGBA(SDL_Surface *surface, const SDL_Rect *rect, 
 {
     SDL_Rect area;
     SDL_Rect fb;
-    int x, y;
+    int y;
 
     if (!surface || !rgba_scratch || !rect) {
         return false;
@@ -1433,30 +1435,19 @@ bool KITTY_ConvertSurfaceRectToRGBA(SDL_Surface *surface, const SDL_Rect *rect, 
         return false;
     }
 
-    /* ARGB8888 packed: A in top byte, then R,G,B. Kitty f=32 wants R,G,B,A bytes. */
-    for (y = area.y; y < area.y + area.h; ++y) {
-        const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + (size_t)y * (size_t)surface->pitch) + area.x;
-        Uint8 *dst = rgba_scratch + ((size_t)y * (size_t)surface->w + (size_t)area.x) * 4u;
-        const int count = area.w;
-        x = 0;
-#ifdef KITTY_HAVE_NEON_LE
-        for (; x + 16 <= count; x += 16) {
-            const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
-            uint8x16x4_t rgba;
-            rgba.val[0] = bgra.val[2]; /* R */
-            rgba.val[1] = bgra.val[1]; /* G */
-            rgba.val[2] = bgra.val[0]; /* B */
-            rgba.val[3] = bgra.val[3]; /* A */
-            vst4q_u8(dst, rgba);
-            dst += 64;
-        }
-#endif
-        for (; x < count; ++x) {
-            const Uint32 p = src[x];
-            *dst++ = (Uint8)((p >> 16) & 0xFF); /* R */
-            *dst++ = (Uint8)((p >> 8) & 0xFF);  /* G */
-            *dst++ = (Uint8)(p & 0xFF);         /* B */
-            *dst++ = (Uint8)((p >> 24) & 0xFF); /* A */
+    if (area.x == 0 && area.w == surface->w && (size_t)surface->pitch == (size_t)surface->w * 4u) {
+        const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + (size_t)area.y * (size_t)surface->pitch);
+        Uint8 *dst = rgba_scratch + (size_t)area.y * (size_t)surface->w * 4u;
+        KITTY_ConvertRowRGBA(src, dst, area.w * area.h);
+    } else {
+        const Uint8 *src_row = (const Uint8 *)surface->pixels + (size_t)area.y * (size_t)surface->pitch + (size_t)area.x * 4u;
+        Uint8 *dst = rgba_scratch + ((size_t)area.y * (size_t)surface->w + (size_t)area.x) * 4u;
+        const size_t src_stride = (size_t)surface->pitch;
+        const size_t dst_stride = (size_t)surface->w * 4u;
+        for (y = 0; y < area.h; ++y) {
+            KITTY_ConvertRowRGBA((const Uint32 *)src_row, dst, area.w);
+            src_row += src_stride;
+            dst += dst_stride;
         }
     }
     return true;
@@ -1472,7 +1463,9 @@ bool KITTY_PackRGBARect(const Uint8 *rgba_scratch, int fb_w, int fb_h,
     SDL_Rect fb, area;
     int y;
     size_t need;
-    size_t off = 0;
+    size_t row_bytes, src_stride;
+    const Uint8 *src;
+    Uint8 *dst;
 
     if (!rgba_scratch || !rect || !out || fb_w <= 0 || fb_h <= 0) {
         return false;
@@ -1488,13 +1481,21 @@ bool KITTY_PackRGBARect(const Uint8 *rgba_scratch, int fb_w, int fb_h,
     if (need > out_cap) {
         return false;
     }
-    for (y = area.y; y < area.y + area.h; ++y) {
-        const Uint8 *src = rgba_scratch + ((size_t)y * (size_t)fb_w + (size_t)area.x) * 4u;
-        SDL_memcpy(out + off, src, (size_t)area.w * 4u);
-        off += (size_t)area.w * 4u;
+    if (area.x == 0 && area.w == fb_w) {
+        SDL_memcpy(out, rgba_scratch + (size_t)area.y * (size_t)fb_w * 4u, need);
+    } else {
+        row_bytes = (size_t)area.w * 4u;
+        src_stride = (size_t)fb_w * 4u;
+        src = rgba_scratch + ((size_t)area.y * (size_t)fb_w + (size_t)area.x) * 4u;
+        dst = out;
+        for (y = 0; y < area.h; ++y) {
+            SDL_memcpy(dst, src, row_bytes);
+            src += src_stride;
+            dst += row_bytes;
+        }
     }
     if (out_len) {
-        *out_len = off;
+        *out_len = need;
     }
     return true;
 }
