@@ -498,7 +498,7 @@ static void KITTY_MultiRectWorker(void *arg, size_t idx)
  * (convert/diff/zlib/base64) of frame N+1 with kernel PTY write of frame N,
  * while strictly preserving FIFO order and backpressure (max 1 buffer in flight).
  */
-#define KITTY_ASYNC_MAX_BYTES ((size_t)262144u)
+#define KITTY_ASYNC_MAX_BYTES ((size_t)1048576u)
 
 typedef struct KITTY_AsyncWriter
 {
@@ -2872,10 +2872,14 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
             /* Optional host round-trip: wait for Gi=<id>;OK after a=T.
              * Compile with -DSDL_KITTY_PERF_ACK=ON; then SDL_KITTY_PERF_ACK=1 at run. */
             {
-                const char *ack_env = SDL_getenv("SDL_KITTY_PERF_ACK");
-                if (ack_env && (ack_env[0] == '1' || SDL_strcasecmp(ack_env, "true") == 0 ||
-                                SDL_strcasecmp(ack_env, "yes") == 0 ||
-                                SDL_strcasecmp(ack_env, "on") == 0)) {
+                bool want_ack = vdata->cfg_cached ? vdata->cfg_perf_ack : false;
+                if (!vdata->cfg_cached) {
+                    const char *ack_env = SDL_getenv("SDL_KITTY_PERF_ACK");
+                    want_ack = (ack_env && (ack_env[0] == '1' || SDL_strcasecmp(ack_env, "true") == 0 ||
+                                            SDL_strcasecmp(ack_env, "yes") == 0 ||
+                                            SDL_strcasecmp(ack_env, "on") == 0));
+                }
+                if (want_ack) {
                     KITTY_FlushAsyncWriter(vdata);
                     const Uint64 a0 = SDL_GetTicksNS();
                     const KITTY_GraphicsQueryStatus st =
