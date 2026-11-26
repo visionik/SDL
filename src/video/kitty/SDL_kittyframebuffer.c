@@ -215,6 +215,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         bool diff_proved_changed = false;
         bool upload_skip_enabled = false;
         bool have_pre_hash = false;
+        bool single_prepacked = false;
         Uint64 pre_hash = 0;
         SDL_Rect diff_rects[16];
         int diff_n = 0;
@@ -319,7 +320,47 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         }
 
         if (convert_mode == KITTY_CONVERT_DIRTY) {
-            if (rects && numrects > 0) {
+            if (rects && numrects == 1) {
+                /* Single explicit dirty rect: convert, diff-check, and pack into
+                 * pack_scratch on Core 0 in one L1-hot pass (zero scratch read-back). */
+                const size_t rpx = (size_t)dirty.w * (size_t)dirty.h;
+                const size_t pack_cap = rpx * (size_t)bpp;
+                const size_t max_af_px = vdata->cfg_cached
+                                             ? vdata->cfg_af_max_pixels
+                                             : ((vdata->term_profile && vdata->term_profile->af_max_pixels > 0)
+                                                    ? vdata->term_profile->af_max_pixels
+                                                    : ((size_t)160 * 1024));
+                bool rchg = false;
+                bool conv_ok = false;
+                if (rpx > 0 && rpx <= max_af_px) {
+                    Uint8 *pbuf = KITTY_EnsurePackScratch(wdata, pack_cap);
+                    if (pbuf) {
+                        size_t plen = 0;
+                        conv_ok = KITTY_ConvertSurfaceRectCheckAndPack(
+                            surface, &dirty, wdata->rgb_scratch, pbuf, pack_cap,
+                            use_rgba, &rchg, &plen);
+                        if (conv_ok && rchg) {
+                            single_prepacked = true;
+                        }
+                    }
+                }
+                if (!conv_ok) {
+                    conv_ok = KITTY_ConvertSurfaceRectCheckChanged(
+                        surface, &dirty, wdata->rgb_scratch, use_rgba, &rchg);
+                }
+                if (!conv_ok) {
+                    convert_mode = KITTY_CONVERT_FULL;
+                } else if (!rchg && wdata->placed) {
+                    ok = true;
+                    wire_mode = KITTY_WIRE_UPLOAD_SKIP;
+                    convert_px = 0;
+                    upload_px = 0;
+                    vdata->skip_presents += 1;
+                    goto kitty_present_log;
+                } else {
+                    diff_proved_changed = true;
+                }
+            } else if (rects && numrects > 1) {
                 /* Convert ONLY the app-supplied dirty rects (not their bloated
                  * union bounding box) while checking whether any pixel changed.
                  * Leaves rgb_scratch 100% up-to-date and avoids a full-FB hash. */
@@ -589,13 +630,18 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     size_t packed_len = 0;
                     const size_t pack_cap = convert_px * (size_t)bpp;
                     bool pack_ok = false;
-                    packed = KITTY_EnsurePackScratch(wdata, pack_cap);
-                    if (packed) {
-                        pack_ok = use_rgba
-                                      ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h,
-                                                           &dirty, packed, pack_cap, &packed_len)
-                                      : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h,
-                                                          &dirty, packed, pack_cap, &packed_len);
+                    if (single_prepacked && wdata->pack_scratch && wdata->pack_scratch_cap >= pack_cap) {
+                        packed = wdata->pack_scratch;
+                        pack_ok = true;
+                    } else {
+                        packed = KITTY_EnsurePackScratch(wdata, pack_cap);
+                        if (packed) {
+                            pack_ok = use_rgba
+                                          ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h,
+                                                               &dirty, packed, pack_cap, &packed_len)
+                                          : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h,
+                                                              &dirty, packed, pack_cap, &packed_len);
+                        }
                     }
                     if (pack_ok &&
                         KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed,
@@ -671,7 +717,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                         size_t packed_len = 0;
                         const size_t pack_cap = convert_px * (size_t)bpp;
                         bool pack_ok = false;
-                        packed = (Uint8 *)SDL_malloc(pack_cap);
+                        packed = KITTY_EnsurePackScratch(wdata, pack_cap);
                         if (packed) {
                             pack_ok = use_rgba
                                           ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w,
@@ -700,7 +746,6 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                             SDL_ClearError();
                             wdata->overlay_count = 0;
                         }
-                        SDL_free(packed);
                         packed = NULL;
                     }
                 }
@@ -792,7 +837,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                             break;
                         }
 
-                        packed = (Uint8 *)SDL_malloc(rpx * (size_t)bpp);
+                        packed = KITTY_EnsurePackScratch(wdata, rpx * (size_t)bpp);
                         if (!packed) {
                             at_ok = false;
                             break;
@@ -815,7 +860,6 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                             at_upload += rpx;
                             placed_n++;
                         }
-                        SDL_free(packed);
                         packed = NULL;
                     }
 
