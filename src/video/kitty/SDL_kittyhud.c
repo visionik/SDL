@@ -475,7 +475,7 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
                 Uint8 pill_bd[4] = { hud->pal.accent2[0], hud->pal.accent2[1], hud->pal.accent2[2], 165 };
                 Uint8 pill_fg[4] = { 196, 245, 255, 255 };
                 const float badge_px = 8.2f * s;
-                const float max_tw = KITTY_FontMeasureUTF8("A=F · ZLIB", SDL_strlen("A=F · ZLIB"), badge_px, true);
+                const float max_tw = KITTY_FontMeasureUTF8("A=F +Z", 6, badge_px, true);
                 float btw;
                 int pw, ph, px, py;
 

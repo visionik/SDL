@@ -1111,9 +1111,9 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             const char *tag = "DIRECT";
             if (dirty_pct > 100.0f) dirty_pct = 100.0f;
             if (wire_mode == KITTY_WIRE_DIRTY_BW) {
-                tag = vdata->cfg_af_zlib ? "A=F · ZLIB" : "A=F";
+                tag = vdata->cfg_af_zlib ? "A=F +Z" : "A=F";
             } else if (wire_mode == KITTY_WIRE_DIRTY_AT) {
-                tag = "A=T · DIRTY";
+                tag = "A=T";
             } else if (wire_mode == KITTY_WIRE_UPLOAD_SKIP) {
                 tag = "SKIP";
                 dirty_pct = 0.0f;
