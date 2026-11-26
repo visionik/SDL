@@ -400,11 +400,11 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
     }
 
     shadow_pad = (int)(7.0f * s + 0.5f);
-    card_w = (int)(264.0f * s + 0.5f);
+    card_w = (int)(296.0f * s + 0.5f);
     card_h = (int)(98.0f * s + 0.5f);
     if (card_w > fb_w - 16) {
         card_w = fb_w - 16;
-        s = (float)card_w / 264.0f;
+        s = (float)card_w / 296.0f;
         card_h = (int)(98.0f * s + 0.5f);
     }
     if (card_h > fb_h - 16) card_h = fb_h - 16;
@@ -468,15 +468,16 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
             KITTY_FontDrawUTF8(&canvas, nx + 4.0f * s, head_base - 0.5f * s,
                                "FPS", 3, unit_px, hud->pal.muted, false, false);
 
-            /* Fixed-width petite transport badge pill (sized for "A=F +Z", never jumps) */
+            /* Fixed-width petite transport badge pill with "MODE" label (never jumps) */
             {
                 char badge[24];
                 Uint8 pill_bg[4] = { hud->pal.accent2[0], hud->pal.accent2[1], hud->pal.accent2[2], 38 };
                 Uint8 pill_bd[4] = { hud->pal.accent2[0], hud->pal.accent2[1], hud->pal.accent2[2], 170 };
                 Uint8 pill_fg[4] = { 196, 245, 255, 255 };
-                const float badge_px = 10.8f * s;
+                const float badge_px = 10.5f * s;
+                const float mlbl_px = 9.2f * s;
                 const float max_tw = KITTY_FontMeasureUTF8("A=F +Z", 6, badge_px, true);
-                float btw;
+                float btw, mlw;
                 int pw, ph, px, py;
 
                 if (hud->rec_active) {
@@ -495,6 +496,12 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
                 ph = (int)(17.5f * s + 0.5f);
                 px = inner_x + inner_w - pw;
                 py = cy + (int)(9.0f * s + 0.5f);
+                if (!hud->rec_active) {
+                    mlw = KITTY_FontMeasureUTF8("MODE", 4, mlbl_px, false);
+                    KITTY_FontDrawUTF8(&canvas, (float)px - mlw - 5.0f * s,
+                                       (float)py + (float)ph * 0.5f + mlbl_px * 0.34f,
+                                       "MODE", 4, mlbl_px, hud->pal.muted, false, false);
+                }
                 KITTY_CanvasDrawPill(&canvas, px, py, pw, ph, (float)ph * 0.5f, pill_bg, pill_bd);
                 KITTY_FontDrawUTF8(&canvas, (float)px + ((float)pw - btw) * 0.5f,
                                    (float)py + (float)ph * 0.5f + badge_px * 0.34f,
@@ -583,40 +590,44 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
             }
         }
 
-        /* 4) Crisp single-row Telemetry Strip (TX · WIRE · DIRTY bar) */
+        /* 4) Crisp labeled Telemetry Strip: TX <ms>  WIRE <KB>  DIRTY [bar] */
         {
-            const float val_px = 12.0f * s;
+            const float lbl_px = 9.5f * s;
+            const float val_px = 11.8f * s;
             const float row_y = (float)cy + 86.5f * s;
             char tx_buf[20], wire_buf[24];
             float xcur = (float)inner_x;
-            float dirty_t;
-            int bar_x, bar_w;
+            float dirty_t, dlw;
+            int bar_w, bar_x;
 
+            xcur = KITTY_FontDrawUTF8(&canvas, xcur, row_y, "TX", 2, lbl_px,
+                                      hud->pal.muted, false, false);
             SDL_snprintf(tx_buf, sizeof(tx_buf), "%.2fms", hud->ewma_tx_ms);
-            xcur = KITTY_FontDrawUTF8(&canvas, xcur, row_y, tx_buf, SDL_strlen(tx_buf),
+            xcur = KITTY_FontDrawUTF8(&canvas, xcur + 3.5f * s, row_y, tx_buf, SDL_strlen(tx_buf),
                                       val_px, hud->pal.tx_line, true, true);
-            xcur = KITTY_FontDrawUTF8(&canvas, xcur + 5.0f * s, row_y, "·", SDL_strlen("·"),
-                                      val_px, hud->pal.muted, false, false);
 
-            if (hud->bw_mbps >= 0.1) {
-                SDL_snprintf(wire_buf, sizeof(wire_buf), "%.1fK", hud->ewma_wire_kb);
-            } else {
+            xcur = KITTY_FontDrawUTF8(&canvas, xcur + 11.0f * s, row_y, "WIRE", 4, lbl_px,
+                                      hud->pal.muted, false, false);
+            if (hud->ewma_wire_kb >= 100.0) {
                 SDL_snprintf(wire_buf, sizeof(wire_buf), "%.0fK", hud->ewma_wire_kb);
+            } else {
+                SDL_snprintf(wire_buf, sizeof(wire_buf), "%.1fK", hud->ewma_wire_kb);
             }
-            xcur = KITTY_FontDrawUTF8(&canvas, xcur + 5.0f * s, row_y, wire_buf, SDL_strlen(wire_buf),
-                                      val_px, hud->pal.fg, true, true);
+            (void)KITTY_FontDrawUTF8(&canvas, xcur + 3.5f * s, row_y, wire_buf, SDL_strlen(wire_buf),
+                                     val_px, hud->pal.fg, true, true);
 
-            /* Compact dirty-coverage gradient bar on the right */
-            bar_x = (int)(xcur + 10.0f * s);
-            bar_w = (inner_x + inner_w) - bar_x;
-            if (bar_w >= (int)(28.0f * s)) {
-                dirty_t = (float)(hud->ewma_dirty_pct / 100.0);
-                if (dirty_t < 0.0f) dirty_t = 0.0f;
-                if (dirty_t > 1.0f) dirty_t = 1.0f;
-                KITTY_CanvasDrawProgressBar(&canvas, bar_x, cy + (int)(79.0f * s + 0.5f),
-                                            bar_w, (int)(6.5f * s + 0.5f),
-                                            dirty_t, hud->pal.track, hud->pal.accent, hud->pal.accent2);
-            }
+            /* Compact right-aligned DIRTY label + petite ~44px gradient meter */
+            bar_w = (int)(44.0f * s + 0.5f);
+            bar_x = (inner_x + inner_w) - bar_w;
+            dlw = KITTY_FontMeasureUTF8("DIRTY", 5, lbl_px, false);
+            KITTY_FontDrawUTF8(&canvas, (float)bar_x - dlw - 5.0f * s, row_y, "DIRTY", 5,
+                               lbl_px, hud->pal.muted, false, false);
+            dirty_t = (float)(hud->ewma_dirty_pct / 100.0);
+            if (dirty_t < 0.0f) dirty_t = 0.0f;
+            if (dirty_t > 1.0f) dirty_t = 1.0f;
+            KITTY_CanvasDrawProgressBar(&canvas, bar_x, cy + (int)(79.0f * s + 0.5f),
+                                        bar_w, (int)(6.5f * s + 0.5f),
+                                        dirty_t, hud->pal.track, hud->pal.accent, hud->pal.accent2);
         }
     }
 
