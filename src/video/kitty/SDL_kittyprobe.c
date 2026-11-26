@@ -28,8 +28,8 @@
 #include "SDL_kittyprofile.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
-#include <sys/select.h>
 #include <unistd.h>
 #endif
 
@@ -485,12 +485,40 @@ static bool KITTY_WriteAllProbe(int fd, const void *buf, size_t len)
             if (errno == EINTR) {
                 continue;
             }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd;
+                int pr;
+                pfd.fd = fd;
+                pfd.events = POLLOUT;
+                pfd.revents = 0;
+                pr = poll(&pfd, 1, 500);
+                if (pr > 0 && !(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                    continue;
+                }
+                if (pr < 0 && errno == EINTR) {
+                    continue;
+                }
+            }
             return false;
         }
         p += (size_t)n;
         len -= (size_t)n;
     }
     return true;
+}
+
+static bool KITTY_PollReadableProbe(int fd, int timeout_ms)
+{
+    struct pollfd pfd;
+    int pr;
+    if (fd < 0) {
+        return false;
+    }
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    pr = poll(&pfd, 1, timeout_ms);
+    return pr > 0 && (pfd.revents & POLLIN) != 0;
 }
 
 /*
@@ -531,13 +559,7 @@ static KITTY_GraphicsQueryStatus KITTY_AwaitGraphicsQuery(int fd, Uint32 id, int
     int a;
 
     for (a = 0; a < attempts; ++a) {
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(fd, &fds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 25000;
-        if (select(fd + 1, &fds, NULL, NULL, &tv) > 0) {
+        if (KITTY_PollReadableProbe(fd, 25)) {
             const ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - total);
             if (n > 0) {
                 total += (size_t)n;
@@ -615,7 +637,7 @@ static bool KITTY_ProbeShmQuery(SDL_VideoData *data, Uint32 id)
     char header[192];
     int header_len;
 
-    SDL_snprintf(name, sizeof(name), "/sdl-kitty-probe-%d", (int)getpid());
+    SDL_snprintf(name, sizeof(name), "/sk-p-%x", (unsigned)getpid());
     shm_unlink(name);
     shm_fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (shm_fd < 0) {
@@ -667,13 +689,7 @@ static void KITTY_DrainTty(int fd)
 {
     unsigned char junk[256];
     for (;;) {
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(fd, &fds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 0;
-        if (select(fd + 1, &fds, NULL, NULL, &tv) <= 0) {
+        if (!KITTY_PollReadableProbe(fd, 0)) {
             break;
         }
         if (read(fd, junk, sizeof(junk)) <= 0) {
@@ -700,13 +716,7 @@ static bool KITTY_QueryXtversion(SDL_VideoData *data, char *out, size_t cap)
         return false;
     }
     for (a = 0; a < attempts && total < sizeof(buf) - 1; ++a) {
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(data->tty_in, &fds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 25000;
-        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) > 0) {
+        if (KITTY_PollReadableProbe(data->tty_in, 25)) {
             const ssize_t n = read(data->tty_in, buf + total, sizeof(buf) - 1 - total);
             if (n > 0) {
                 total += (size_t)n;

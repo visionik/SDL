@@ -91,7 +91,6 @@ bool KITTY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
     data->image_index = 0;
     data->placed = false;
     data->rgb_scratch = NULL;
-    data->rgb_back = NULL;
     data->rgb_w = 0;
     data->rgb_h = 0;
     data->scratch_bpp = 0;
@@ -138,14 +137,17 @@ void KITTY_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
             vdata->focus_window = NULL;
         }
         if (!vdata->leave_images) {
+            KITTY_FlushAsyncWriter(vdata);
             KITTY_DeleteAllImages(vdata->tty_fd);
         }
     }
     if (data) {
         SDL_free(data->rgb_scratch);
         data->rgb_scratch = NULL;
-        SDL_free(data->rgb_back);
-        data->rgb_back = NULL;
+        SDL_free(data->pack_scratch);
+        data->pack_scratch = NULL;
+        data->pack_scratch_cap = 0;
+        data->fb_surface = NULL;
         SDL_free(data);
     }
     window->internal = NULL;

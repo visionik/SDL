@@ -36,6 +36,7 @@
 #include "SDL_kittygraphics.h"
 #include "SDL_kittyprobe.h"
 #include "SDL_kittyprofile.h"
+#include "SDL_kittyrect.h"
 #include "SDL_kittyvideo.h"
 #include "SDL_kittywindow.h"
 
@@ -54,8 +55,18 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this);
  */
 static void KITTY_VideoQuit(SDL_VideoDevice *_this);
 
-static SDL_VideoData *KITTY_winch_data = NULL;
+static SDL_VideoData * volatile KITTY_winch_data = NULL;
 static void (*KITTY_prev_winch)(int) = SIG_DFL;
+
+static volatile sig_atomic_t KITTY_term_sig_installed = 0;
+static volatile sig_atomic_t KITTY_term_tty_in = -1;
+static volatile sig_atomic_t KITTY_term_tty_out = -1;
+static volatile sig_atomic_t KITTY_term_alt_screen = 1;
+static volatile sig_atomic_t KITTY_term_leave_images = 0;
+static struct sigaction KITTY_prev_sigint;
+static struct sigaction KITTY_prev_sigterm;
+static bool KITTY_have_prev_sigint = false;
+static bool KITTY_have_prev_sigterm = false;
 
 /*
  * SIGWINCH handler: mark the active SDL_VideoData so PumpEvents/VideoInit can
@@ -66,6 +77,66 @@ static void KITTY_HandleSIGWINCH(int sig)
     (void)sig;
     if (KITTY_winch_data) {
         KITTY_winch_data->got_winch = 1;
+    }
+}
+
+/*
+ * Async-signal-safe SIGINT/SIGTERM cleanup so Ctrl+C or kill never leaves
+ * the user's shell stuck in raw mode / alt-screen / SGR mouse tracking.
+ */
+static void KITTY_HandleTermSignal(int sig)
+{
+    struct sigaction dfl;
+    if (KITTY_term_sig_installed) {
+        KITTY_term_sig_installed = 0;
+        KITTY_EmergencyRestore((int)KITTY_term_tty_in, (int)KITTY_term_tty_out,
+                               KITTY_term_alt_screen != 0, KITTY_term_leave_images != 0);
+    }
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    dfl.sa_flags = 0;
+    sigaction(sig, &dfl, NULL);
+    raise(sig);
+}
+
+static void KITTY_InstallTermSignals(const SDL_VideoData *data)
+{
+    struct sigaction sa, old;
+    KITTY_term_tty_in = data->tty_in;
+    KITTY_term_tty_out = data->tty_out;
+    KITTY_term_alt_screen = data->use_alt_screen ? 1 : 0;
+    KITTY_term_leave_images = data->leave_images ? 1 : 0;
+    KITTY_term_sig_installed = 1;
+
+    SDL_zero(sa);
+    sa.sa_handler = KITTY_HandleTermSignal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    KITTY_have_prev_sigint = false;
+    if (sigaction(SIGINT, NULL, &old) == 0 && old.sa_handler != SIG_IGN) {
+        if (sigaction(SIGINT, &sa, &KITTY_prev_sigint) == 0) {
+            KITTY_have_prev_sigint = true;
+        }
+    }
+    KITTY_have_prev_sigterm = false;
+    if (sigaction(SIGTERM, NULL, &old) == 0 && old.sa_handler != SIG_IGN) {
+        if (sigaction(SIGTERM, &sa, &KITTY_prev_sigterm) == 0) {
+            KITTY_have_prev_sigterm = true;
+        }
+    }
+}
+
+static void KITTY_UninstallTermSignals(void)
+{
+    KITTY_term_sig_installed = 0;
+    if (KITTY_have_prev_sigint) {
+        sigaction(SIGINT, &KITTY_prev_sigint, NULL);
+        KITTY_have_prev_sigint = false;
+    }
+    if (KITTY_have_prev_sigterm) {
+        sigaction(SIGTERM, &KITTY_prev_sigterm, NULL);
+        KITTY_have_prev_sigterm = false;
     }
 }
 
@@ -204,6 +275,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
     }
     data->terminal_owned = true;
     data->keyboard_enabled = true;
+    KITTY_InstallTermSignals(data);
 
     /* Install WINCH before sizing waits so Rex pane layout is observed. */
     KITTY_winch_data = data;
@@ -218,6 +290,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
 
     /* Size before mouse: any-event mode floods the tty and can starve CSI 14t. */
     if (!KITTY_QueryTerminalSize(data)) {
+        KITTY_UninstallTermSignals();
         KITTY_RestoreTerminal(data);
         data->terminal_owned = false;
         return false;
@@ -280,6 +353,75 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
      * is known (shm vs direct soft-maxes differ on Kitty/Ghostty). */
     KITTY_ApplyFramebufferCap(data);
 
+    /* Resolve hot-path env + profile policy once at init so UpdateWindowFramebuffer
+     * and TransmitRGB never call SDL_getenv()/strcasecmp()/atof() per frame. */
+    {
+        const KITTY_TerminalProfile *prof = data->term_profile;
+        const char *env;
+
+        env = SDL_getenv("SDL_KITTY_DIRTY");
+        data->cfg_dirty_enabled = !(env && (env[0] == '0' || SDL_strcasecmp(env, "off") == 0 ||
+                                            SDL_strcasecmp(env, "false") == 0 ||
+                                            SDL_strcasecmp(env, "no") == 0));
+        data->cfg_fb_diff = KITTY_SelectFbDiff(SDL_getenv("SDL_KITTY_FB_DIFF"),
+                                               prof ? prof->fb_diff : true);
+        data->cfg_fb_diff_tile = KITTY_SelectFbDiffTile(SDL_getenv("SDL_KITTY_FB_DIFF_TILE"),
+                                                        prof ? prof->fb_diff_tile : 32);
+        data->cfg_fb_diff_cover = KITTY_SelectFbDiffCover(SDL_getenv("SDL_KITTY_FB_DIFF_COVER"),
+                                                          prof ? prof->fb_diff_cover : 0.45f);
+        data->cfg_upload_skip = KITTY_SelectUploadSkip(SDL_getenv("SDL_KITTY_UPLOAD_SKIP"),
+                                                       prof ? prof->upload_skip : true);
+        data->cfg_af_max_coverage = (prof && prof->af_max_coverage > 0.0f) ? prof->af_max_coverage : 0.40f;
+        env = SDL_getenv("SDL_KITTY_AF_MAX_COVERAGE");
+        if (env && env[0]) {
+            data->cfg_af_max_coverage = (float)SDL_atof(env);
+        }
+        data->cfg_af_max_pixels = (prof && prof->af_max_pixels > 0)
+                                      ? prof->af_max_pixels
+                                      : ((size_t)160 * 1024);
+        data->cfg_dirty_bw = KITTY_SelectDirtyBW(SDL_getenv("SDL_KITTY_DIRTY_BW"), data->frame_edit_ok);
+        data->cfg_coalesce_gap = KITTY_SelectCoalesceGap(SDL_getenv("SDL_KITTY_COALESCE_GAP"),
+                                                         prof ? prof->coalesce_gap_px : 0);
+        data->cfg_dirty_union_at = KITTY_SelectDirtyUnionAT(SDL_getenv("SDL_KITTY_DIRTY_UNION_AT"),
+                                                            prof && prof->dirty_union_at);
+        data->cfg_dirty_at = KITTY_SelectDirtyAT(SDL_getenv("SDL_KITTY_DIRTY_AT"),
+                                                 prof && prof->dirty_at_overlays);
+        data->cfg_pingpong = KITTY_SelectPingPong(SDL_getenv("SDL_KITTY_PINGPONG"),
+                                                  prof && prof->pingpong);
+        env = SDL_getenv("SDL_KITTY_AF_ZLIB");
+        if (env && (env[0] == '0' || env[0] == '1') && env[1] == '\0') {
+            data->cfg_af_zlib = (env[0] == '1');
+        } else {
+            data->cfg_af_zlib = prof && prof->af_zlib;
+        }
+        env = SDL_getenv("SDL_KITTY_ZLIB_LEVEL");
+        if (env && env[0]) {
+            const long lv = SDL_strtol(env, NULL, 10);
+            if (lv >= 1 && lv <= 9) {
+                data->cfg_zlib_level = (int)lv;
+            }
+        }
+        env = SDL_getenv("SDL_KITTY_TRANSMIT");
+        if (env && env[0]) {
+            if (SDL_strcasecmp(env, "direct") == 0) {
+                data->transmit_mode = KITTY_TRANSMIT_DIRECT;
+            } else if (SDL_strcasecmp(env, "zlib") == 0) {
+                data->transmit_mode = KITTY_TRANSMIT_DIRECT_ZLIB;
+            } else if (SDL_strcasecmp(env, "shm") == 0) {
+                data->transmit_mode = KITTY_TRANSMIT_SHM;
+            }
+        }
+        env = SDL_getenv("SDL_KITTY_PERF_ACK");
+        data->cfg_perf_ack = (env && (env[0] == '1' || SDL_strcasecmp(env, "true") == 0 ||
+                                      SDL_strcasecmp(env, "yes") == 0 ||
+                                      SDL_strcasecmp(env, "on") == 0));
+        data->cfg_max_direct_bytes = (prof && prof->max_direct_bytes > 0)
+                                         ? prof->max_direct_bytes
+                                         : ((size_t)1920 * 1080 * 4);
+        data->cfg_apc_chunk_bytes = KITTY_ProfileApcChunkBytes(prof);
+        data->cfg_cached = true;
+    }
+
     {
         const char *no_mouse = SDL_getenv("SDL_KITTY_MOUSE");
         const bool want_mouse = !(no_mouse && (no_mouse[0] == '0' ||
@@ -288,6 +430,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
                                                SDL_strcasecmp(no_mouse, "no") == 0));
         if (want_mouse) {
             if (!KITTY_EnableMouse(data)) {
+                KITTY_UninstallTermSignals();
                 KITTY_RestoreTerminal(data);
                 data->terminal_owned = false;
                 return false;
@@ -305,6 +448,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
     mode.w = data->pixel_w;
     mode.h = data->pixel_h;
     if (SDL_AddBasicVideoDisplay(&mode) == 0) {
+        KITTY_UninstallTermSignals();
         KITTY_RestoreTerminal(data);
         data->terminal_owned = false;
         return false;
@@ -344,9 +488,14 @@ static void KITTY_VideoQuit(SDL_VideoDevice *_this)
         KITTY_prev_winch = SIG_DFL;
     }
 
+    KITTY_UninstallTermSignals();
+
     if (data && data->terminal_owned) {
         KITTY_RestoreTerminal(data);
         data->terminal_owned = false;
+    }
+    if (data) {
+        KITTY_FreeTransmitBuffers(data);
     }
 }
 

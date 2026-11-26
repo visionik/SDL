@@ -52,6 +52,16 @@ typedef enum KITTY_TransmitMode
 
 struct KITTY_TerminalProfile; /* SDL_kittyprofile.h */
 
+#define KITTY_KEY_HOLD_MAX 64
+
+typedef struct KITTY_KeyHold
+{
+    SDL_Scancode sc;
+    Uint64 earliest_up_ms;
+    bool want_up;
+    bool down;
+} KITTY_KeyHold;
+
 /*
  * Driver-private state for one kitty SDL_VideoDevice: tty fds, terminal
  * profile, cell/pixel geometry, mouse mode, transmit path, and pending CSI.
@@ -123,6 +133,12 @@ typedef struct SDL_VideoData
     Uint64 winch_at_ms;
     unsigned char tty_pending[KITTY_TTY_PENDING_MAX];
     size_t tty_pending_len;
+    bool esc_pending;
+    Uint64 esc_pending_ms;
+    Uint64 ctrl_c_ms;
+    /* Deferred key-up tracking for MAME-style poll-after-drain apps. */
+    KITTY_KeyHold key_holds[KITTY_KEY_HOLD_MAX];
+    int key_hold_n;
     /* Perf counters (SDL_KITTY_DEBUG present lines + kitty_perf_summary.py). */
     size_t last_wire_bytes; /* APC bytes written on last successful upload */
     size_t last_raw_bytes;  /* payload before b64 (zlib size or raw RGB) */
@@ -134,6 +150,34 @@ typedef struct SDL_VideoData
     Uint32 wire_presents;
     Uint32 ack_presents; /* presents where ms_ack was measured */
     Uint32 skip_presents;
+    /* Persistent grow-only transmit buffers + reusable z_stream (zero per-frame malloc). */
+    Uint8 *tx_z_buf;
+    size_t tx_z_cap;
+    char *tx_b64_buf;
+    size_t tx_b64_cap;
+    void *tx_zstream; /* z_stream*, lazily initialized with deflateInit */
+    void *tx_pz_ctx;  /* parallel zlib slice streams/buffers, lazily initialized */
+    void *tx_mr_ctx;  /* parallel multi-rect a=f pack+zlib+b64 worker pool */
+    void *tx_async;   /* depth-1 pipelined async PTY writer thread */
+    /* Cached hot-path present/transmit policy resolved once at VideoInit. */
+    bool cfg_cached;
+    bool cfg_dirty_enabled;
+    bool cfg_fb_diff;
+    int cfg_fb_diff_tile;
+    float cfg_fb_diff_cover;
+    bool cfg_upload_skip;
+    float cfg_af_max_coverage;
+    size_t cfg_af_max_pixels;
+    bool cfg_dirty_bw;
+    int cfg_coalesce_gap;
+    bool cfg_dirty_union_at;
+    bool cfg_dirty_at;
+    bool cfg_pingpong;
+    bool cfg_af_zlib;
+    int cfg_zlib_level; /* 0 = auto (3 parallel full-frame, 1 serial/a=f); 1..9 override */
+    bool cfg_perf_ack;
+    size_t cfg_max_direct_bytes;
+    size_t cfg_apc_chunk_bytes;
 } SDL_VideoData;
 
 /* Stacked a=T dirty overlays (dirty_at_overlays experiment). Ids 100+. */
@@ -150,10 +194,8 @@ typedef struct SDL_WindowData
     Uint32 image_ids[2];
     int image_index;
     bool placed;
-    /* Retained RGB24/RGBA32: rgb_scratch = last presented; rgb_back = convert target
-     * for tile-diff (pointer-swapped after each present). */
+    /* Retained RGB24/RGBA32 scratch (updated in-place by fused convert+tile-diff). */
     Uint8 *rgb_scratch;
-    Uint8 *rgb_back;
     int rgb_w;
     int rgb_h;
     int scratch_bpp; /* 3 (f=24) or 4 (f=32) */
@@ -166,6 +208,11 @@ typedef struct SDL_WindowData
     /* Exp 6: FNV of last successfully uploaded scratch (full buffer). */
     Uint64 last_upload_hash;
     bool last_upload_hash_valid;
+    /* Persistent grow-only scratch for packed dirty-rect uploads. */
+    Uint8 *pack_scratch;
+    size_t pack_scratch_cap;
+    /* Cached window framebuffer surface (avoids per-frame property RWLock + hash). */
+    SDL_Surface *fb_surface;
 } SDL_WindowData;
 
 #endif // SDL_kittyvideo_h_

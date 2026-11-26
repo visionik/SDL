@@ -92,6 +92,9 @@ bool KITTY_FbPixelToCellCursor(int x, int y, int cell_w, int cell_h,
  */
 Uint64 KITTY_Fnv1a64(const Uint8 *data, size_t len);
 
+/* Fast 64-bit 4-lane word hash for upload_skip frame fingerprinting. */
+Uint64 KITTY_FastHash64(const Uint8 *data, size_t len);
+
 /*
  * Merge overlapping / near rects (expanded by gap_px). Writes up to max_out
  * coalesced rects into out; if more remain, collapses to a single union.
@@ -123,6 +126,29 @@ bool KITTY_FitAspectCells(int cols, int rows, int cell_w, int cell_h, int fb_w, 
 KITTY_DiffOutcome KITTY_TileDiffBBox(const Uint8 *prev, const Uint8 *next,
                                      int fb_w, int fb_h, int bpp, int tile,
                                      float cover_limit, SDL_Rect *dirty_out);
+
+/*
+ * Multi-rect tile diff: scans prev vs next in tile×tile blocks, merges
+ * horizontally and vertically contiguous dirty tiles into up to max_rects
+ * disjoint rectangles, and returns NONE / RECT / FULL based on actual dirty
+ * pixel coverage vs cover_limit.
+ */
+KITTY_DiffOutcome KITTY_TileDiffRects(const Uint8 *prev, const Uint8 *next,
+                                      int fb_w, int fb_h, int bpp, int tile,
+                                      float cover_limit,
+                                      SDL_Rect *rects_out, int max_rects,
+                                      int *out_count, SDL_Rect *bbox_out);
+
+/*
+ * Fused single-pass surface convert + multi-rect tile diff: compares
+ * XRGB8888/ARGB8888 surface pixels directly against rgb_scratch in-place,
+ * writing only changed chunks into rgb_scratch (read-only on static tiles,
+ * write-only on already-dirty tiles) and emitting up to max_rects dirty rects.
+ */
+KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb_scratch,
+                                                bool use_rgba, int tile, float cover_limit,
+                                                SDL_Rect *rects_out, int max_rects,
+                                                int *out_count, SDL_Rect *bbox_out);
 
 /*
  * SDL_KITTY_FB_DIFF: env "0"/off/false/no → false; non-empty otherwise →
@@ -162,6 +188,25 @@ bool KITTY_ConvertSurfaceRectToRGB(SDL_Surface *surface, const SDL_Rect *rect, U
  * for Kitty f=32).
  */
 bool KITTY_ConvertSurfaceRectToRGBA(SDL_Surface *surface, const SDL_Rect *rect, Uint8 *rgba_scratch);
+
+/*
+ * Convert a clipped surface rect into rgb_scratch in-place while checking
+ * whether any pixel differed from the prior scratch contents. Clean chunks
+ * remain read-only; sets *out_changed = true if any pixel changed.
+ */
+bool KITTY_ConvertSurfaceRectCheckChanged(SDL_Surface *surface, const SDL_Rect *rect,
+                                          Uint8 *rgb_scratch, bool use_rgba,
+                                          bool *out_changed);
+
+/*
+ * Fused convert + change-check + tight pack: reads surface->pixels once,
+ * updates changed pixels in rgb_scratch, and writes tightly packed RGB24/RGBA32
+ * directly into packed_out from the same NEON registers (no scratch read-back).
+ */
+bool KITTY_ConvertSurfaceRectCheckAndPack(SDL_Surface *surface, const SDL_Rect *rect,
+                                          Uint8 *rgb_scratch, Uint8 *packed_out,
+                                          size_t packed_cap, bool use_rgba,
+                                          bool *out_changed, size_t *out_len);
 
 /*
  * Pack a rect from a full-frame RGB24 scratch into a tightly packed buffer

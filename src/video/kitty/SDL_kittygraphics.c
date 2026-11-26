@@ -34,14 +34,23 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/select.h>
+#include <sys/uio.h>
 #include <termios.h>
 #include <unistd.h>
 #include <zlib.h>
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#endif
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define KITTY_HAVE_NEON64 1
+#endif
 
 #ifndef MAP_FAILED
 #define MAP_FAILED ((void *)-1)
@@ -63,18 +72,75 @@ static const char KITTY_b64_table[] =
 static size_t KITTY_Base64Encode(const Uint8 *src, size_t src_len, char *dst, size_t dst_cap)
 {
     size_t i = 0, o = 0;
-    while (i + 2 < src_len) {
-        if (o + 4 >= dst_cap) {
-            break;
-        }
-        const Uint32 n = ((Uint32)src[i] << 16) | ((Uint32)src[i + 1] << 8) | src[i + 2];
-        dst[o++] = KITTY_b64_table[(n >> 18) & 63];
-        dst[o++] = KITTY_b64_table[(n >> 12) & 63];
-        dst[o++] = KITTY_b64_table[(n >> 6) & 63];
-        dst[o++] = KITTY_b64_table[n & 63];
-        i += 3;
+    size_t max_triples;
+    size_t cap_triples;
+
+    if (dst_cap == 0) {
+        return 0;
     }
-    if (i < src_len && o + 4 < dst_cap) {
+    max_triples = src_len / 3u;
+    cap_triples = (dst_cap - 1u) / 4u;
+    if (max_triples > cap_triples) {
+        max_triples = cap_triples;
+    }
+    const size_t full_bytes = max_triples * 3u;
+
+#ifdef KITTY_HAVE_NEON64
+    if (full_bytes >= 48u) {
+        uint8x16x4_t tbl;
+        const uint8x16_t mask6 = vdupq_n_u8(0x3Fu);
+        tbl.val[0] = vld1q_u8((const uint8_t *)(KITTY_b64_table + 0));
+        tbl.val[1] = vld1q_u8((const uint8_t *)(KITTY_b64_table + 16));
+        tbl.val[2] = vld1q_u8((const uint8_t *)(KITTY_b64_table + 32));
+        tbl.val[3] = vld1q_u8((const uint8_t *)(KITTY_b64_table + 48));
+        while (i + 96u <= full_bytes) {
+            const uint8x16x3_t in0 = vld3q_u8((const uint8_t *)(src + i));
+            const uint8x16x3_t in1 = vld3q_u8((const uint8_t *)(src + i + 48));
+            uint8x16x4_t out0, out1;
+            out0.val[0] = vqtbl4q_u8(tbl, vshrq_n_u8(in0.val[0], 2));
+            out0.val[1] = vqtbl4q_u8(tbl, vandq_u8(vorrq_u8(vshlq_n_u8(in0.val[0], 4), vshrq_n_u8(in0.val[1], 4)), mask6));
+            out0.val[2] = vqtbl4q_u8(tbl, vandq_u8(vorrq_u8(vshlq_n_u8(in0.val[1], 2), vshrq_n_u8(in0.val[2], 6)), mask6));
+            out0.val[3] = vqtbl4q_u8(tbl, vandq_u8(in0.val[2], mask6));
+            out1.val[0] = vqtbl4q_u8(tbl, vshrq_n_u8(in1.val[0], 2));
+            out1.val[1] = vqtbl4q_u8(tbl, vandq_u8(vorrq_u8(vshlq_n_u8(in1.val[0], 4), vshrq_n_u8(in1.val[1], 4)), mask6));
+            out1.val[2] = vqtbl4q_u8(tbl, vandq_u8(vorrq_u8(vshlq_n_u8(in1.val[1], 2), vshrq_n_u8(in1.val[2], 6)), mask6));
+            out1.val[3] = vqtbl4q_u8(tbl, vandq_u8(in1.val[2], mask6));
+            vst4q_u8((uint8_t *)(dst + o), out0);
+            vst4q_u8((uint8_t *)(dst + o + 64), out1);
+            i += 96u;
+            o += 128u;
+        }
+        while (i + 48u <= full_bytes) {
+            const uint8x16x3_t in = vld3q_u8((const uint8_t *)(src + i));
+            const uint8x16_t b0 = in.val[0];
+            const uint8x16_t b1 = in.val[1];
+            const uint8x16_t b2 = in.val[2];
+            const uint8x16_t idx0 = vshrq_n_u8(b0, 2);
+            const uint8x16_t idx1 = vandq_u8(vorrq_u8(vshlq_n_u8(b0, 4), vshrq_n_u8(b1, 4)), mask6);
+            const uint8x16_t idx2 = vandq_u8(vorrq_u8(vshlq_n_u8(b1, 2), vshrq_n_u8(b2, 6)), mask6);
+            const uint8x16_t idx3 = vandq_u8(b2, mask6);
+            uint8x16x4_t out;
+            out.val[0] = vqtbl4q_u8(tbl, idx0);
+            out.val[1] = vqtbl4q_u8(tbl, idx1);
+            out.val[2] = vqtbl4q_u8(tbl, idx2);
+            out.val[3] = vqtbl4q_u8(tbl, idx3);
+            vst4q_u8((uint8_t *)(dst + o), out);
+            i += 48u;
+            o += 64u;
+        }
+    }
+#endif
+
+    while (i < full_bytes) {
+        const Uint32 n = ((Uint32)src[i] << 16) | ((Uint32)src[i + 1] << 8) | src[i + 2];
+        dst[o]     = KITTY_b64_table[(n >> 18) & 63];
+        dst[o + 1] = KITTY_b64_table[(n >> 12) & 63];
+        dst[o + 2] = KITTY_b64_table[(n >> 6) & 63];
+        dst[o + 3] = KITTY_b64_table[n & 63];
+        i += 3u;
+        o += 4u;
+    }
+    if (i < src_len && o + 4u < dst_cap) {
         Uint32 n = (Uint32)src[i] << 16;
         dst[o++] = KITTY_b64_table[(n >> 18) & 63];
         if (i + 1 < src_len) {
@@ -88,14 +154,13 @@ static size_t KITTY_Base64Encode(const Uint8 *src, size_t src_len, char *dst, si
             dst[o++] = '=';
         }
     }
-    if (o < dst_cap) {
-        dst[o] = '\0';
-    }
+    dst[o] = '\0';
     return o;
 }
 
 /*
- * Write the full buffer to fd, retrying on EINTR. Sets SDL error on failure.
+ * Write the full buffer to fd, retrying on EINTR and waiting via poll() on
+ * EAGAIN/EWOULDBLOCK so large APCs never abort mid-escape-sequence.
  */
 static bool KITTY_WriteAll(int fd, const void *buf, size_t len)
 {
@@ -106,6 +171,20 @@ static bool KITTY_WriteAll(int fd, const void *buf, size_t len)
             if (errno == EINTR) {
                 continue;
             }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd;
+                int pr;
+                pfd.fd = fd;
+                pfd.events = POLLOUT;
+                pfd.revents = 0;
+                pr = poll(&pfd, 1, 500);
+                if (pr > 0 && !(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                    continue;
+                }
+                if (pr < 0 && errno == EINTR) {
+                    continue;
+                }
+            }
             return SDL_SetError("kitty write failed: %s", strerror(errno));
         }
         p += (size_t)n;
@@ -115,11 +194,770 @@ static bool KITTY_WriteAll(int fd, const void *buf, size_t len)
 }
 
 /*
- * Chunked direct (t=d) a=T transmit: base64-encode payload, optionally
- * home with CSI CUP, then write APC chunks sized by chunk_bytes.
+ * Scatter-gather writev() loop sending header + payload + ST in a single
+ * syscall per APC chunk, with EINTR retry and poll(POLLOUT) on EAGAIN.
+ */
+static bool KITTY_WritevAll(int fd, struct iovec *iov, int iovcnt)
+{
+    int idx = 0;
+    while (idx < iovcnt) {
+        ssize_t n;
+        if (iov[idx].iov_len == 0) {
+            idx++;
+            continue;
+        }
+        n = writev(fd, iov + idx, iovcnt - idx);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd;
+                int pr;
+                pfd.fd = fd;
+                pfd.events = POLLOUT;
+                pfd.revents = 0;
+                pr = poll(&pfd, 1, 500);
+                if (pr > 0 && !(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                    continue;
+                }
+                if (pr < 0 && errno == EINTR) {
+                    continue;
+                }
+            }
+            return SDL_SetError("kitty writev failed: %s", strerror(errno));
+        }
+        {
+            size_t rem = (size_t)n;
+            while (idx < iovcnt && rem >= iov[idx].iov_len) {
+                rem -= iov[idx].iov_len;
+                idx++;
+            }
+            if (idx < iovcnt && rem > 0) {
+                iov[idx].iov_base = (char *)iov[idx].iov_base + rem;
+                iov[idx].iov_len -= rem;
+            }
+        }
+    }
+    return true;
+}
+
+static bool KITTY_PollReadable(int fd, int timeout_ms)
+{
+    struct pollfd pfd;
+    int pr;
+    if (fd < 0) {
+        return false;
+    }
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    pr = poll(&pfd, 1, timeout_ms);
+    return pr > 0 && (pfd.revents & POLLIN) != 0;
+}
+
+#ifdef __APPLE__
+#define KITTY_PZ_MAX_SLICES 16
+#define KITTY_PZ_MIN_BYTES ((size_t)128 * 1024)
+
+/* 128-byte aligned per-worker slice eliminates false sharing on Apple Silicon
+ * (where L1 cache lines are 128 B and sizeof(z_stream) == 112 B). */
+typedef struct __attribute__((aligned(128))) KITTY_ParallelZlibSlice
+{
+    z_stream stream;
+    bool stream_init;
+    Uint8 *out_buf;
+    size_t out_cap;
+    size_t off;
+    size_t in_len;
+    size_t out_len;
+    uLong adler;
+    bool ok;
+} KITTY_ParallelZlibSlice;
+
+typedef struct KITTY_ParallelZlibCtx
+{
+    KITTY_ParallelZlibSlice slices[KITTY_PZ_MAX_SLICES];
+    int max_slices;
+    const Uint8 *src;
+    int active_slices;
+} KITTY_ParallelZlibCtx;
+
+static void KITTY_FreeParallelZlib(SDL_VideoData *vdata)
+{
+    KITTY_ParallelZlibCtx *ctx;
+    int i;
+    if (!vdata || !vdata->tx_pz_ctx) {
+        return;
+    }
+    ctx = (KITTY_ParallelZlibCtx *)vdata->tx_pz_ctx;
+    for (i = 0; i < KITTY_PZ_MAX_SLICES; ++i) {
+        if (ctx->slices[i].stream_init) {
+            deflateEnd(&ctx->slices[i].stream);
+            ctx->slices[i].stream_init = false;
+        }
+        SDL_free(ctx->slices[i].out_buf);
+        ctx->slices[i].out_buf = NULL;
+        ctx->slices[i].out_cap = 0;
+    }
+    SDL_free(ctx);
+    vdata->tx_pz_ctx = NULL;
+}
+
+static void KITTY_ParallelZlibWorker(void *arg, size_t idx)
+{
+    KITTY_ParallelZlibCtx *ctx = (KITTY_ParallelZlibCtx *)arg;
+    KITTY_ParallelZlibSlice *sl = &ctx->slices[idx];
+    z_stream *zs = &sl->stream;
+    const Uint8 *in = ctx->src + sl->off;
+    const size_t in_len = sl->in_len;
+    const int flush = ((int)idx + 1 == ctx->active_slices) ? Z_FINISH : Z_SYNC_FLUSH;
+    int zerr;
+
+    sl->ok = false;
+    sl->out_len = 0;
+    sl->adler = adler32(adler32(0L, Z_NULL, 0), in, (uInt)in_len);
+
+    zerr = deflateReset(zs);
+    if (zerr != Z_OK) {
+        return;
+    }
+    zs->next_in = (Bytef *)in;
+    zs->avail_in = (uInt)in_len;
+    zs->next_out = (Bytef *)sl->out_buf;
+    zs->avail_out = (uInt)sl->out_cap;
+
+    zerr = deflate(zs, flush);
+    if (flush == Z_FINISH ? (zerr != Z_STREAM_END) : (zerr != Z_OK || zs->avail_in != 0)) {
+        return;
+    }
+    sl->out_len = (size_t)zs->total_out;
+    sl->ok = true;
+}
+
+#define KITTY_MR_MAX 16
+
+typedef struct __attribute__((aligned(128))) KITTY_MultiRectSlot
+{
+    z_stream zs;
+    bool zs_init;
+    Uint8 *pack_buf;
+    size_t pack_cap;
+    Uint8 *z_buf;
+    size_t z_cap;
+    char *apc_buf;
+    size_t apc_cap;
+    SDL_Rect rect;
+    size_t raw_len;
+    size_t wire_len;
+    bool ok;
+} KITTY_MultiRectSlot;
+
+typedef struct KITTY_MultiRectCtx
+{
+    KITTY_MultiRectSlot slots[KITTY_MR_MAX];
+    const Uint8 *rgb_scratch;
+    int fb_w;
+    int fb_h;
+    int kitty_f;
+    Uint32 image_id;
+    size_t chunk_cap;
+    int zlevel;
+    bool want_zlib;
+} KITTY_MultiRectCtx;
+
+static void KITTY_FreeMultiRectCtx(SDL_VideoData *vdata)
+{
+    KITTY_MultiRectCtx *ctx;
+    int i;
+    if (!vdata || !vdata->tx_mr_ctx) {
+        return;
+    }
+    ctx = (KITTY_MultiRectCtx *)vdata->tx_mr_ctx;
+    for (i = 0; i < KITTY_MR_MAX; ++i) {
+        if (ctx->slots[i].zs_init) {
+            deflateEnd(&ctx->slots[i].zs);
+            ctx->slots[i].zs_init = false;
+        }
+        SDL_free(ctx->slots[i].pack_buf);
+        SDL_free(ctx->slots[i].z_buf);
+        SDL_free(ctx->slots[i].apc_buf);
+    }
+    SDL_free(ctx);
+    vdata->tx_mr_ctx = NULL;
+}
+
+static void KITTY_MultiRectWorker(void *arg, size_t idx)
+{
+    KITTY_MultiRectCtx *ctx = (KITTY_MultiRectCtx *)arg;
+    KITTY_MultiRectSlot *s = &ctx->slots[idx];
+    const int bpp = (ctx->kitty_f == 32) ? 4 : 3;
+    const size_t raw_len = (size_t)s->rect.w * (size_t)s->rect.h * (size_t)bpp;
+    const Uint8 *body;
+    size_t body_len;
+    bool use_z = ctx->want_zlib && raw_len > 48u;
+    size_t packed_len = 0;
+    bool pack_ok;
+    size_t b64_len, encoded;
+    char header[160];
+    int header_len;
+
+    s->ok = false;
+    s->raw_len = raw_len;
+    s->wire_len = 0;
+
+    if (s->pack_cap < raw_len) {
+        Uint8 *nb = (Uint8 *)SDL_realloc(s->pack_buf, raw_len);
+        if (!nb) {
+            return;
+        }
+        s->pack_buf = nb;
+        s->pack_cap = raw_len;
+    }
+    pack_ok = (bpp == 4)
+                  ? KITTY_PackRGBARect(ctx->rgb_scratch, ctx->fb_w, ctx->fb_h, &s->rect,
+                                       s->pack_buf, s->pack_cap, &packed_len)
+                  : KITTY_PackRGBRect(ctx->rgb_scratch, ctx->fb_w, ctx->fb_h, &s->rect,
+                                      s->pack_buf, s->pack_cap, &packed_len);
+    if (!pack_ok) {
+        return;
+    }
+
+    body = s->pack_buf;
+    body_len = raw_len;
+    if (use_z) {
+        uLongf bound;
+        if (!s->zs_init) {
+            if (deflateInit2(&s->zs, ctx->zlevel, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+                return;
+            }
+            s->zs_init = true;
+        } else if (deflateReset(&s->zs) != Z_OK) {
+            return;
+        }
+        bound = deflateBound(&s->zs, (uLong)raw_len);
+        if (s->z_cap < (size_t)bound) {
+            Uint8 *nb = (Uint8 *)SDL_realloc(s->z_buf, (size_t)bound);
+            if (!nb) {
+                return;
+            }
+            s->z_buf = nb;
+            s->z_cap = (size_t)bound;
+        }
+        s->zs.next_in = (Bytef *)s->pack_buf;
+        s->zs.avail_in = (uInt)raw_len;
+        s->zs.next_out = (Bytef *)s->z_buf;
+        s->zs.avail_out = (uInt)bound;
+        if (deflate(&s->zs, Z_FINISH) != Z_STREAM_END) {
+            return;
+        }
+        if ((size_t)s->zs.total_out < raw_len) {
+            body = s->z_buf;
+            body_len = (size_t)s->zs.total_out;
+        } else {
+            use_z = false;
+        }
+    }
+
+    b64_len = ((body_len + 2u) / 3u) * 4u;
+    if (b64_len > ctx->chunk_cap) {
+        return;
+    }
+    header_len = SDL_snprintf(header, sizeof(header),
+                              "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
+                              ctx->kitty_f, use_z ? "o=z," : "", (unsigned)ctx->image_id,
+                              s->rect.x, s->rect.y, s->rect.w, s->rect.h);
+    if (header_len <= 0) {
+        return;
+    }
+    {
+        const size_t need = (size_t)header_len + b64_len + 3u;
+        if (s->apc_cap < need) {
+            char *nb = (char *)SDL_realloc(s->apc_buf, need);
+            if (!nb) {
+                return;
+            }
+            s->apc_buf = nb;
+            s->apc_cap = need;
+        }
+        SDL_memcpy(s->apc_buf, header, (size_t)header_len);
+        encoded = KITTY_Base64Encode(body, body_len, s->apc_buf + header_len, b64_len + 1u);
+        if (encoded == 0) {
+            return;
+        }
+        s->apc_buf[(size_t)header_len + encoded] = '\033';
+        s->apc_buf[(size_t)header_len + encoded + 1u] = '\\';
+        s->wire_len = (size_t)header_len + encoded + 2u;
+        s->ok = true;
+    }
+}
+#endif /* __APPLE__ */
+
+/*
+ * Depth-1 double-buffered async PTY writer thread. Overlaps CPU work
+ * (convert/diff/zlib/base64) of frame N+1 with kernel PTY write of frame N,
+ * while strictly preserving FIFO order and backpressure (max 1 buffer in flight).
+ */
+#define KITTY_ASYNC_MAX_BYTES ((size_t)1048576u)
+
+typedef struct KITTY_AsyncWriter
+{
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t cv_work;
+    pthread_cond_t cv_idle;
+    int fd;
+    char *buf;
+    size_t cap;
+    size_t len;
+    char *stage_buf;
+    size_t stage_cap;
+    size_t stage_len;
+    bool batching;
+    bool busy;
+    bool writer_sleeping;
+    bool main_waiting;
+    bool stop;
+    bool write_err;
+    bool started;
+} KITTY_AsyncWriter;
+
+static void *KITTY_AsyncWriterMain(void *arg)
+{
+    KITTY_AsyncWriter *w = (KITTY_AsyncWriter *)arg;
+    pthread_mutex_lock(&w->mu);
+    for (;;) {
+        while (!w->busy && !w->stop) {
+            w->writer_sleeping = true;
+            pthread_cond_wait(&w->cv_work, &w->mu);
+            w->writer_sleeping = false;
+        }
+        if (!w->busy && w->stop) {
+            break;
+        }
+        {
+            const int fd = w->fd;
+            const char *buf = w->buf;
+            const size_t len = w->len;
+            bool ok;
+            pthread_mutex_unlock(&w->mu);
+            ok = KITTY_WriteAll(fd, buf, len);
+            pthread_mutex_lock(&w->mu);
+            if (!ok) {
+                w->write_err = true;
+            }
+            w->busy = false;
+            w->len = 0;
+            if (w->main_waiting) {
+                pthread_cond_signal(&w->cv_idle);
+            }
+        }
+    }
+    pthread_mutex_unlock(&w->mu);
+    return NULL;
+}
+
+static KITTY_AsyncWriter *KITTY_GetAsyncWriter(SDL_VideoData *vdata)
+{
+    KITTY_AsyncWriter *w;
+    if (!vdata) {
+        return NULL;
+    }
+    if (vdata->tx_async) {
+        return (KITTY_AsyncWriter *)vdata->tx_async;
+    }
+    w = (KITTY_AsyncWriter *)SDL_calloc(1, sizeof(KITTY_AsyncWriter));
+    if (!w) {
+        return NULL;
+    }
+    if (pthread_mutex_init(&w->mu, NULL) != 0) {
+        SDL_free(w);
+        return NULL;
+    }
+    if (pthread_cond_init(&w->cv_work, NULL) != 0) {
+        pthread_mutex_destroy(&w->mu);
+        SDL_free(w);
+        return NULL;
+    }
+    if (pthread_cond_init(&w->cv_idle, NULL) != 0) {
+        pthread_cond_destroy(&w->cv_work);
+        pthread_mutex_destroy(&w->mu);
+        SDL_free(w);
+        return NULL;
+    }
+    if (pthread_create(&w->thread, NULL, KITTY_AsyncWriterMain, w) != 0) {
+        pthread_cond_destroy(&w->cv_idle);
+        pthread_cond_destroy(&w->cv_work);
+        pthread_mutex_destroy(&w->mu);
+        SDL_free(w);
+        return NULL;
+    }
+    w->started = true;
+    vdata->tx_async = w;
+    return w;
+}
+
+static char *KITTY_AsyncEnsureStage(KITTY_AsyncWriter *w, size_t need)
+{
+    size_t cap;
+    char *p;
+    if (w->stage_buf && w->stage_cap >= need) {
+        return w->stage_buf;
+    }
+    cap = w->stage_cap ? w->stage_cap : 16384u;
+    while (cap < need) {
+        cap *= 2u;
+    }
+    p = (char *)SDL_realloc(w->stage_buf, cap);
+    if (!p) {
+        return NULL;
+    }
+    w->stage_buf = p;
+    w->stage_cap = cap;
+    return p;
+}
+
+static bool KITTY_AsyncSubmitStage(KITTY_AsyncWriter *w, int fd, size_t len)
+{
+    bool prev_err;
+    char *tmp_buf;
+    size_t tmp_cap;
+
+    pthread_mutex_lock(&w->mu);
+    while (w->busy) {
+        w->main_waiting = true;
+        pthread_cond_wait(&w->cv_idle, &w->mu);
+        w->main_waiting = false;
+    }
+    prev_err = w->write_err;
+    w->write_err = false;
+    tmp_buf = w->buf;
+    tmp_cap = w->cap;
+    w->buf = w->stage_buf;
+    w->cap = w->stage_cap;
+    w->stage_buf = tmp_buf;
+    w->stage_cap = tmp_cap;
+    w->fd = fd;
+    w->len = len;
+    w->busy = true;
+    w->stage_len = 0;
+    if (w->writer_sleeping) {
+        pthread_cond_signal(&w->cv_work);
+    }
+    pthread_mutex_unlock(&w->mu);
+    return !prev_err;
+}
+
+void KITTY_BeginAsyncBatch(SDL_VideoData *vdata)
+{
+    KITTY_AsyncWriter *w = KITTY_GetAsyncWriter(vdata);
+    if (!w) {
+        return;
+    }
+    w->stage_len = 0;
+    w->batching = true;
+}
+
+void KITTY_CancelAsyncBatch(SDL_VideoData *vdata)
+{
+    KITTY_AsyncWriter *w;
+    if (!vdata || !vdata->tx_async) {
+        return;
+    }
+    w = (KITTY_AsyncWriter *)vdata->tx_async;
+    w->stage_len = 0;
+    w->batching = false;
+}
+
+bool KITTY_CommitAsyncBatch(SDL_VideoData *vdata)
+{
+    KITTY_AsyncWriter *w;
+    size_t len;
+    if (!vdata || !vdata->tx_async) {
+        return true;
+    }
+    w = (KITTY_AsyncWriter *)vdata->tx_async;
+    len = w->stage_len;
+    w->batching = false;
+    w->stage_len = 0;
+    if (len == 0) {
+        return true;
+    }
+    if (!KITTY_AsyncSubmitStage(w, vdata->tty_fd, len)) {
+        return SDL_SetError("kitty async batch write failed");
+    }
+    return true;
+}
+
+void KITTY_FlushAsyncWriter(SDL_VideoData *vdata)
+{
+    KITTY_AsyncWriter *w;
+    if (!vdata || !vdata->tx_async) {
+        return;
+    }
+    w = (KITTY_AsyncWriter *)vdata->tx_async;
+    pthread_mutex_lock(&w->mu);
+    while (w->busy) {
+        w->main_waiting = true;
+        pthread_cond_wait(&w->cv_idle, &w->mu);
+        w->main_waiting = false;
+    }
+    pthread_mutex_unlock(&w->mu);
+}
+
+static void KITTY_DestroyAsyncWriter(SDL_VideoData *vdata)
+{
+    KITTY_AsyncWriter *w;
+    if (!vdata || !vdata->tx_async) {
+        return;
+    }
+    w = (KITTY_AsyncWriter *)vdata->tx_async;
+    if (w->started) {
+        pthread_mutex_lock(&w->mu);
+        w->stop = true;
+        pthread_cond_signal(&w->cv_work);
+        pthread_mutex_unlock(&w->mu);
+        pthread_join(w->thread, NULL);
+        w->started = false;
+    }
+    pthread_cond_destroy(&w->cv_idle);
+    pthread_cond_destroy(&w->cv_work);
+    pthread_mutex_destroy(&w->mu);
+    SDL_free(w->buf);
+    SDL_free(w->stage_buf);
+    SDL_free(w);
+    vdata->tx_async = NULL;
+}
+
+/*
+ * Free persistent transmit scratch buffers and reusable z_stream on vdata.
+ */
+void KITTY_FreeTransmitBuffers(SDL_VideoData *vdata)
+{
+    if (!vdata) {
+        return;
+    }
+    KITTY_DestroyAsyncWriter(vdata);
+#ifdef __APPLE__
+    KITTY_FreeParallelZlib(vdata);
+    KITTY_FreeMultiRectCtx(vdata);
+#endif
+    if (vdata->tx_zstream) {
+        deflateEnd((z_stream *)vdata->tx_zstream);
+        SDL_free(vdata->tx_zstream);
+        vdata->tx_zstream = NULL;
+    }
+    SDL_free(vdata->tx_z_buf);
+    vdata->tx_z_buf = NULL;
+    vdata->tx_z_cap = 0;
+    SDL_free(vdata->tx_b64_buf);
+    vdata->tx_b64_buf = NULL;
+    vdata->tx_b64_cap = 0;
+}
+
+static char *KITTY_EnsureB64Buf(SDL_VideoData *vdata, size_t need)
+{
+    char *p;
+    if (vdata->tx_b64_buf && vdata->tx_b64_cap >= need) {
+        return vdata->tx_b64_buf;
+    }
+    p = (char *)SDL_realloc(vdata->tx_b64_buf, need);
+    if (!p) {
+        return NULL;
+    }
+    vdata->tx_b64_buf = p;
+    vdata->tx_b64_cap = need;
+    return p;
+}
+
+static Uint8 *KITTY_EnsureZBuf(SDL_VideoData *vdata, size_t need)
+{
+    Uint8 *p;
+    if (vdata->tx_z_buf && vdata->tx_z_cap >= need) {
+        return vdata->tx_z_buf;
+    }
+    p = (Uint8 *)SDL_realloc(vdata->tx_z_buf, need);
+    if (!p) {
+        return NULL;
+    }
+    vdata->tx_z_buf = p;
+    vdata->tx_z_cap = need;
+    return p;
+}
+
+/*
+ * Compress src into vdata->tx_z_buf reusing a persistent z_stream (deflateReset)
+ * so we never pay deflateInit/deflateEnd (~256 KB alloc+memset) per frame/rect.
+ */
+static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t src_len,
+                               Uint8 **out_buf, size_t *out_len)
+{
+    z_stream *zs;
+    uLongf bound;
+    Uint8 *dst;
+    int zerr;
+
+    if (!vdata || !src || src_len == 0 || !out_buf || !out_len) {
+        return false;
+    }
+
+#ifdef __APPLE__
+    /* Multi-core RFC 1950 zlib for large full-frame payloads: up to 12 raw
+     * deflate slices concatenated via Z_SYNC_FLUSH + Z_FINISH + adler32_combine. */
+    if (src_len >= KITTY_PZ_MIN_BYTES) {
+        KITTY_ParallelZlibCtx *ctx = (KITTY_ParallelZlibCtx *)vdata->tx_pz_ctx;
+        int i;
+        if (!ctx) {
+            ctx = (KITTY_ParallelZlibCtx *)SDL_calloc(1, sizeof(KITTY_ParallelZlibCtx));
+            if (ctx) {
+                long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+                int max_s = (ncpu >= KITTY_PZ_MAX_SLICES) ? KITTY_PZ_MAX_SLICES
+                                                          : (ncpu >= 2 ? (int)ncpu : 2);
+                bool init_ok = true;
+                const int pz_level = (vdata->cfg_zlib_level >= 1 && vdata->cfg_zlib_level <= 9)
+                                         ? vdata->cfg_zlib_level
+                                         : 3;
+                ctx->max_slices = max_s;
+                for (i = 0; i < max_s; ++i) {
+                    /* Default level 3 stays on Apple's fast deflate path while shrinking
+                     * wire bytes enough to reduce overlapped PTY drain time; override
+                     * with SDL_KITTY_ZLIB_LEVEL=1..9 (e.g. 4 for ~2x smaller wire over SSH). */
+                    if (deflateInit2(&ctx->slices[i].stream, pz_level, Z_DEFLATED, -15, 8,
+                                     Z_DEFAULT_STRATEGY) != Z_OK) {
+                        init_ok = false;
+                        break;
+                    }
+                    ctx->slices[i].stream_init = true;
+                }
+                if (init_ok) {
+                    vdata->tx_pz_ctx = ctx;
+                } else {
+                    vdata->tx_pz_ctx = ctx;
+                    KITTY_FreeParallelZlib(vdata);
+                    ctx = NULL;
+                }
+            }
+        }
+        if (ctx) {
+            int n_slices = (src_len >= 3072u * 1024u)
+                               ? ctx->max_slices
+                               : (src_len >= 1536u * 1024u ? 12 : (src_len >= 512u * 1024u ? 8 : 4));
+            if (n_slices > ctx->max_slices) {
+                n_slices = ctx->max_slices;
+            }
+            const size_t base = src_len / (size_t)n_slices;
+            size_t off = 0;
+            bool cap_ok = true;
+            ctx->src = src;
+            ctx->active_slices = n_slices;
+            for (i = 0; i < n_slices; ++i) {
+                KITTY_ParallelZlibSlice *sl = &ctx->slices[i];
+                const size_t slen = (i + 1 == n_slices) ? (src_len - off) : base;
+                const size_t sbound = (size_t)deflateBound(&sl->stream, (uLong)slen) + 16u;
+                sl->off = off;
+                sl->in_len = slen;
+                off += slen;
+                if (sl->out_cap < sbound) {
+                    Uint8 *nb = (Uint8 *)SDL_realloc(sl->out_buf, sbound);
+                    if (!nb) {
+                        cap_ok = false;
+                        break;
+                    }
+                    sl->out_buf = nb;
+                    sl->out_cap = sbound;
+                }
+            }
+            if (cap_ok) {
+                bool all_ok = true;
+                size_t total = 2u + 4u; /* 2B zlib header + 4B adler32 trailer */
+                dispatch_apply_f((size_t)n_slices,
+                                 dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                                 ctx, KITTY_ParallelZlibWorker);
+                for (i = 0; i < n_slices; ++i) {
+                    if (!ctx->slices[i].ok) {
+                        all_ok = false;
+                        break;
+                    }
+                    total += ctx->slices[i].out_len;
+                }
+                if (all_ok) {
+                    dst = KITTY_EnsureZBuf(vdata, total);
+                    if (dst) {
+                        uLong combined = ctx->slices[0].adler;
+                        size_t pos = 2u;
+                        dst[0] = 0x78u; /* CM=8 deflate, CINFO=7 (32K window) */
+                        dst[1] = 0x01u; /* FLEVEL=0, FCHECK=1 (0x7801 % 31 == 0) */
+                        for (i = 0; i < n_slices; ++i) {
+                            SDL_memcpy(dst + pos, ctx->slices[i].out_buf, ctx->slices[i].out_len);
+                            pos += ctx->slices[i].out_len;
+                            if (i > 0) {
+                                combined = adler32_combine(combined, ctx->slices[i].adler,
+                                                           (z_off_t)ctx->slices[i].in_len);
+                            }
+                        }
+                        dst[pos + 0] = (Uint8)((combined >> 24) & 0xFFu);
+                        dst[pos + 1] = (Uint8)((combined >> 16) & 0xFFu);
+                        dst[pos + 2] = (Uint8)((combined >> 8) & 0xFFu);
+                        dst[pos + 3] = (Uint8)(combined & 0xFFu);
+                        *out_buf = dst;
+                        *out_len = total;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+#endif /* __APPLE__ */
+    if (!vdata->tx_zstream) {
+        const int serial_level = (vdata->cfg_zlib_level >= 1 && vdata->cfg_zlib_level <= 9)
+                                     ? vdata->cfg_zlib_level
+                                     : Z_BEST_SPEED;
+        zs = (z_stream *)SDL_calloc(1, sizeof(z_stream));
+        if (!zs) {
+            return false;
+        }
+        zerr = deflateInit2(zs, serial_level, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY);
+        if (zerr != Z_OK) {
+            SDL_free(zs);
+            return SDL_SetError("zlib deflateInit2 failed (%d)", zerr);
+        }
+        vdata->tx_zstream = zs;
+    } else {
+        zs = (z_stream *)vdata->tx_zstream;
+        zerr = deflateReset(zs);
+        if (zerr != Z_OK) {
+            return SDL_SetError("zlib deflateReset failed (%d)", zerr);
+        }
+    }
+
+    bound = deflateBound(zs, (uLong)src_len);
+    dst = KITTY_EnsureZBuf(vdata, (size_t)bound);
+    if (!dst) {
+        return false;
+    }
+
+    zs->next_in = (Bytef *)src;
+    zs->avail_in = (uInt)src_len;
+    zs->next_out = (Bytef *)dst;
+    zs->avail_out = (uInt)bound;
+
+    zerr = deflate(zs, Z_FINISH);
+    if (zerr != Z_STREAM_END) {
+        return SDL_SetError("zlib deflate failed (%d)", zerr);
+    }
+
+    *out_buf = dst;
+    *out_len = (size_t)zs->total_out;
+    return true;
+}
+
+/*
+ * Chunked direct (t=d) a=T transmit: stream-encode base64 in L1/L2-friendly
+ * 48 KB raw -> 64 KB b64 blocks directly to the tty so the terminal reader
+ * starts draining immediately while keeping exact APC chunk_cap boundaries.
  * extra_keys may add o=z or overlay z/X/Y. out_wire_bytes gets bytes sent.
  */
-static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
+static bool KITTY_TransmitDirectPayload(SDL_VideoData *vdata, int fd, Uint32 image_id, int w, int h,
                                         int place_cols, int place_rows,
                                         const char *extra_keys,
                                         const Uint8 *payload, size_t payload_len,
@@ -127,70 +965,213 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
                                         size_t chunk_bytes,
                                         size_t *out_wire_bytes)
 {
-    const size_t b64_len = ((payload_len + 2) / 3) * 4;
+    const size_t b64_total = ((payload_len + 2u) / 3u) * 4u;
     const size_t chunk_cap = chunk_bytes > 0 ? chunk_bytes : KITTY_CHUNK_DEFAULT;
     size_t wire = 0;
-    char *b64 = (char *)SDL_malloc(b64_len + 1);
-    if (!b64) {
-        return false;
-    }
-    const size_t encoded = KITTY_Base64Encode(payload, payload_len, b64, b64_len + 1);
-    if (encoded == 0) {
-        SDL_free(b64);
+
+    if (payload_len == 0) {
         return SDL_SetError("base64 encode failed");
     }
 
     /* Prefer KITTY_WritePlaceOrigin at the call site (viewport CUP). This
      * fallback homes to 1;1 when a caller still passes home_cursor. */
     if (home_cursor) {
+        KITTY_FlushAsyncWriter(vdata);
         if (!KITTY_WriteAll(fd, "\033[H", 3)) {
-            SDL_free(b64);
             return false;
         }
         wire += 3;
     }
 
-    size_t offset = 0;
-    bool first = true;
-    while (offset < encoded) {
-        size_t chunk = encoded - offset;
-        if (chunk > chunk_cap) {
-            chunk = chunk_cap;
-        }
-        const int more = (offset + chunk < encoded) ? 1 : 0;
-        char header[256];
-        int header_len;
-        if (first) {
-            /* c/r stretch when place_cols/rows set; C=1/N=1/p=1 via formatter.
-             * Rex: omit m=0 on single-chunk; omit q=2. extra_keys e.g. "o=z". */
+    /* Single-chunk payloads <= 256 KB (all 720p/1080p zlib frames): encode
+     * directly into the double-buffered async PTY writer stage buffer so the
+     * previous frame's PTY drain overlaps this frame's CPU work. */
+    if (b64_total <= KITTY_ASYNC_MAX_BYTES && b64_total <= chunk_cap && !home_cursor) {
+        KITTY_AsyncWriter *aw = KITTY_GetAsyncWriter(vdata);
+        if (aw) {
+            char header[256];
             char ctrl[192];
             const int ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 'd', image_id,
                                                             w, h, place_cols, place_rows,
-                                                            more != 0, extra_keys, 0, kitty_f);
+                                                            false, extra_keys, 0, kitty_f);
+            int header_len;
+            char *dst;
+            size_t encoded;
             if (ctrl_len <= 0) {
-                SDL_free(b64);
                 return SDL_SetError("transmit header format failed");
             }
             header_len = SDL_snprintf(header, sizeof(header), "\033_G%s;", ctrl);
-            first = false;
-        } else {
-            header_len = SDL_snprintf(header, sizeof(header), "\033_Gm=%d;", more);
+            if (header_len <= 0) {
+                return SDL_SetError("header snprintf failed");
+            }
+            dst = KITTY_AsyncEnsureStage(aw, (size_t)header_len + b64_total + 3u);
+            if (!dst) {
+                return false;
+            }
+            SDL_memcpy(dst, header, (size_t)header_len);
+            encoded = KITTY_Base64Encode(payload, payload_len, dst + header_len, b64_total + 1u);
+            if (encoded == 0) {
+                return SDL_SetError("base64 encode failed");
+            }
+            dst[(size_t)header_len + encoded] = '\033';
+            dst[(size_t)header_len + encoded + 1u] = '\\';
+            wire = (size_t)header_len + encoded + 2u;
+            if (!KITTY_AsyncSubmitStage(aw, fd, wire)) {
+                return SDL_SetError("kitty async write failed");
+            }
+            if (out_wire_bytes) {
+                *out_wire_bytes = wire;
+            }
+            return true;
         }
-        if (header_len <= 0) {
-            SDL_free(b64);
-            return SDL_SetError("header snprintf failed");
-        }
-        if (!KITTY_WriteAll(fd, header, (size_t)header_len) ||
-            !KITTY_WriteAll(fd, b64 + offset, chunk) ||
-            !KITTY_WriteAll(fd, "\033\\", 2)) {
-            SDL_free(b64);
-            return false;
-        }
-        wire += (size_t)header_len + chunk + 2;
-        offset += chunk;
     }
 
-    SDL_free(b64);
+    KITTY_FlushAsyncWriter(vdata);
+
+    /* Small payloads (e.g. zlib-compressed frames <= 192 KB) fit in L2 and
+     * go out in a single writev() call; large raw payloads stream in 48 KB raw
+     * -> 64 KB b64 blocks so encoding overlaps PTY drain and avoids a multi-MB
+     * b64 scratch buffer. */
+    if (b64_total <= 196608u) {
+        char *b64 = KITTY_EnsureB64Buf(vdata, b64_total + 1u);
+        size_t encoded;
+        size_t offset = 0;
+        bool first = true;
+        if (!b64) {
+            return false;
+        }
+        encoded = KITTY_Base64Encode(payload, payload_len, b64, b64_total + 1u);
+        if (encoded == 0) {
+            return SDL_SetError("base64 encode failed");
+        }
+        while (offset < encoded) {
+            size_t chunk = encoded - offset;
+            int more;
+            char header[256];
+            int header_len;
+            if (chunk > chunk_cap) {
+                chunk = chunk_cap;
+            }
+            more = (offset + chunk < encoded) ? 1 : 0;
+            if (first) {
+                char ctrl[192];
+                const int ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 'd', image_id,
+                                                                w, h, place_cols, place_rows,
+                                                                more != 0, extra_keys, 0, kitty_f);
+                if (ctrl_len <= 0) {
+                    return SDL_SetError("transmit header format failed");
+                }
+                header_len = SDL_snprintf(header, sizeof(header), "\033_G%s;", ctrl);
+                first = false;
+            } else {
+                header_len = SDL_snprintf(header, sizeof(header), "\033_Gm=%d;", more);
+            }
+            if (header_len <= 0) {
+                return SDL_SetError("header snprintf failed");
+            }
+            {
+                struct iovec iov[3];
+                iov[0].iov_base = header;
+                iov[0].iov_len = (size_t)header_len;
+                iov[1].iov_base = b64 + offset;
+                iov[1].iov_len = chunk;
+                iov[2].iov_base = (void *)"\033\\";
+                iov[2].iov_len = 2;
+                if (!KITTY_WritevAll(fd, iov, 3)) {
+                    return false;
+                }
+            }
+            wire += (size_t)header_len + chunk + 2u;
+            offset += chunk;
+        }
+    } else {
+        /* Stream base64 in 48 KB raw (64 KB b64) L1/L2-friendly slices while
+         * respecting chunk_cap APC boundaries (aligned to 4-byte b64 quantum). */
+        enum { RAW_SLICE = 49152 }; /* 48 KB raw -> 65536 B base64 */
+        char *sbuf = KITTY_EnsureB64Buf(vdata, 65536u + 1u);
+        size_t chunk_cap_aligned = (chunk_cap / 4u) * 4u;
+        size_t raw_off = 0;
+        size_t b64_off = 0;
+        bool first = true;
+        if (!sbuf) {
+            return false;
+        }
+        if (chunk_cap_aligned < 4u) {
+            chunk_cap_aligned = 4u;
+        }
+        while (raw_off < payload_len) {
+            size_t chunk_b64_rem = b64_total - b64_off;
+            int more;
+            char header[256];
+            int header_len;
+            bool need_hdr = true;
+            if (chunk_b64_rem > chunk_cap_aligned) {
+                chunk_b64_rem = chunk_cap_aligned;
+            }
+            more = (b64_off + chunk_b64_rem < b64_total) ? 1 : 0;
+            if (first) {
+                char ctrl[192];
+                const int ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 'd', image_id,
+                                                                w, h, place_cols, place_rows,
+                                                                more != 0, extra_keys, 0, kitty_f);
+                if (ctrl_len <= 0) {
+                    return SDL_SetError("transmit header format failed");
+                }
+                header_len = SDL_snprintf(header, sizeof(header), "\033_G%s;", ctrl);
+                first = false;
+            } else {
+                header_len = SDL_snprintf(header, sizeof(header), "\033_Gm=%d;", more);
+            }
+            if (header_len <= 0) {
+                return SDL_SetError("header snprintf failed");
+            }
+            wire += (size_t)header_len + chunk_b64_rem + 2u;
+
+            while (chunk_b64_rem > 0) {
+                size_t want_b64 = chunk_b64_rem;
+                size_t raw_take;
+                size_t enc;
+                bool last_in_apc;
+                if (want_b64 > 65536u) {
+                    want_b64 = 65536u;
+                }
+                raw_take = (want_b64 / 4u) * 3u;
+                if (raw_take > payload_len - raw_off) {
+                    raw_take = payload_len - raw_off;
+                }
+                enc = KITTY_Base64Encode(payload + raw_off, raw_take, sbuf, 65536u + 1u);
+                if (enc == 0) {
+                    return SDL_SetError("base64 stream encode failed");
+                }
+                raw_off += raw_take;
+                b64_off += enc;
+                chunk_b64_rem -= enc;
+                last_in_apc = (chunk_b64_rem == 0);
+                {
+                    struct iovec iov[3];
+                    int niov = 0;
+                    if (need_hdr) {
+                        iov[niov].iov_base = header;
+                        iov[niov].iov_len = (size_t)header_len;
+                        niov++;
+                        need_hdr = false;
+                    }
+                    iov[niov].iov_base = sbuf;
+                    iov[niov].iov_len = enc;
+                    niov++;
+                    if (last_in_apc) {
+                        iov[niov].iov_base = (void *)"\033\\";
+                        iov[niov].iov_len = 2;
+                        niov++;
+                    }
+                    if (!KITTY_WritevAll(fd, iov, niov)) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
     if (out_wire_bytes) {
         *out_wire_bytes = wire;
     }
@@ -201,40 +1182,39 @@ static bool KITTY_TransmitDirectPayload(int fd, Uint32 image_id, int w, int h,
  * zlib-compress RGB/RGBA then transmit as direct a=T with o=z.
  * out_raw_bytes receives compressed payload size (pre-base64).
  */
-static bool KITTY_TransmitDirectZlib(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
+static bool KITTY_TransmitDirectZlib(SDL_VideoData *vdata, int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
                                      int place_cols, int place_rows, int kitty_f, bool home_cursor,
                                      size_t chunk_bytes, size_t *out_wire_bytes, size_t *out_raw_bytes)
 {
     const int bpp = (kitty_f == 32) ? 4 : 3;
-    const uLong raw_len = (uLong)w * (uLong)h * (uLong)bpp;
-    uLongf bound = compressBound(raw_len);
-    Uint8 *compressed = (Uint8 *)SDL_malloc((size_t)bound);
-    if (!compressed) {
+    const size_t raw_len = (size_t)w * (size_t)h * (size_t)bpp;
+    Uint8 *compressed = NULL;
+    size_t out_len = 0;
+    if (!KITTY_ZlibCompress(vdata, rgb, raw_len, &compressed, &out_len)) {
         return false;
     }
-    uLongf out_len = bound;
-    const int zerr = compress2(compressed, &out_len, rgb, raw_len, Z_BEST_SPEED);
-    if (zerr != Z_OK) {
-        SDL_free(compressed);
-        return SDL_SetError("zlib compress2 failed (%d)", zerr);
+    /* Adaptive bypass: if zlib expanded incompressible pixels, send raw without o=z. */
+    if (out_len >= raw_len) {
+        if (out_raw_bytes) {
+            *out_raw_bytes = raw_len;
+        }
+        return KITTY_TransmitDirectPayload(vdata, fd, image_id, w, h, place_cols, place_rows,
+                                           "", rgb, raw_len, kitty_f,
+                                           home_cursor, chunk_bytes, out_wire_bytes);
     }
     if (out_raw_bytes) {
-        *out_raw_bytes = (size_t)out_len; /* compressed payload size (pre-b64) */
+        *out_raw_bytes = out_len; /* compressed payload size (pre-b64) */
     }
-    {
-        const bool ok = KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows,
-                                                    "o=z", compressed, (size_t)out_len, kitty_f,
-                                                    home_cursor, chunk_bytes, out_wire_bytes);
-        SDL_free(compressed);
-        return ok;
-    }
+    return KITTY_TransmitDirectPayload(vdata, fd, image_id, w, h, place_cols, place_rows,
+                                       "o=z", compressed, out_len, kitty_f,
+                                       home_cursor, chunk_bytes, out_wire_bytes);
 }
 
 /*
  * Transmit uncompressed RGB/RGBA as direct a=T (no o=z).
  * out_raw_bytes receives the raw pixel byte count.
  */
-static bool KITTY_TransmitDirectRaw(int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
+static bool KITTY_TransmitDirectRaw(SDL_VideoData *vdata, int fd, Uint32 image_id, const Uint8 *rgb, int w, int h,
                                     int place_cols, int place_rows, int kitty_f, bool home_cursor,
                                     size_t chunk_bytes, size_t *out_wire_bytes, size_t *out_raw_bytes)
 {
@@ -243,7 +1223,7 @@ static bool KITTY_TransmitDirectRaw(int fd, Uint32 image_id, const Uint8 *rgb, i
     if (out_raw_bytes) {
         *out_raw_bytes = raw_len;
     }
-    return KITTY_TransmitDirectPayload(fd, image_id, w, h, place_cols, place_rows, "", rgb, raw_len,
+    return KITTY_TransmitDirectPayload(vdata, fd, image_id, w, h, place_cols, place_rows, "", rgb, raw_len,
                                        kitty_f, home_cursor, chunk_bytes, out_wire_bytes);
 }
 
@@ -269,11 +1249,16 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
     }
     fd = vdata->tty_fd;
 
-    SDL_snprintf(name, sizeof(name), "/sdl-kitty-%d-%u-%u", (int)getpid(), (unsigned)image_id,
+    /* Keep name well under macOS PSHMNAMLEN (31 bytes). Unique per (pid, id, seq)
+     * so skip the guaranteed-ENOENT pre-unlink unless EEXIST actually happens. */
+    SDL_snprintf(name, sizeof(name), "/sk-%x-%x-%x", (unsigned)getpid(), (unsigned)image_id,
                  (unsigned)seq);
-    shm_unlink(name);
 
     shm_fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0600);
+    if (shm_fd < 0 && errno == EEXIST) {
+        shm_unlink(name);
+        shm_fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0600);
+    }
     if (shm_fd < 0) {
         return SDL_SetError("shm_open failed: %s", strerror(errno));
     }
@@ -292,8 +1277,9 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
         char name_b64[128];
         const size_t nlen = SDL_strlen(name);
         const size_t encoded = KITTY_Base64Encode((const Uint8 *)name, nlen, name_b64, sizeof(name_b64));
-        char header[256];
-        int header_len;
+        char ctrl[192];
+        char apc[400];
+        int ctrl_len, apc_len;
 
         if (encoded == 0) {
             SDL_SetError("shm name base64 failed");
@@ -302,24 +1288,20 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
         if (home_cursor && !KITTY_WritePlaceOrigin(vdata)) {
             goto done;
         }
-        {
-            char ctrl[192];
-            const int ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 's', image_id,
-                                                            w, h, place_cols, place_rows,
-                                                            false, NULL, raw_len, kitty_f);
-            if (ctrl_len <= 0) {
-                SDL_SetError("shm header format failed");
-                goto done;
-            }
-            header_len = SDL_snprintf(header, sizeof(header), "\033_G%s;", ctrl);
-        }
-        if (header_len <= 0) {
-            SDL_SetError("shm header snprintf failed");
+        ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 's', image_id,
+                                              w, h, place_cols, place_rows,
+                                              false, NULL, raw_len, kitty_f);
+        if (ctrl_len <= 0) {
+            SDL_SetError("shm header format failed");
             goto done;
         }
-        if (!KITTY_WriteAll(fd, header, (size_t)header_len) ||
-            !KITTY_WriteAll(fd, name_b64, encoded) ||
-            !KITTY_WriteAll(fd, "\033\\", 2)) {
+        apc_len = SDL_snprintf(apc, sizeof(apc), "\033_G%s;%s\033\\", ctrl, name_b64);
+        if (apc_len <= 0 || (size_t)apc_len >= sizeof(apc)) {
+            SDL_SetError("shm apc snprintf failed");
+            goto done;
+        }
+        KITTY_FlushAsyncWriter(vdata);
+        if (!KITTY_WriteAll(fd, apc, (size_t)apc_len)) {
             goto done;
         }
         ok = true;
@@ -372,13 +1354,7 @@ static void KITTY_DrainTTY(SDL_VideoData *data)
 {
     unsigned char junk[256];
     for (;;) {
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(data->tty_in, &fds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 0;
-        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+        if (!KITTY_PollReadable(data->tty_in, 0)) {
             break;
         }
         if (read(data->tty_in, junk, sizeof(junk)) <= 0) {
@@ -406,13 +1382,7 @@ static bool KITTY_QueryPixelSizeCSI(SDL_VideoData *data)
     }
 
     for (int attempt = 0; attempt < 60 && !(got_cell && got_area); ++attempt) {
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(data->tty_in, &fds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 25000;
-        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+        if (!KITTY_PollReadable(data->tty_in, 25)) {
             continue;
         }
         {
@@ -742,6 +1712,7 @@ bool KITTY_WritePlaceOrigin(SDL_VideoData *data)
     if (!data) {
         return false;
     }
+    KITTY_FlushAsyncWriter(data);
     if (data->vp_cols > 0 && data->vp_rows > 0 && data->vp_col > 0 && data->vp_row > 0) {
         n = SDL_snprintf(buf, sizeof(buf), "\033[%d;%dH", data->vp_row, data->vp_col);
     } else {
@@ -767,6 +1738,7 @@ bool KITTY_DrawViewportChrome(SDL_VideoData *data)
     if (fd < 0) {
         return false;
     }
+    KITTY_FlushAsyncWriter(data);
 
     x0 = data->vp_col - 1;
     y0 = data->vp_row - 1;
@@ -957,13 +1929,7 @@ static void KITTY_DrainInput(SDL_VideoData *data)
      * (delete / last a=T without q=2 often arrive after restore starts). */
     for (passes = 0; passes < max_passes; ++passes) {
         for (;;) {
-            fd_set fds;
-            struct timeval tv;
-            FD_ZERO(&fds);
-            FD_SET(data->tty_in, &fds);
-            tv.tv_sec = 0;
-            tv.tv_usec = 0;
-            if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+            if (!KITTY_PollReadable(data->tty_in, 0)) {
                 break;
             }
             if (read(data->tty_in, junk, sizeof(junk)) <= 0) {
@@ -971,13 +1937,11 @@ static void KITTY_DrainInput(SDL_VideoData *data)
             }
         }
         if (passes < max_passes - 1) {
-            fd_set fds;
-            struct timeval tv;
-            FD_ZERO(&fds);
-            FD_SET(data->tty_in, &fds);
-            tv.tv_sec = 0;
-            tv.tv_usec = quiet_us;
-            if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+            int quiet_ms = (quiet_us + 999) / 1000;
+            if (quiet_ms < 1) {
+                quiet_ms = 1;
+            }
+            if (!KITTY_PollReadable(data->tty_in, quiet_ms)) {
                 break;
             }
             (void)read(data->tty_in, junk, sizeof(junk));
@@ -1017,13 +1981,7 @@ static bool KITTY_ModeRecognized(SDL_VideoData *data, int mode)
         return false;
     }
     for (int attempt = 0; attempt < 20; ++attempt) {
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(data->tty_in, &fds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 25000;
-        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+        if (!KITTY_PollReadable(data->tty_in, 25)) {
             continue;
         }
         const ssize_t n = read(data->tty_in, buf + total, sizeof(buf) - 1 - total);
@@ -1064,13 +2022,7 @@ static bool KITTY_ProbeKittyKeyboard(SDL_VideoData *data)
         return false;
     }
     for (int attempt = 0; attempt < 16; ++attempt) {
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(data->tty_in, &fds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 25000;
-        if (select(data->tty_in + 1, &fds, NULL, NULL, &tv) <= 0) {
+        if (!KITTY_PollReadable(data->tty_in, 25)) {
             continue;
         }
         {
@@ -1205,6 +2157,7 @@ void KITTY_RestoreTerminal(SDL_VideoData *data)
         "\033[<u"
         "\033[?25h";
     static const char leave_alt[] = "\033[?1049l";
+    KITTY_FlushAsyncWriter(data);
     if (!data->leave_images) {
         KITTY_DeleteAllImages(data->tty_out);
     }
@@ -1245,6 +2198,42 @@ void KITTY_RestoreTerminal(SDL_VideoData *data)
 }
 
 /*
+ * Async-signal-safe emergency restore for SIGINT/SIGTERM handlers.
+ * Uses only raw write() and tcsetattr() so Ctrl+C / kill never wedges the tty.
+ */
+void KITTY_EmergencyRestore(int tty_in, int tty_out, bool use_alt_screen, bool leave_images)
+{
+    static const char del_all[] = "\033_Ga=d,d=A,q=2\033\\";
+    static const char restore_modes[] =
+        "\033[?1016l"
+        "\033[?1006l"
+        "\033[?1003l"
+        "\033[?1002l"
+        "\033[?1000l"
+        "\033[<u"
+        "\033[?25h";
+    static const char leave_alt[] = "\033[?1049l";
+
+    if (tty_out >= 0) {
+        ssize_t r;
+        if (!leave_images) {
+            r = write(tty_out, del_all, sizeof(del_all) - 1);
+            (void)r;
+        }
+        r = write(tty_out, restore_modes, sizeof(restore_modes) - 1);
+        (void)r;
+        if (use_alt_screen) {
+            r = write(tty_out, leave_alt, sizeof(leave_alt) - 1);
+            (void)r;
+        }
+    }
+    if (KITTY_termios_saved && tty_in >= 0) {
+        (void)tcsetattr(tty_in, TCSANOW, &KITTY_saved_termios);
+        KITTY_termios_saved = false;
+    }
+}
+
+/*
  * Delete every Kitty image on fd (a=d,d=A,q=2).
  */
 bool KITTY_DeleteAllImages(int fd)
@@ -1275,7 +2264,8 @@ void KITTY_ClearOverlays(SDL_VideoData *vdata, SDL_WindowData *wdata)
     if (!wdata) {
         return;
     }
-    if (vdata) {
+    if (vdata && wdata->overlay_count > 0) {
+        KITTY_FlushAsyncWriter(vdata);
         for (i = 0; i < wdata->overlay_count; ++i) {
             if (wdata->overlay_ids[i] != 0) {
                 KITTY_DeleteImage(vdata->tty_fd, wdata->overlay_ids[i]);
@@ -1333,6 +2323,7 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
     }
 
     /* Save/restore cursor so CUP for overlays does not drift the base origin. */
+    KITTY_FlushAsyncWriter(vdata);
     if (!KITTY_WriteAll(vdata->tty_fd, "\0337", 2)) {
         return false;
     }
@@ -1356,7 +2347,7 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
     chunk_bytes = KITTY_ProfileApcChunkBytes(vdata->term_profile);
     {
         size_t wire = 0;
-        const bool ok = KITTY_TransmitDirectPayload(vdata->tty_fd, image_id, rw, rh,
+        const bool ok = KITTY_TransmitDirectPayload(vdata, vdata->tty_fd, image_id, rw, rh,
                                                    place_cols, place_rows, extra,
                                                    packed_rgb, payload_len, kitty_f,
                                                    false, chunk_bytes, &wire);
@@ -1373,7 +2364,11 @@ bool KITTY_TransmitRGBRectPlace(SDL_VideoData *vdata, Uint32 image_id,
 
 bool KITTY_EditsCompressed(const SDL_VideoData *vdata)
 {
-    const char *z = SDL_getenv("SDL_KITTY_AF_ZLIB");
+    const char *z;
+    if (vdata && vdata->cfg_cached) {
+        return vdata->cfg_af_zlib;
+    }
+    z = SDL_getenv("SDL_KITTY_AF_ZLIB");
     if (z && (z[0] == '0' || z[0] == '1') && z[1] == '\0') {
         return z[0] == '1';
     }
@@ -1412,10 +2407,11 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
 
     /* Direct a=f ceiling — huge chunks paint base64 when the host drops the APC. */
     {
-        const size_t max_direct =
-            (vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
-                ? vdata->term_profile->max_direct_bytes
-                : ((size_t)1920 * 1080 * 4);
+        const size_t max_direct = vdata->cfg_cached
+                                      ? vdata->cfg_max_direct_bytes
+                                      : ((vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
+                                             ? vdata->term_profile->max_direct_bytes
+                                             : ((size_t)1920 * 1080 * 4));
         if (payload_len > max_direct) {
             return SDL_SetError(
                 "kitty: refusing direct a=f of %dx%d (~%zu bytes); use smaller FB or SHM full present",
@@ -1426,89 +2422,269 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     /* Compress the edit (o=z) where the terminal shows compressed edits, as full a=T does with
      * prefer_zlib. A desktop's changed rectangles are mostly text and flat colour, which zlib shrinks
      * several times over. */
-    zlib_edit = KITTY_EditsCompressed(vdata);
+    zlib_edit = KITTY_EditsCompressed(vdata) && payload_len > 48u;
     if (zlib_edit) {
-        uLongf out_len = compressBound((uLong)payload_len);
-        compressed = (Uint8 *)SDL_malloc(out_len);
-        if (!compressed) {
+        size_t zlen = 0;
+        if (!KITTY_ZlibCompress(vdata, packed_rgb, payload_len, &compressed, &zlen)) {
             return false;
         }
-        if (compress2(compressed, &out_len, packed_rgb, (uLong)payload_len, Z_BEST_SPEED) != Z_OK) {
-            SDL_free(compressed);
-            return SDL_SetError("zlib compress2 failed for a=f");
+        if (zlen < payload_len) {
+            body = compressed;
+            body_len = zlen;
+        } else {
+            zlib_edit = false;
         }
-        body = compressed;
-        body_len = (size_t)out_len;
     }
 
     b64_len = ((body_len + 2) / 3) * 4;
-    b64 = (char *)SDL_malloc(b64_len + 1);
-    if (!b64) {
-        SDL_free(compressed);
+    {
+        const size_t chunk_cap = vdata->cfg_cached
+                                     ? vdata->cfg_apc_chunk_bytes
+                                     : KITTY_ProfileApcChunkBytes(vdata->term_profile);
+
+        if (b64_len <= KITTY_ASYNC_MAX_BYTES && b64_len <= chunk_cap) {
+            KITTY_AsyncWriter *aw = KITTY_GetAsyncWriter(vdata);
+            if (aw) {
+                char header[160];
+                const int header_len = SDL_snprintf(header, sizeof(header),
+                                                    "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
+                                                    kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id,
+                                                    x, y, rw, rh);
+                size_t add;
+                char *dst;
+                size_t wire;
+                if (header_len <= 0) {
+                    return SDL_SetError("frame-edit header snprintf failed");
+                }
+                add = (size_t)header_len + b64_len + 2u;
+                if (aw->batching && aw->stage_len + add > KITTY_ASYNC_MAX_BYTES && aw->stage_len > 0) {
+                    if (!KITTY_AsyncSubmitStage(aw, vdata->tty_fd, aw->stage_len)) {
+                        return SDL_SetError("kitty async rect-edit flush failed");
+                    }
+                }
+                {
+                    const size_t base = aw->batching ? aw->stage_len : 0u;
+                    dst = KITTY_AsyncEnsureStage(aw, base + add + 1u);
+                    if (!dst) {
+                        return false;
+                    }
+                    dst += base;
+                    SDL_memcpy(dst, header, (size_t)header_len);
+                    encoded = KITTY_Base64Encode(body, body_len, dst + header_len, b64_len + 1u);
+                    if (encoded == 0) {
+                        return SDL_SetError("base64 encode failed");
+                    }
+                    dst[(size_t)header_len + encoded] = '\033';
+                    dst[(size_t)header_len + encoded + 1u] = '\\';
+                    wire = (size_t)header_len + encoded + 2u;
+                    if (aw->batching) {
+                        aw->stage_len = base + wire;
+                    } else if (!KITTY_AsyncSubmitStage(aw, vdata->tty_fd, wire)) {
+                        return SDL_SetError("kitty async rect-edit write failed");
+                    }
+                }
+                vdata->last_wire_bytes += wire;
+                vdata->last_raw_bytes += payload_len;
+                vdata->last_ms_ack = -1.0;
+                vdata->total_wire_bytes += wire;
+                vdata->wire_presents += 1;
+                return true;
+            }
+        }
+
+        KITTY_FlushAsyncWriter(vdata);
+
+        b64 = KITTY_EnsureB64Buf(vdata, b64_len + 1);
+        if (!b64) {
+            return false;
+        }
+        encoded = KITTY_Base64Encode(body, body_len, b64, b64_len + 1);
+        if (encoded == 0) {
+            return SDL_SetError("base64 encode failed");
+        }
+
+        /* Edit root frame in place — do not home cursor or re-place. */
+        {
+            size_t wire = 0;
+            const Uint64 t0 = SDL_GetTicksNS();
+
+            while (offset < encoded) {
+                size_t chunk = encoded - offset;
+                char header[256];
+                int header_len;
+                int more;
+                if (chunk > chunk_cap) {
+                    chunk = chunk_cap;
+                }
+                more = (offset + chunk < encoded) ? 1 : 0;
+                if (first) {
+                    /* r=1 edits root; X=1 overwrite; q=2 quiet (no APC OK). */
+                    header_len = SDL_snprintf(header, sizeof(header),
+                                              "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2%s;",
+                                              kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id, x, y, rw, rh,
+                                              more ? ",m=1" : "");
+                    first = false;
+                } else {
+                    header_len = SDL_snprintf(header, sizeof(header), "\033_Ga=f,m=%d;", more);
+                }
+                if (header_len <= 0) {
+                    return SDL_SetError("frame-edit header snprintf failed");
+                }
+                {
+                    struct iovec iov[3];
+                    iov[0].iov_base = header;
+                    iov[0].iov_len = (size_t)header_len;
+                    iov[1].iov_base = b64 + offset;
+                    iov[1].iov_len = chunk;
+                    iov[2].iov_base = (void *)"\033\\";
+                    iov[2].iov_len = 2;
+                    if (!KITTY_WritevAll(vdata->tty_fd, iov, 3)) {
+                        return false;
+                    }
+                }
+                wire += (size_t)header_len + chunk + 2;
+                offset += chunk;
+            }
+
+            {
+                const Uint64 t1 = SDL_GetTicksNS();
+                const double ms = (double)(t1 - t0) / 1000000.0;
+                /* Accumulate: framebuffer zeros last_* at present start (multi a=f). */
+                vdata->last_wire_bytes += wire;
+                vdata->last_raw_bytes += payload_len;
+                vdata->last_ms_tx += ms;
+                vdata->last_ms_ack = -1.0;
+                vdata->total_wire_bytes += wire;
+                vdata->total_ms_tx += ms;
+                vdata->wire_presents += 1;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
+                                 const Uint8 *rgb_scratch, int fb_w, int fb_h,
+                                 const SDL_Rect *rects, int n_rects, int kitty_f,
+                                 size_t *out_upload_px)
+{
+#ifdef __APPLE__
+    KITTY_MultiRectCtx *ctx;
+    KITTY_AsyncWriter *aw;
+    SDL_Rect fb;
+    int valid_n = 0;
+    size_t total_px = 0;
+    size_t total_wire = 0;
+    size_t total_raw = 0;
+    int i;
+    char *dst;
+
+    if (!vdata || !rgb_scratch || !rects || image_id == 0 ||
+        fb_w <= 0 || fb_h <= 0 || n_rects < 3 || n_rects > KITTY_MR_MAX) {
         return false;
     }
-    encoded = KITTY_Base64Encode(body, body_len, b64, b64_len + 1);
-    SDL_free(compressed);
-    if (encoded == 0) {
-        SDL_free(b64);
-        return SDL_SetError("base64 encode failed");
+    if (kitty_f != 24 && kitty_f != 32) {
+        kitty_f = 24;
+    }
+    if (!KITTY_EditsCompressed(vdata)) {
+        return false;
     }
 
-    /* Edit root frame in place — do not home cursor or re-place. */
+    ctx = (KITTY_MultiRectCtx *)vdata->tx_mr_ctx;
+    if (!ctx) {
+        ctx = (KITTY_MultiRectCtx *)SDL_calloc(1, sizeof(KITTY_MultiRectCtx));
+        if (!ctx) {
+            return false;
+        }
+        vdata->tx_mr_ctx = ctx;
+    }
+
+    fb.x = 0;
+    fb.y = 0;
+    fb.w = fb_w;
+    fb.h = fb_h;
+    for (i = 0; i < n_rects; ++i) {
+        SDL_Rect c;
+        if (!SDL_GetRectIntersection(&rects[i], &fb, &c) || c.w <= 0 || c.h <= 0) {
+            continue;
+        }
+        ctx->slots[valid_n].rect = c;
+        total_px += (size_t)c.w * (size_t)c.h;
+        valid_n++;
+    }
+    if (valid_n < 3 || total_px < 4096u) {
+        return false;
+    }
+
+    ctx->rgb_scratch = rgb_scratch;
+    ctx->fb_w = fb_w;
+    ctx->fb_h = fb_h;
+    ctx->kitty_f = kitty_f;
+    ctx->image_id = image_id;
+    ctx->chunk_cap = vdata->cfg_cached
+                         ? vdata->cfg_apc_chunk_bytes
+                         : KITTY_ProfileApcChunkBytes(vdata->term_profile);
+    ctx->zlevel = (vdata->cfg_zlib_level >= 1 && vdata->cfg_zlib_level <= 9)
+                      ? vdata->cfg_zlib_level
+                      : Z_BEST_SPEED;
+    ctx->want_zlib = true;
+
+    dispatch_apply_f((size_t)valid_n,
+                     dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                     ctx, KITTY_MultiRectWorker);
+
+    for (i = 0; i < valid_n; ++i) {
+        if (!ctx->slots[i].ok) {
+            return false;
+        }
+        total_wire += ctx->slots[i].wire_len;
+        total_raw += ctx->slots[i].raw_len;
+    }
+    if (total_wire == 0 || total_wire > KITTY_ASYNC_MAX_BYTES) {
+        return false;
+    }
+
+    aw = KITTY_GetAsyncWriter(vdata);
+    if (!aw) {
+        return false;
+    }
+    dst = KITTY_AsyncEnsureStage(aw, total_wire + 1u);
+    if (!dst) {
+        return false;
+    }
     {
-        const size_t chunk_cap = KITTY_ProfileApcChunkBytes(vdata->term_profile);
-        size_t wire = 0;
-        const Uint64 t0 = SDL_GetTicksNS();
-
-        while (offset < encoded) {
-            size_t chunk = encoded - offset;
-            char header[256];
-            int header_len;
-            int more;
-            if (chunk > chunk_cap) {
-                chunk = chunk_cap;
-            }
-            more = (offset + chunk < encoded) ? 1 : 0;
-            if (first) {
-                /* r=1 edits root; X=1 overwrite; q=2 quiet (no APC OK). */
-                header_len = SDL_snprintf(header, sizeof(header),
-                                          "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2%s;",
-                                          kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id, x, y, rw, rh,
-                                          more ? ",m=1" : "");
-                first = false;
-            } else {
-                header_len = SDL_snprintf(header, sizeof(header), "\033_Ga=f,m=%d;", more);
-            }
-            if (header_len <= 0) {
-                SDL_free(b64);
-                return SDL_SetError("frame-edit header snprintf failed");
-            }
-            if (!KITTY_WriteAll(vdata->tty_fd, header, (size_t)header_len) ||
-                !KITTY_WriteAll(vdata->tty_fd, b64 + offset, chunk) ||
-                !KITTY_WriteAll(vdata->tty_fd, "\033\\", 2)) {
-                SDL_free(b64);
-                return false;
-            }
-            wire += (size_t)header_len + chunk + 2;
-            offset += chunk;
-        }
-
-        {
-            const Uint64 t1 = SDL_GetTicksNS();
-            const double ms = (double)(t1 - t0) / 1000000.0;
-            /* Accumulate: framebuffer zeros last_* at present start (multi a=f). */
-            vdata->last_wire_bytes += wire;
-            vdata->last_raw_bytes += payload_len;
-            vdata->last_ms_tx += ms;
-            vdata->last_ms_ack = -1.0;
-            vdata->total_wire_bytes += wire;
-            vdata->total_ms_tx += ms;
-            vdata->wire_presents += 1;
+        size_t pos = 0;
+        for (i = 0; i < valid_n; ++i) {
+            SDL_memcpy(dst + pos, ctx->slots[i].apc_buf, ctx->slots[i].wire_len);
+            pos += ctx->slots[i].wire_len;
         }
     }
+    if (!KITTY_AsyncSubmitStage(aw, vdata->tty_fd, total_wire)) {
+        return false;
+    }
 
-    SDL_free(b64);
+    vdata->last_wire_bytes += total_wire;
+    vdata->last_raw_bytes += total_raw;
+    vdata->last_ms_ack = -1.0;
+    vdata->total_wire_bytes += total_wire;
+    vdata->wire_presents += (Uint32)valid_n;
+    if (out_upload_px) {
+        *out_upload_px = total_px;
+    }
     return true;
+#else
+    (void)vdata;
+    (void)image_id;
+    (void)rgb_scratch;
+    (void)fb_w;
+    (void)fb_h;
+    (void)rects;
+    (void)n_rects;
+    (void)kitty_f;
+    (void)out_upload_px;
+    return false;
+#endif
 }
 
 /*
@@ -1562,14 +2738,16 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
         kitty_f = 24;
     }
 
-    const char *force = SDL_getenv("SDL_KITTY_TRANSMIT");
-    if (force) {
-        if (SDL_strcasecmp(force, "direct") == 0) {
-            vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
-        } else if (SDL_strcasecmp(force, "zlib") == 0) {
-            vdata->transmit_mode = KITTY_TRANSMIT_DIRECT_ZLIB;
-        } else if (SDL_strcasecmp(force, "shm") == 0) {
-            vdata->transmit_mode = KITTY_TRANSMIT_SHM;
+    if (!vdata->cfg_cached) {
+        const char *force = SDL_getenv("SDL_KITTY_TRANSMIT");
+        if (force) {
+            if (SDL_strcasecmp(force, "direct") == 0) {
+                vdata->transmit_mode = KITTY_TRANSMIT_DIRECT;
+            } else if (SDL_strcasecmp(force, "zlib") == 0) {
+                vdata->transmit_mode = KITTY_TRANSMIT_DIRECT_ZLIB;
+            } else if (SDL_strcasecmp(force, "shm") == 0) {
+                vdata->transmit_mode = KITTY_TRANSMIT_SHM;
+            }
         }
     }
 
@@ -1602,10 +2780,14 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
              * tty when the host rejects/drops the APC (seen with dvd_sprite on
              * Kitty.app at ~3360x2100 after SHM failure). Refuse giant direct;
              * ceiling comes from the host profile (docs/terminals.md). */
-            const size_t max_direct =
-                (vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
-                    ? vdata->term_profile->max_direct_bytes
-                    : ((size_t)1920 * 1080 * 4);
+            const size_t max_direct = vdata->cfg_cached
+                                          ? vdata->cfg_max_direct_bytes
+                                          : ((vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
+                                                 ? vdata->term_profile->max_direct_bytes
+                                                 : ((size_t)1920 * 1080 * 4));
+            const size_t apc_chunk = vdata->cfg_cached
+                                         ? vdata->cfg_apc_chunk_bytes
+                                         : KITTY_ProfileApcChunkBytes(vdata->term_profile);
 
             if (vdata->transmit_mode == KITTY_TRANSMIT_SHM && !vdata->shm_failed) {
                 if (KITTY_TransmitShm(vdata, image_id, rgb, w, h, place_cols, place_rows, kitty_f,
@@ -1647,9 +2829,9 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
             }
 
             if (!ok && vdata->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
-                if (KITTY_TransmitDirectZlib(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
+                if (KITTY_TransmitDirectZlib(vdata, vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
                                              kitty_f, home_cursor,
-                                             KITTY_ProfileApcChunkBytes(vdata->term_profile),
+                                             apc_chunk,
                                              &wire_bytes, &raw_bytes)) {
                     ok = true;
                 } else {
@@ -1665,9 +2847,9 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
                         "set SDL_KITTY_FB_MAX=1280x720 or fix SHM",
                         (size_t)w, (size_t)h, raw_len);
                 }
-                ok = KITTY_TransmitDirectRaw(vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
+                ok = KITTY_TransmitDirectRaw(vdata, vdata->tty_fd, image_id, rgb, w, h, place_cols, place_rows,
                                              kitty_f, home_cursor,
-                                             KITTY_ProfileApcChunkBytes(vdata->term_profile),
+                                             apc_chunk,
                                              &wire_bytes, &raw_bytes);
             }
         }
@@ -1690,10 +2872,15 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
             /* Optional host round-trip: wait for Gi=<id>;OK after a=T.
              * Compile with -DSDL_KITTY_PERF_ACK=ON; then SDL_KITTY_PERF_ACK=1 at run. */
             {
-                const char *ack_env = SDL_getenv("SDL_KITTY_PERF_ACK");
-                if (ack_env && (ack_env[0] == '1' || SDL_strcasecmp(ack_env, "true") == 0 ||
-                                SDL_strcasecmp(ack_env, "yes") == 0 ||
-                                SDL_strcasecmp(ack_env, "on") == 0)) {
+                bool want_ack = vdata->cfg_cached ? vdata->cfg_perf_ack : false;
+                if (!vdata->cfg_cached) {
+                    const char *ack_env = SDL_getenv("SDL_KITTY_PERF_ACK");
+                    want_ack = (ack_env && (ack_env[0] == '1' || SDL_strcasecmp(ack_env, "true") == 0 ||
+                                            SDL_strcasecmp(ack_env, "yes") == 0 ||
+                                            SDL_strcasecmp(ack_env, "on") == 0));
+                }
+                if (want_ack) {
+                    KITTY_FlushAsyncWriter(vdata);
                     const Uint64 a0 = SDL_GetTicksNS();
                     const KITTY_GraphicsQueryStatus st =
                         KITTY_AwaitGraphicsAck(vdata->tty_in, image_id, 100);

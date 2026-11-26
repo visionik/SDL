@@ -101,6 +101,23 @@ bool KITTY_EnableMouse(SDL_VideoData *data);
 void KITTY_RestoreTerminal(SDL_VideoData *data);
 
 /*
+ * Async-signal-safe terminal restore for SIGINT/SIGTERM handlers: writes
+ * mode-reset escapes and restores saved termios without allocating or logging.
+ */
+void KITTY_EmergencyRestore(int tty_in, int tty_out, bool use_alt_screen, bool leave_images);
+
+/* Free persistent transmit scratch buffers and reusable z_stream on vdata. */
+void KITTY_FreeTransmitBuffers(SDL_VideoData *vdata);
+
+/* Wait for any in-flight pipelined async PTY write to finish (ordering barrier). */
+void KITTY_FlushAsyncWriter(SDL_VideoData *vdata);
+
+/* Coalesce multi-rect a=f APCs into the async writer stage buffer for one submit/frame. */
+void KITTY_BeginAsyncBatch(SDL_VideoData *vdata);
+bool KITTY_CommitAsyncBatch(SDL_VideoData *vdata);
+void KITTY_CancelAsyncBatch(SDL_VideoData *vdata);
+
+/*
  * Full-frame transmit+place (a=T): SHM, zlib direct, or raw base64 per
  * vdata->transmit_mode / SDL_KITTY_TRANSMIT. kitty_f: 24 (RGB) or 32 (RGBA).
  */
@@ -122,6 +139,15 @@ bool KITTY_EditsCompressed(const SDL_VideoData *vdata);
  */
 bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                                const Uint8 *packed_rgb, int x, int y, int rw, int rh, int kitty_f);
+
+/*
+ * Parallel multi-rect a=f pack + zlib + base64 + single async submit.
+ * Returns true if all clipped rects were transmitted; false to fall back.
+ */
+bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
+                                 const Uint8 *rgb_scratch, int fb_w, int fb_h,
+                                 const SDL_Rect *rects, int n_rects, int kitty_f,
+                                 size_t *out_upload_px);
 
 /*
  * Transmit+place a packed rect as its own image at a 1-based CSI CUP cell.
