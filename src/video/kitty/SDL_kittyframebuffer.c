@@ -138,6 +138,7 @@ bool SDL_KITTY_CreateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
 
     if (wdata) {
         KITTY_FreeRGBScratch(wdata);
+        wdata->fb_surface = surface;
     }
 
     SDL_SetSurfaceProperty(SDL_GetWindowProperties(window), KITTY_SURFACE, surface);
@@ -169,12 +170,16 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
     size_t upload_px;
     Uint8 *packed = NULL;
 
-    surface = (SDL_Surface *)SDL_GetPointerProperty(SDL_GetWindowProperties(window), KITTY_SURFACE, NULL);
-    if (!surface) {
-        return SDL_SetError("Couldn't find kitty surface for window");
-    }
     if (!vdata || !wdata) {
         return SDL_SetError("kitty video/window data missing");
+    }
+    surface = wdata->fb_surface;
+    if (!surface) {
+        surface = (SDL_Surface *)SDL_GetPointerProperty(SDL_GetWindowProperties(window), KITTY_SURFACE, NULL);
+        if (!surface) {
+            return SDL_SetError("Couldn't find kitty surface for window");
+        }
+        wdata->fb_surface = surface;
     }
 
     /* Card viewport still clamped to a stub grid (e.g. 80×24 while req is
@@ -957,6 +962,7 @@ void SDL_KITTY_DestroyWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *wind
     SDL_WindowData *wdata = window ? (SDL_WindowData *)window->internal : NULL;
     (void)_this;
     if (wdata) {
+        wdata->fb_surface = NULL;
         KITTY_FreeRGBScratch(wdata);
     }
     SDL_ClearProperty(SDL_GetWindowProperties(window), KITTY_SURFACE);

@@ -210,6 +210,8 @@ typedef struct SDL_WindowData
     /* Persistent grow-only scratch for packed dirty-rect uploads. */
     Uint8 *pack_scratch;
     size_t pack_scratch_cap;
+    /* Cached window framebuffer surface (avoids per-frame property RWLock + hash). */
+    SDL_Surface *fb_surface;
 } SDL_WindowData;
 
 #endif // SDL_kittyvideo_h_

@@ -382,51 +382,57 @@ int KITTY_CoalesceRects(int fb_w, int fb_h, const SDL_Rect *in, int n_in,
     }
 
     for (i = 0; i < n_in && n < (int)(sizeof(tmp) / sizeof(tmp[0])); ++i) {
-        SDL_Rect fb = { 0, 0, fb_w, fb_h };
-        SDL_Rect clipped;
-        if (!SDL_GetRectIntersection(&in[i], &fb, &clipped) ||
-            clipped.w <= 0 || clipped.h <= 0) {
+        int x0 = in[i].x;
+        int y0 = in[i].y;
+        int x1 = x0 + in[i].w;
+        int y1 = y0 + in[i].h;
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > fb_w) { x1 = fb_w; }
+        if (y1 > fb_h) { y1 = fb_h; }
+        if (x1 <= x0 || y1 <= y0) {
             continue;
         }
-        tmp[n++] = clipped;
+        tmp[n].x = x0;
+        tmp[n].y = y0;
+        tmp[n].w = x1 - x0;
+        tmp[n].h = y1 - y0;
+        n++;
     }
     if (n == 0) {
         return 0;
     }
 
-    /* Iteratively union near/overlapping pairs until stable. */
+    /* Iteratively union near/overlapping pairs using direct integer bounds. */
     do {
         merged = false;
         for (i = 0; i < n; ++i) {
-            int j;
-            for (j = i + 1; j < n; ++j) {
-                SDL_Rect expanded = {
-                    tmp[i].x - gap_px,
-                    tmp[i].y - gap_px,
-                    tmp[i].w + 2 * gap_px,
-                    tmp[i].h + 2 * gap_px
-                };
-                if (SDL_HasRectIntersection(&expanded, &tmp[j])) {
-                    const int x0 = tmp[i].x < tmp[j].x ? tmp[i].x : tmp[j].x;
-                    const int y0 = tmp[i].y < tmp[j].y ? tmp[i].y : tmp[j].y;
-                    const int x1 = (tmp[i].x + tmp[i].w) > (tmp[j].x + tmp[j].w)
-                                       ? (tmp[i].x + tmp[i].w)
-                                       : (tmp[j].x + tmp[j].w);
-                    const int y1 = (tmp[i].y + tmp[i].h) > (tmp[j].y + tmp[j].h)
-                                       ? (tmp[i].y + tmp[i].h)
-                                       : (tmp[j].y + tmp[j].h);
-                    tmp[i].x = x0;
-                    tmp[i].y = y0;
-                    tmp[i].w = x1 - x0;
-                    tmp[i].h = y1 - y0;
+            int j = i + 1;
+            int ax0 = tmp[i].x;
+            int ay0 = tmp[i].y;
+            int ax1 = ax0 + tmp[i].w;
+            int ay1 = ay0 + tmp[i].h;
+            while (j < n) {
+                const int bx0 = tmp[j].x;
+                const int by0 = tmp[j].y;
+                const int bx1 = bx0 + tmp[j].w;
+                const int by1 = by0 + tmp[j].h;
+                if (ax0 - gap_px < bx1 && ax1 + gap_px > bx0 &&
+                    ay0 - gap_px < by1 && ay1 + gap_px > by0) {
+                    if (bx0 < ax0) { ax0 = bx0; }
+                    if (by0 < ay0) { ay0 = by0; }
+                    if (bx1 > ax1) { ax1 = bx1; }
+                    if (by1 > ay1) { ay1 = by1; }
+                    tmp[i].x = ax0;
+                    tmp[i].y = ay0;
+                    tmp[i].w = ax1 - ax0;
+                    tmp[i].h = ay1 - ay0;
                     tmp[j] = tmp[n - 1];
                     n--;
                     merged = true;
-                    break;
+                } else {
+                    j++;
                 }
-            }
-            if (merged) {
-                break;
             }
         }
     } while (merged && n > 1);
@@ -516,6 +522,28 @@ static size_t KITTY_FindFirstDiff(const Uint8 *a, const Uint8 *b, size_t len)
 {
     size_t i = 0;
 #ifdef KITTY_HAVE_NEON_LE
+    while (i + 128u <= len) {
+        const uint8x16_t d0 = veorq_u8(vld1q_u8(a + i), vld1q_u8(b + i));
+        const uint8x16_t d1 = veorq_u8(vld1q_u8(a + i + 16), vld1q_u8(b + i + 16));
+        const uint8x16_t d2 = veorq_u8(vld1q_u8(a + i + 32), vld1q_u8(b + i + 32));
+        const uint8x16_t d3 = veorq_u8(vld1q_u8(a + i + 48), vld1q_u8(b + i + 48));
+        const uint8x16_t d4 = veorq_u8(vld1q_u8(a + i + 64), vld1q_u8(b + i + 64));
+        const uint8x16_t d5 = veorq_u8(vld1q_u8(a + i + 80), vld1q_u8(b + i + 80));
+        const uint8x16_t d6 = veorq_u8(vld1q_u8(a + i + 96), vld1q_u8(b + i + 96));
+        const uint8x16_t d7 = veorq_u8(vld1q_u8(a + i + 112), vld1q_u8(b + i + 112));
+        const uint8x16_t lo = vorrq_u8(vorrq_u8(d0, d1), vorrq_u8(d2, d3));
+        const uint8x16_t hi = vorrq_u8(vorrq_u8(d4, d5), vorrq_u8(d6, d7));
+        if (vmaxvq_u32(vreinterpretq_u32_u8(vorrq_u8(lo, hi))) != 0) {
+            if (vmaxvq_u32(vreinterpretq_u32_u8(lo)) == 0) {
+                i += 64u;
+            }
+            while (i < len && a[i] == b[i]) {
+                i++;
+            }
+            return i;
+        }
+        i += 128u;
+    }
     while (i + 64u <= len) {
         const uint8x16_t d0 = veorq_u8(vld1q_u8(a + i), vld1q_u8(b + i));
         const uint8x16_t d1 = veorq_u8(vld1q_u8(a + i + 16), vld1q_u8(b + i + 16));
