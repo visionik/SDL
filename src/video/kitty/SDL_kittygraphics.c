@@ -520,8 +520,9 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
 }
 
 /*
- * Chunked direct (t=d) a=T transmit: base64-encode payload, optionally
- * home with CSI CUP, then write APC chunks sized by chunk_bytes.
+ * Chunked direct (t=d) a=T transmit: stream-encode base64 in L1/L2-friendly
+ * 48 KB raw -> 64 KB b64 blocks directly to the tty so the terminal reader
+ * starts draining immediately while keeping exact APC chunk_cap boundaries.
  * extra_keys may add o=z or overlay z/X/Y. out_wire_bytes gets bytes sent.
  */
 static bool KITTY_TransmitDirectPayload(SDL_VideoData *vdata, int fd, Uint32 image_id, int w, int h,
@@ -532,15 +533,11 @@ static bool KITTY_TransmitDirectPayload(SDL_VideoData *vdata, int fd, Uint32 ima
                                         size_t chunk_bytes,
                                         size_t *out_wire_bytes)
 {
-    const size_t b64_len = ((payload_len + 2) / 3) * 4;
+    const size_t b64_total = ((payload_len + 2u) / 3u) * 4u;
     const size_t chunk_cap = chunk_bytes > 0 ? chunk_bytes : KITTY_CHUNK_DEFAULT;
     size_t wire = 0;
-    char *b64 = KITTY_EnsureB64Buf(vdata, b64_len + 1);
-    if (!b64) {
-        return false;
-    }
-    const size_t encoded = KITTY_Base64Encode(payload, payload_len, b64, b64_len + 1);
-    if (encoded == 0) {
+
+    if (payload_len == 0) {
         return SDL_SetError("base64 encode failed");
     }
 
@@ -553,48 +550,148 @@ static bool KITTY_TransmitDirectPayload(SDL_VideoData *vdata, int fd, Uint32 ima
         wire += 3;
     }
 
-    size_t offset = 0;
-    bool first = true;
-    while (offset < encoded) {
-        size_t chunk = encoded - offset;
-        if (chunk > chunk_cap) {
-            chunk = chunk_cap;
+    /* Small payloads (e.g. zlib-compressed frames <= 192 KB) fit in L2 and
+     * go out in a single writev() call; large raw payloads stream in 48 KB raw
+     * -> 64 KB b64 blocks so encoding overlaps PTY drain and avoids a multi-MB
+     * b64 scratch buffer. */
+    if (b64_total <= 196608u) {
+        char *b64 = KITTY_EnsureB64Buf(vdata, b64_total + 1u);
+        size_t encoded;
+        size_t offset = 0;
+        bool first = true;
+        if (!b64) {
+            return false;
         }
-        const int more = (offset + chunk < encoded) ? 1 : 0;
-        char header[256];
-        int header_len;
-        if (first) {
-            /* c/r stretch when place_cols/rows set; C=1/N=1/p=1 via formatter.
-             * Rex: omit m=0 on single-chunk; omit q=2. extra_keys e.g. "o=z". */
-            char ctrl[192];
-            const int ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 'd', image_id,
-                                                            w, h, place_cols, place_rows,
-                                                            more != 0, extra_keys, 0, kitty_f);
-            if (ctrl_len <= 0) {
-                return SDL_SetError("transmit header format failed");
+        encoded = KITTY_Base64Encode(payload, payload_len, b64, b64_total + 1u);
+        if (encoded == 0) {
+            return SDL_SetError("base64 encode failed");
+        }
+        while (offset < encoded) {
+            size_t chunk = encoded - offset;
+            int more;
+            char header[256];
+            int header_len;
+            if (chunk > chunk_cap) {
+                chunk = chunk_cap;
             }
-            header_len = SDL_snprintf(header, sizeof(header), "\033_G%s;", ctrl);
-            first = false;
-        } else {
-            header_len = SDL_snprintf(header, sizeof(header), "\033_Gm=%d;", more);
+            more = (offset + chunk < encoded) ? 1 : 0;
+            if (first) {
+                char ctrl[192];
+                const int ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 'd', image_id,
+                                                                w, h, place_cols, place_rows,
+                                                                more != 0, extra_keys, 0, kitty_f);
+                if (ctrl_len <= 0) {
+                    return SDL_SetError("transmit header format failed");
+                }
+                header_len = SDL_snprintf(header, sizeof(header), "\033_G%s;", ctrl);
+                first = false;
+            } else {
+                header_len = SDL_snprintf(header, sizeof(header), "\033_Gm=%d;", more);
+            }
+            if (header_len <= 0) {
+                return SDL_SetError("header snprintf failed");
+            }
+            {
+                struct iovec iov[3];
+                iov[0].iov_base = header;
+                iov[0].iov_len = (size_t)header_len;
+                iov[1].iov_base = b64 + offset;
+                iov[1].iov_len = chunk;
+                iov[2].iov_base = (void *)"\033\\";
+                iov[2].iov_len = 2;
+                if (!KITTY_WritevAll(fd, iov, 3)) {
+                    return false;
+                }
+            }
+            wire += (size_t)header_len + chunk + 2u;
+            offset += chunk;
         }
-        if (header_len <= 0) {
-            return SDL_SetError("header snprintf failed");
+    } else {
+        /* Stream base64 in 48 KB raw (64 KB b64) L1/L2-friendly slices while
+         * respecting chunk_cap APC boundaries (aligned to 4-byte b64 quantum). */
+        enum { RAW_SLICE = 49152 }; /* 48 KB raw -> 65536 B base64 */
+        char *sbuf = KITTY_EnsureB64Buf(vdata, 65536u + 1u);
+        size_t chunk_cap_aligned = (chunk_cap / 4u) * 4u;
+        size_t raw_off = 0;
+        size_t b64_off = 0;
+        bool first = true;
+        if (!sbuf) {
+            return false;
         }
-        {
-            struct iovec iov[3];
-            iov[0].iov_base = header;
-            iov[0].iov_len = (size_t)header_len;
-            iov[1].iov_base = b64 + offset;
-            iov[1].iov_len = chunk;
-            iov[2].iov_base = (void *)"\033\\";
-            iov[2].iov_len = 2;
-            if (!KITTY_WritevAll(fd, iov, 3)) {
-                return false;
+        if (chunk_cap_aligned < 4u) {
+            chunk_cap_aligned = 4u;
+        }
+        while (raw_off < payload_len) {
+            size_t chunk_b64_rem = b64_total - b64_off;
+            int more;
+            char header[256];
+            int header_len;
+            bool need_hdr = true;
+            if (chunk_b64_rem > chunk_cap_aligned) {
+                chunk_b64_rem = chunk_cap_aligned;
+            }
+            more = (b64_off + chunk_b64_rem < b64_total) ? 1 : 0;
+            if (first) {
+                char ctrl[192];
+                const int ctrl_len = KITTY_FormatTransmitHeader(ctrl, sizeof(ctrl), 'd', image_id,
+                                                                w, h, place_cols, place_rows,
+                                                                more != 0, extra_keys, 0, kitty_f);
+                if (ctrl_len <= 0) {
+                    return SDL_SetError("transmit header format failed");
+                }
+                header_len = SDL_snprintf(header, sizeof(header), "\033_G%s;", ctrl);
+                first = false;
+            } else {
+                header_len = SDL_snprintf(header, sizeof(header), "\033_Gm=%d;", more);
+            }
+            if (header_len <= 0) {
+                return SDL_SetError("header snprintf failed");
+            }
+            wire += (size_t)header_len + chunk_b64_rem + 2u;
+
+            while (chunk_b64_rem > 0) {
+                size_t want_b64 = chunk_b64_rem;
+                size_t raw_take;
+                size_t enc;
+                bool last_in_apc;
+                if (want_b64 > 65536u) {
+                    want_b64 = 65536u;
+                }
+                raw_take = (want_b64 / 4u) * 3u;
+                if (raw_take > payload_len - raw_off) {
+                    raw_take = payload_len - raw_off;
+                }
+                enc = KITTY_Base64Encode(payload + raw_off, raw_take, sbuf, 65536u + 1u);
+                if (enc == 0) {
+                    return SDL_SetError("base64 stream encode failed");
+                }
+                raw_off += raw_take;
+                b64_off += enc;
+                chunk_b64_rem -= enc;
+                last_in_apc = (chunk_b64_rem == 0);
+                {
+                    struct iovec iov[3];
+                    int niov = 0;
+                    if (need_hdr) {
+                        iov[niov].iov_base = header;
+                        iov[niov].iov_len = (size_t)header_len;
+                        niov++;
+                        need_hdr = false;
+                    }
+                    iov[niov].iov_base = sbuf;
+                    iov[niov].iov_len = enc;
+                    niov++;
+                    if (last_in_apc) {
+                        iov[niov].iov_base = (void *)"\033\\";
+                        iov[niov].iov_len = 2;
+                        niov++;
+                    }
+                    if (!KITTY_WritevAll(fd, iov, niov)) {
+                        return false;
+                    }
+                }
             }
         }
-        wire += (size_t)header_len + chunk + 2;
-        offset += chunk;
     }
 
     if (out_wire_bytes) {
