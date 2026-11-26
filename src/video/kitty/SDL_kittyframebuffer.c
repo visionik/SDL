@@ -35,6 +35,7 @@
 #include "../SDL_sysvideo.h"
 #include "SDL_kittyframebuffer_c.h"
 #include "SDL_kittygraphics.h"
+#include "SDL_kittyoverlay.h"
 #include "SDL_kittyprobe.h"
 #include "SDL_kittyprofile.h"
 #include "SDL_kittyrect.h"
@@ -216,11 +217,22 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         bool upload_skip_enabled = false;
         bool have_pre_hash = false;
         bool single_prepacked = false;
+        bool ov_active = false;
+        bool ov_needs_redraw = false;
+        bool ov_applied = false;
+        Uint8 ov_alpha = 0;
+        SDL_Rect ov_rect = { 0, 0, 0, 0 };
         Uint64 pre_hash = 0;
         SDL_Rect diff_rects[16];
         int diff_n = 0;
         const SDL_Rect *multi_rects = rects;
         int multi_numrects = numrects;
+
+        if (vdata->overlay) {
+            ov_active = KITTY_OverlayEvaluate((KITTY_ToastOverlay *)vdata->overlay,
+                                              surface->w, surface->h, SDL_GetTicks(),
+                                              &ov_rect, &ov_alpha, &ov_needs_redraw);
+        }
 
         if (!KITTY_EnsureRGBScratch(wdata, surface->w, surface->h, bpp)) {
             return false;
@@ -277,6 +289,14 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                                                       (int)(sizeof(diff_rects) / sizeof(diff_rects[0])),
                                                       &diff_n, &dirty);
                     if (diff == KITTY_DIFF_NONE) {
+                        if (ov_needs_redraw && wdata->placed) {
+                            dirty = ov_rect;
+                            multi_rects = NULL;
+                            multi_numrects = 0;
+                            diff_proved_changed = true;
+                            convert_mode = KITTY_CONVERT_DIRTY;
+                            goto kitty_present_after_convert;
+                        }
 #ifdef SDL_KITTY_RUNTIME_DEBUG
                         if (KITTY_DebugEnabled()) {
                             static int skips;
@@ -351,12 +371,20 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 if (!conv_ok) {
                     convert_mode = KITTY_CONVERT_FULL;
                 } else if (!rchg && wdata->placed) {
-                    ok = true;
-                    wire_mode = KITTY_WIRE_UPLOAD_SKIP;
-                    convert_px = 0;
-                    upload_px = 0;
-                    vdata->skip_presents += 1;
-                    goto kitty_present_log;
+                    if (ov_needs_redraw) {
+                        dirty = ov_rect;
+                        multi_rects = NULL;
+                        multi_numrects = 0;
+                        single_prepacked = false;
+                        diff_proved_changed = true;
+                    } else {
+                        ok = true;
+                        wire_mode = KITTY_WIRE_UPLOAD_SKIP;
+                        convert_px = 0;
+                        upload_px = 0;
+                        vdata->skip_presents += 1;
+                        goto kitty_present_log;
+                    }
                 } else {
                     diff_proved_changed = true;
                 }
@@ -388,13 +416,20 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 if (!any_valid) {
                     convert_mode = KITTY_CONVERT_FULL;
                 } else if (!any_changed && wdata->placed) {
-                    /* Every pixel in every dirty rect matched rgb_scratch! */
-                    ok = true;
-                    wire_mode = KITTY_WIRE_UPLOAD_SKIP;
-                    convert_px = 0;
-                    upload_px = 0;
-                    vdata->skip_presents += 1;
-                    goto kitty_present_log;
+                    if (ov_needs_redraw) {
+                        dirty = ov_rect;
+                        multi_rects = NULL;
+                        multi_numrects = 0;
+                        diff_proved_changed = true;
+                    } else {
+                        /* Every pixel in every dirty rect matched rgb_scratch! */
+                        ok = true;
+                        wire_mode = KITTY_WIRE_UPLOAD_SKIP;
+                        convert_px = 0;
+                        upload_px = 0;
+                        vdata->skip_presents += 1;
+                        goto kitty_present_log;
+                    }
                 } else {
                     diff_proved_changed = true;
                     if (!overflow_changed && changed_n > 0) {
@@ -449,7 +484,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                                   : KITTY_SelectUploadSkip(
                                         SDL_getenv("SDL_KITTY_UPLOAD_SKIP"),
                                         vdata->term_profile ? vdata->term_profile->upload_skip : true);
-        if (upload_skip_enabled && !diff_proved_changed && wdata->rgb_scratch) {
+        if (upload_skip_enabled && !diff_proved_changed && !ov_needs_redraw && wdata->rgb_scratch) {
             const size_t bytes =
                 (size_t)surface->w * (size_t)surface->h * (size_t)bpp;
             pre_hash = KITTY_FastHash64(wdata->rgb_scratch, bytes);
@@ -462,6 +497,43 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 vdata->skip_presents += 1;
                 goto kitty_present_log;
             }
+        }
+
+        /* Temporarily composite active HUD toast onto rgb_scratch (restored right after
+         * transmit so rgb_scratch always holds pure game pixels for diffing). */
+        if (ov_active && wdata->rgb_scratch) {
+            ov_applied = KITTY_OverlayApply((KITTY_ToastOverlay *)vdata->overlay,
+                                            wdata->rgb_scratch, surface->w, surface->h,
+                                            bpp, ov_alpha);
+            if (ov_applied && single_prepacked && SDL_HasRectIntersection(&dirty, &ov_rect)) {
+                single_prepacked = false;
+            }
+        }
+        if (ov_needs_redraw && convert_mode == KITTY_CONVERT_DIRTY && ov_rect.w > 0 && ov_rect.h > 0) {
+            /* Ensure ov_rect is transmitted even if game dirty rects were elsewhere. */
+            if (multi_rects && multi_numrects > 1) {
+                if (multi_rects != diff_rects && multi_numrects < 15) {
+                    int mi;
+                    for (mi = 0; mi < multi_numrects; ++mi) {
+                        diff_rects[mi] = multi_rects[mi];
+                    }
+                    diff_rects[multi_numrects] = ov_rect;
+                    multi_rects = diff_rects;
+                    multi_numrects += 1;
+                } else if (multi_rects == diff_rects && multi_numrects < 16) {
+                    diff_rects[multi_numrects++] = ov_rect;
+                }
+                KITTY_UnionRects(surface->w, surface->h, multi_rects, multi_numrects, &dirty);
+            } else if (!(dirty.x == ov_rect.x && dirty.y == ov_rect.y &&
+                         dirty.w == ov_rect.w && dirty.h == ov_rect.h)) {
+                diff_rects[0] = dirty;
+                diff_rects[1] = ov_rect;
+                multi_rects = diff_rects;
+                multi_numrects = 2;
+                KITTY_UnionRects(surface->w, surface->h, diff_rects, 2, &dirty);
+                single_prepacked = false;
+            }
+            convert_px = (size_t)dirty.w * (size_t)dirty.h;
         }
 
         /* Sparse direct a=f. Prefer per-rect edits when the app passed multiple
@@ -911,6 +983,15 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                     wire_mode = (convert_mode == KITTY_CONVERT_DIRTY) ? KITTY_WIRE_DIRTY_CPU : KITTY_WIRE_FULL;
                 }
             }
+        }
+
+        /* Restore clean game pixels in rgb_scratch before next frame's tile-diff. */
+        if (ov_applied) {
+            KITTY_OverlayRestore((KITTY_ToastOverlay *)vdata->overlay,
+                                 wdata->rgb_scratch, surface->w, surface->h, bpp);
+        }
+        if (ok && vdata->overlay && wire_mode != KITTY_WIRE_UPLOAD_SKIP) {
+            KITTY_OverlayMarkDrawn((KITTY_ToastOverlay *)vdata->overlay, ov_alpha);
         }
 
         /* Record fingerprint after successful upload without re-hashing. */

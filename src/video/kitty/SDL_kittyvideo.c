@@ -34,6 +34,7 @@
 #include "SDL_kittyevents_c.h"
 #include "SDL_kittyframebuffer_c.h"
 #include "SDL_kittygraphics.h"
+#include "SDL_kittyoverlay.h"
 #include "SDL_kittyprobe.h"
 #include "SDL_kittyprofile.h"
 #include "SDL_kittyrect.h"
@@ -419,6 +420,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
                                          ? prof->max_direct_bytes
                                          : ((size_t)1920 * 1080 * 4);
         data->cfg_apc_chunk_bytes = KITTY_ProfileApcChunkBytes(prof);
+        data->overlay = KITTY_OverlayCreate(SDL_getenv("SDL_KITTY_OVERLAY"));
         data->cfg_cached = true;
     }
 
@@ -495,6 +497,8 @@ static void KITTY_VideoQuit(SDL_VideoDevice *_this)
         data->terminal_owned = false;
     }
     if (data) {
+        KITTY_OverlayDestroy((KITTY_ToastOverlay *)data->overlay);
+        data->overlay = NULL;
         KITTY_FreeTransmitBuffers(data);
     }
 }

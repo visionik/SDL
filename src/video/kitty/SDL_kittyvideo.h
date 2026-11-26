@@ -159,6 +159,7 @@ typedef struct SDL_VideoData
     void *tx_pz_ctx;  /* parallel zlib slice streams/buffers, lazily initialized */
     void *tx_mr_ctx;  /* parallel multi-rect a=f pack+zlib+b64 worker pool */
     void *tx_async;   /* depth-1 pipelined async PTY writer thread */
+    void *overlay;    /* KITTY_ToastOverlay* from SDL_KITTY_OVERLAY, if configured */
     /* Cached hot-path present/transmit policy resolved once at VideoInit. */
     bool cfg_cached;
     bool cfg_dirty_enabled;
