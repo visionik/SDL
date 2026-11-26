@@ -157,6 +157,7 @@ typedef struct SDL_VideoData
     size_t tx_b64_cap;
     void *tx_zstream; /* z_stream*, lazily initialized with deflateInit */
     void *tx_pz_ctx;  /* parallel zlib slice streams/buffers, lazily initialized */
+    void *tx_mr_ctx;  /* parallel multi-rect a=f pack+zlib+b64 worker pool */
     void *tx_async;   /* depth-1 pipelined async PTY writer thread */
     /* Cached hot-path present/transmit policy resolved once at VideoInit. */
     bool cfg_cached;

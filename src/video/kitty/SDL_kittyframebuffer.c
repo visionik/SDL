@@ -509,58 +509,72 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 }
 
                 if (multi_ok) {
-                    KITTY_BeginAsyncBatch(vdata);
-                }
-
-                for (ri = 0; multi_ok && ri < af_n; ++ri) {
-                    SDL_Rect clipped;
-                    size_t rpx;
-                    size_t packed_len = 0;
-                    bool pack_ok = false;
-
-                    if (!SDL_GetRectIntersection(&af_rects[ri], &fb, &clipped) ||
-                        clipped.w <= 0 || clipped.h <= 0) {
-                        continue;
-                    }
-                    rpx = (size_t)clipped.w * (size_t)clipped.h;
-                    if (rpx > max_af_px) {
-                        multi_ok = false;
-                        break;
-                    }
-                    packed = KITTY_EnsurePackScratch(wdata, rpx * (size_t)bpp);
-                    if (!packed) {
-                        multi_ok = false;
-                        break;
-                    }
-                    pack_ok = use_rgba
-                                  ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h,
-                                                       &clipped, packed, rpx * (size_t)bpp, &packed_len)
-                                  : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h,
-                                                      &clipped, packed, rpx * (size_t)bpp, &packed_len);
-                    if (!pack_ok ||
-                        !KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed,
-                                                   clipped.x, clipped.y, clipped.w, clipped.h,
-                                                   kitty_f)) {
-                        multi_ok = false;
-                        SDL_ClearError();
-                    } else {
-                        multi_upload += rpx;
-                    }
-                    packed = NULL;
-                }
-
-                if (multi_ok && multi_upload > 0 && multi_upload <= max_af_px) {
-                    if (KITTY_CommitAsyncBatch(vdata)) {
+                    size_t par_upload = 0;
+                    if (af_n >= 3 && af_n <= 16 &&
+                        KITTY_TransmitMultiRectEdit(vdata, wdata->live_image_id, wdata->rgb_scratch,
+                                                    surface->w, surface->h, af_rects, af_n,
+                                                    kitty_f, &par_upload)) {
                         ok = true;
                         wire_mode = KITTY_WIRE_DIRTY_BW;
-                        upload_px = multi_upload;
+                        upload_px = par_upload;
                         wdata->rgb_valid = true;
                         KITTY_ClearOverlays(vdata, wdata);
-                    } else {
-                        SDL_ClearError();
                     }
-                } else {
-                    KITTY_CancelAsyncBatch(vdata);
+                }
+
+                if (!ok && multi_ok) {
+                    KITTY_BeginAsyncBatch(vdata);
+
+                    for (ri = 0; multi_ok && ri < af_n; ++ri) {
+                        SDL_Rect clipped;
+                        size_t rpx;
+                        size_t packed_len = 0;
+                        bool pack_ok = false;
+
+                        if (!SDL_GetRectIntersection(&af_rects[ri], &fb, &clipped) ||
+                            clipped.w <= 0 || clipped.h <= 0) {
+                            continue;
+                        }
+                        rpx = (size_t)clipped.w * (size_t)clipped.h;
+                        if (rpx > max_af_px) {
+                            multi_ok = false;
+                            break;
+                        }
+                        packed = KITTY_EnsurePackScratch(wdata, rpx * (size_t)bpp);
+                        if (!packed) {
+                            multi_ok = false;
+                            break;
+                        }
+                        pack_ok = use_rgba
+                                      ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h,
+                                                           &clipped, packed, rpx * (size_t)bpp, &packed_len)
+                                      : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h,
+                                                          &clipped, packed, rpx * (size_t)bpp, &packed_len);
+                        if (!pack_ok ||
+                            !KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed,
+                                                       clipped.x, clipped.y, clipped.w, clipped.h,
+                                                       kitty_f)) {
+                            multi_ok = false;
+                            SDL_ClearError();
+                        } else {
+                            multi_upload += rpx;
+                        }
+                        packed = NULL;
+                    }
+
+                    if (multi_ok && multi_upload > 0 && multi_upload <= max_af_px) {
+                        if (KITTY_CommitAsyncBatch(vdata)) {
+                            ok = true;
+                            wire_mode = KITTY_WIRE_DIRTY_BW;
+                            upload_px = multi_upload;
+                            wdata->rgb_valid = true;
+                            KITTY_ClearOverlays(vdata, wdata);
+                        } else {
+                            SDL_ClearError();
+                        }
+                    } else {
+                        KITTY_CancelAsyncBatch(vdata);
+                    }
                 }
             }
 

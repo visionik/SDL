@@ -141,6 +141,15 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                                const Uint8 *packed_rgb, int x, int y, int rw, int rh, int kitty_f);
 
 /*
+ * Parallel multi-rect a=f pack + zlib + base64 + single async submit.
+ * Returns true if all clipped rects were transmitted; false to fall back.
+ */
+bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
+                                 const Uint8 *rgb_scratch, int fb_w, int fb_h,
+                                 const SDL_Rect *rects, int n_rects, int kitty_f,
+                                 size_t *out_upload_px);
+
+/*
  * Transmit+place a packed rect as its own image at a 1-based CSI CUP cell.
  * place_cols/rows 0 = natural pixel size; cell_X/Y are in-cell pixel offsets;
  * z stacks above the base. Uses DECSC/DECRC around CUP.

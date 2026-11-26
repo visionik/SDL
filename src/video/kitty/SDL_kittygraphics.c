@@ -334,6 +334,162 @@ static void KITTY_ParallelZlibWorker(void *arg, size_t idx)
     sl->out_len = (size_t)zs->total_out;
     sl->ok = true;
 }
+
+#define KITTY_MR_MAX 16
+
+typedef struct __attribute__((aligned(128))) KITTY_MultiRectSlot
+{
+    z_stream zs;
+    bool zs_init;
+    Uint8 *pack_buf;
+    size_t pack_cap;
+    Uint8 *z_buf;
+    size_t z_cap;
+    char *apc_buf;
+    size_t apc_cap;
+    SDL_Rect rect;
+    size_t raw_len;
+    size_t wire_len;
+    bool ok;
+} KITTY_MultiRectSlot;
+
+typedef struct KITTY_MultiRectCtx
+{
+    KITTY_MultiRectSlot slots[KITTY_MR_MAX];
+    const Uint8 *rgb_scratch;
+    int fb_w;
+    int fb_h;
+    int kitty_f;
+    Uint32 image_id;
+    size_t chunk_cap;
+    bool want_zlib;
+} KITTY_MultiRectCtx;
+
+static void KITTY_FreeMultiRectCtx(SDL_VideoData *vdata)
+{
+    KITTY_MultiRectCtx *ctx;
+    int i;
+    if (!vdata || !vdata->tx_mr_ctx) {
+        return;
+    }
+    ctx = (KITTY_MultiRectCtx *)vdata->tx_mr_ctx;
+    for (i = 0; i < KITTY_MR_MAX; ++i) {
+        if (ctx->slots[i].zs_init) {
+            deflateEnd(&ctx->slots[i].zs);
+            ctx->slots[i].zs_init = false;
+        }
+        SDL_free(ctx->slots[i].pack_buf);
+        SDL_free(ctx->slots[i].z_buf);
+        SDL_free(ctx->slots[i].apc_buf);
+    }
+    SDL_free(ctx);
+    vdata->tx_mr_ctx = NULL;
+}
+
+static void KITTY_MultiRectWorker(void *arg, size_t idx)
+{
+    KITTY_MultiRectCtx *ctx = (KITTY_MultiRectCtx *)arg;
+    KITTY_MultiRectSlot *s = &ctx->slots[idx];
+    const int bpp = (ctx->kitty_f == 32) ? 4 : 3;
+    const size_t raw_len = (size_t)s->rect.w * (size_t)s->rect.h * (size_t)bpp;
+    const Uint8 *body;
+    size_t body_len;
+    bool use_z = ctx->want_zlib && raw_len > 48u;
+    size_t packed_len = 0;
+    bool pack_ok;
+    size_t b64_len, encoded;
+    char header[160];
+    int header_len;
+
+    s->ok = false;
+    s->raw_len = raw_len;
+    s->wire_len = 0;
+
+    if (s->pack_cap < raw_len) {
+        Uint8 *nb = (Uint8 *)SDL_realloc(s->pack_buf, raw_len);
+        if (!nb) {
+            return;
+        }
+        s->pack_buf = nb;
+        s->pack_cap = raw_len;
+    }
+    pack_ok = (bpp == 4)
+                  ? KITTY_PackRGBARect(ctx->rgb_scratch, ctx->fb_w, ctx->fb_h, &s->rect,
+                                       s->pack_buf, s->pack_cap, &packed_len)
+                  : KITTY_PackRGBRect(ctx->rgb_scratch, ctx->fb_w, ctx->fb_h, &s->rect,
+                                      s->pack_buf, s->pack_cap, &packed_len);
+    if (!pack_ok) {
+        return;
+    }
+
+    body = s->pack_buf;
+    body_len = raw_len;
+    if (use_z) {
+        uLongf bound;
+        if (!s->zs_init) {
+            if (deflateInit2(&s->zs, Z_BEST_SPEED, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+                return;
+            }
+            s->zs_init = true;
+        } else if (deflateReset(&s->zs) != Z_OK) {
+            return;
+        }
+        bound = deflateBound(&s->zs, (uLong)raw_len);
+        if (s->z_cap < (size_t)bound) {
+            Uint8 *nb = (Uint8 *)SDL_realloc(s->z_buf, (size_t)bound);
+            if (!nb) {
+                return;
+            }
+            s->z_buf = nb;
+            s->z_cap = (size_t)bound;
+        }
+        s->zs.next_in = (Bytef *)s->pack_buf;
+        s->zs.avail_in = (uInt)raw_len;
+        s->zs.next_out = (Bytef *)s->z_buf;
+        s->zs.avail_out = (uInt)bound;
+        if (deflate(&s->zs, Z_FINISH) != Z_STREAM_END) {
+            return;
+        }
+        if ((size_t)s->zs.total_out < raw_len) {
+            body = s->z_buf;
+            body_len = (size_t)s->zs.total_out;
+        } else {
+            use_z = false;
+        }
+    }
+
+    b64_len = ((body_len + 2u) / 3u) * 4u;
+    if (b64_len > ctx->chunk_cap) {
+        return;
+    }
+    header_len = SDL_snprintf(header, sizeof(header),
+                              "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
+                              ctx->kitty_f, use_z ? "o=z," : "", (unsigned)ctx->image_id,
+                              s->rect.x, s->rect.y, s->rect.w, s->rect.h);
+    if (header_len <= 0) {
+        return;
+    }
+    {
+        const size_t need = (size_t)header_len + b64_len + 3u;
+        if (s->apc_cap < need) {
+            char *nb = (char *)SDL_realloc(s->apc_buf, need);
+            if (!nb) {
+                return;
+            }
+            s->apc_buf = nb;
+            s->apc_cap = need;
+        }
+        SDL_memcpy(s->apc_buf, header, (size_t)header_len);
+        encoded = KITTY_Base64Encode(body, body_len, s->apc_buf + header_len, b64_len + 1u);
+        if (encoded == 0) {
+            return;
+        }
+        s->apc_buf[(size_t)header_len + encoded] = '\033';
+        s->apc_buf[(size_t)header_len + encoded + 1u] = '\\';
+        s->wire_len = (size_t)header_len + encoded + 2u;
+        s->ok = true;
+    }
+}
 #endif /* __APPLE__ */
 
 /*
@@ -583,6 +739,7 @@ void KITTY_FreeTransmitBuffers(SDL_VideoData *vdata)
     KITTY_DestroyAsyncWriter(vdata);
 #ifdef __APPLE__
     KITTY_FreeParallelZlib(vdata);
+    KITTY_FreeMultiRectCtx(vdata);
 #endif
     if (vdata->tx_zstream) {
         deflateEnd((z_stream *)vdata->tx_zstream);
@@ -2395,6 +2552,126 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     }
 
     return true;
+}
+
+bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
+                                 const Uint8 *rgb_scratch, int fb_w, int fb_h,
+                                 const SDL_Rect *rects, int n_rects, int kitty_f,
+                                 size_t *out_upload_px)
+{
+#ifdef __APPLE__
+    KITTY_MultiRectCtx *ctx;
+    KITTY_AsyncWriter *aw;
+    SDL_Rect fb;
+    int valid_n = 0;
+    size_t total_px = 0;
+    size_t total_wire = 0;
+    size_t total_raw = 0;
+    int i;
+    char *dst;
+
+    if (!vdata || !rgb_scratch || !rects || image_id == 0 ||
+        fb_w <= 0 || fb_h <= 0 || n_rects < 3 || n_rects > KITTY_MR_MAX) {
+        return false;
+    }
+    if (kitty_f != 24 && kitty_f != 32) {
+        kitty_f = 24;
+    }
+    if (!KITTY_EditsCompressed(vdata)) {
+        return false;
+    }
+
+    ctx = (KITTY_MultiRectCtx *)vdata->tx_mr_ctx;
+    if (!ctx) {
+        ctx = (KITTY_MultiRectCtx *)SDL_calloc(1, sizeof(KITTY_MultiRectCtx));
+        if (!ctx) {
+            return false;
+        }
+        vdata->tx_mr_ctx = ctx;
+    }
+
+    fb.x = 0;
+    fb.y = 0;
+    fb.w = fb_w;
+    fb.h = fb_h;
+    for (i = 0; i < n_rects; ++i) {
+        SDL_Rect c;
+        if (!SDL_GetRectIntersection(&rects[i], &fb, &c) || c.w <= 0 || c.h <= 0) {
+            continue;
+        }
+        ctx->slots[valid_n].rect = c;
+        total_px += (size_t)c.w * (size_t)c.h;
+        valid_n++;
+    }
+    if (valid_n < 3 || total_px < 4096u) {
+        return false;
+    }
+
+    ctx->rgb_scratch = rgb_scratch;
+    ctx->fb_w = fb_w;
+    ctx->fb_h = fb_h;
+    ctx->kitty_f = kitty_f;
+    ctx->image_id = image_id;
+    ctx->chunk_cap = vdata->cfg_cached
+                         ? vdata->cfg_apc_chunk_bytes
+                         : KITTY_ProfileApcChunkBytes(vdata->term_profile);
+    ctx->want_zlib = true;
+
+    dispatch_apply_f((size_t)valid_n,
+                     dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                     ctx, KITTY_MultiRectWorker);
+
+    for (i = 0; i < valid_n; ++i) {
+        if (!ctx->slots[i].ok) {
+            return false;
+        }
+        total_wire += ctx->slots[i].wire_len;
+        total_raw += ctx->slots[i].raw_len;
+    }
+    if (total_wire == 0 || total_wire > KITTY_ASYNC_MAX_BYTES) {
+        return false;
+    }
+
+    aw = KITTY_GetAsyncWriter(vdata);
+    if (!aw) {
+        return false;
+    }
+    dst = KITTY_AsyncEnsureStage(aw, total_wire + 1u);
+    if (!dst) {
+        return false;
+    }
+    {
+        size_t pos = 0;
+        for (i = 0; i < valid_n; ++i) {
+            SDL_memcpy(dst + pos, ctx->slots[i].apc_buf, ctx->slots[i].wire_len);
+            pos += ctx->slots[i].wire_len;
+        }
+    }
+    if (!KITTY_AsyncSubmitStage(aw, vdata->tty_fd, total_wire)) {
+        return false;
+    }
+
+    vdata->last_wire_bytes += total_wire;
+    vdata->last_raw_bytes += total_raw;
+    vdata->last_ms_ack = -1.0;
+    vdata->total_wire_bytes += total_wire;
+    vdata->wire_presents += (Uint32)valid_n;
+    if (out_upload_px) {
+        *out_upload_px = total_px;
+    }
+    return true;
+#else
+    (void)vdata;
+    (void)image_id;
+    (void)rgb_scratch;
+    (void)fb_w;
+    (void)fb_h;
+    (void)rects;
+    (void)n_rects;
+    (void)kitty_f;
+    (void)out_upload_px;
+    return false;
+#endif
 }
 
 /*
