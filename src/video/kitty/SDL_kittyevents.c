@@ -183,19 +183,16 @@ static void KITTY_RemoveHoldAt(int idx)
  * want_up is set; removes those slots. Called each pump so min-hold releases
  * land even when no tty bytes arrive.
  */
-static void KITTY_FlushDueKeyUps(void)
+static void KITTY_FlushDueKeyUps(SDL_VideoData *vd)
 {
-    SDL_VideoData *vd = KITTY_ActiveVideoData();
     const Uint64 now = SDL_GetTicks();
     int i = 0;
-    if (!vd) {
-        return;
-    }
     while (i < vd->key_hold_n) {
         KITTY_KeyHold *h = &vd->key_holds[i];
         if (h->down && h->want_up && now >= h->earliest_up_ms) {
             SDL_SendKeyboardKey(0, SDL_GLOBAL_KEYBOARD_ID, 0, h->sc, false);
-            KITTY_RemoveHoldAt(i);
+            vd->key_holds[i] = vd->key_holds[vd->key_hold_n - 1];
+            vd->key_hold_n--;
             continue;
         }
         i++;
@@ -605,11 +602,45 @@ static bool KITTY_ParseSGRMouse(SDL_VideoDevice *_this, const char *seq, size_t 
     float px, py;
     Uint8 sdl_button;
 
-    if (len < 4 || seq[0] != '<') {
+    if (len < 6 || seq[0] != '<') {
         return false;
     }
-    if (SDL_sscanf(seq, "<%d;%d;%d%c", &button, &cell_x, &cell_y, &action) != 4) {
-        return false;
+    {
+        size_t pos = 1;
+        int vals[3] = { 0, 0, 0 };
+        int vi;
+        for (vi = 0; vi < 3; ++vi) {
+            bool neg = false;
+            bool any_digit = false;
+            if (pos < len && seq[pos] == '-') {
+                neg = true;
+                pos++;
+            }
+            while (pos < len && seq[pos] >= '0' && seq[pos] <= '9') {
+                vals[vi] = vals[vi] * 10 + (seq[pos] - '0');
+                any_digit = true;
+                pos++;
+            }
+            if (!any_digit) {
+                return false;
+            }
+            if (neg) {
+                vals[vi] = -vals[vi];
+            }
+            if (vi < 2) {
+                if (pos >= len || seq[pos] != ';') {
+                    return false;
+                }
+                pos++;
+            }
+        }
+        if (pos >= len) {
+            return false;
+        }
+        button = vals[0];
+        cell_x = vals[1];
+        cell_y = vals[2];
+        action = seq[pos];
     }
     if (action != 'M' && action != 'm') {
         return false;
@@ -930,18 +961,12 @@ static size_t KITTY_HandleCSI(SDL_VideoDevice *_this, const unsigned char *buf, 
     while (i < len) {
         const unsigned char ch = buf[i];
         if (ch >= 0x40 && ch <= 0x7e) {
-            char seq[128];
-            const size_t seq_len = i; // without leading '['
-            if (seq_len < sizeof(seq)) {
-                /* seq holds intermediate bytes + final (e.g. "53u", "1;1:3A"). */
-                SDL_memcpy(seq, buf + 1, seq_len);
-                seq[seq_len] = '\0';
+            const char *seq = (const char *)(buf + 1);
+            const size_t seq_len = i; /* intermediate bytes + final, without leading '[' */
+            if (seq_len > 0 && seq_len < 128u) {
                 if (seq[0] == '<') {
                     KITTY_ParseSGRMouse(_this, seq, seq_len);
                 } else if (ch == 'u') {
-                    /* Must pass seq_len (not +1): ParseKittyKey checks seq[len-1]=='u'.
-                     * Off-by-one made every CSI-u fail (digits/letters/Esc); arrows
-                     * still worked via the legacy A/B/C/D path. */
                     KITTY_ParseKittyKey(seq, seq_len);
                 } else if (ch == '~' || ch == 'A' || ch == 'B' || ch == 'C' || ch == 'D' ||
                            ch == 'H' || ch == 'F' || ch == 'P' || ch == 'Q' || ch == 'R' ||
@@ -1102,15 +1127,16 @@ static void KITTY_HandleWinch(SDL_VideoDevice *_this)
 void KITTY_PumpEvents(SDL_VideoDevice *_this)
 {
     SDL_VideoData *data = (SDL_VideoData *)_this->internal;
-    unsigned char readbuf[512];
     ssize_t n;
 
     if (!data) {
         return;
     }
 
-    /* Release keys whose minimum hold elapsed. */
-    KITTY_FlushDueKeyUps();
+    /* Release keys whose minimum hold elapsed (skip clock lookup when idle). */
+    if (data->key_hold_n > 0) {
+        KITTY_FlushDueKeyUps(data);
+    }
 
     /*
      * Single focus announce on the first pump (not in CreateWindow). Late
@@ -1147,7 +1173,7 @@ void KITTY_PumpEvents(SDL_VideoDevice *_this)
             continue;
         }
 
-        n = read(data->tty_in, readbuf, room < sizeof(readbuf) ? room : sizeof(readbuf));
+        n = read(data->tty_in, data->tty_pending + data->tty_pending_len, room);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -1158,7 +1184,6 @@ void KITTY_PumpEvents(SDL_VideoDevice *_this)
             break;
         }
 
-        SDL_memcpy(data->tty_pending + data->tty_pending_len, readbuf, (size_t)n);
         data->tty_pending_len += (size_t)n;
 
         {
@@ -1240,7 +1265,7 @@ void KITTY_PumpEvents(SDL_VideoDevice *_this)
         }
 
         /* Short read: no more bytes waiting on a typical non-blocking tty. */
-        if ((size_t)n < sizeof(readbuf) && (size_t)n < room) {
+        if ((size_t)n < room) {
             break;
         }
     }
