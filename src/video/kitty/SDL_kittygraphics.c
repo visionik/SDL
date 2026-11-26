@@ -45,9 +45,106 @@
 #include <termios.h>
 #include <unistd.h>
 #include <zlib.h>
+#ifdef SDL_KITTY_HAVE_LIBDEFLATE
+#include <libdeflate.h>
+#endif
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #include <arm_neon.h>
 #define KITTY_HAVE_NEON64 1
+#elif (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define KITTY_HAVE_X86_B64 1
+
+static int KITTY_GetX86B64Level(void)
+{
+    static int cached = -1;
+    int lv = cached;
+    if (lv < 0) {
+        if (__builtin_cpu_supports("avx2")) {
+            lv = 2;
+        } else if (__builtin_cpu_supports("ssse3")) {
+            lv = 1;
+        } else {
+            lv = 0;
+        }
+        cached = lv;
+    }
+    return lv;
+}
+
+__attribute__((target("ssse3")))
+static size_t KITTY_Base64Encode_SSSE3(const Uint8 *src, size_t src_len, size_t full_bytes, char *dst)
+{
+    const __m128i shuf = _mm_setr_epi8(1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10);
+    const __m128i mask0 = _mm_set1_epi32(0x0FC0FC00);
+    const __m128i mul0 = _mm_set1_epi32(0x04000040);
+    const __m128i mask1 = _mm_set1_epi32(0x003F03F0);
+    const __m128i mul1 = _mm_set1_epi32(0x01000010);
+    const __m128i c51 = _mm_set1_epi8(51);
+    const __m128i c26 = _mm_set1_epi8(26);
+    const __m128i c13 = _mm_set1_epi8(13);
+    const __m128i lut = _mm_setr_epi8(71, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -19, -16, 65, 0, 0);
+    size_t i = 0, o = 0;
+
+    /* Safe 16-byte load requires i + 16 <= src_len (and i + 12 <= full_bytes). */
+    while (i + 16u <= src_len && i + 12u <= full_bytes) {
+        const __m128i raw = _mm_loadu_si128((const __m128i *)(src + i));
+        const __m128i in = _mm_shuffle_epi8(raw, shuf);
+        const __m128i t0 = _mm_and_si128(in, mask0);
+        const __m128i t1 = _mm_mulhi_epu16(t0, mul0);
+        const __m128i t2 = _mm_and_si128(in, mask1);
+        const __m128i t3 = _mm_mullo_epi16(t2, mul1);
+        const __m128i idx = _mm_or_si128(t1, t3);
+        const __m128i sub = _mm_subs_epu8(idx, c51);
+        const __m128i less = _mm_cmpgt_epi8(c26, idx);
+        const __m128i sel = _mm_or_si128(sub, _mm_and_si128(less, c13));
+        const __m128i out = _mm_add_epi8(idx, _mm_shuffle_epi8(lut, sel));
+        _mm_storeu_si128((__m128i *)(dst + o), out);
+        i += 12u;
+        o += 16u;
+    }
+    return i;
+}
+
+__attribute__((target("avx2")))
+static size_t KITTY_Base64Encode_AVX2(const Uint8 *src, size_t src_len, size_t full_bytes, char *dst)
+{
+    const __m256i shuf = _mm256_setr_epi8(
+        1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10,
+        1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10);
+    const __m256i mask0 = _mm256_set1_epi32(0x0FC0FC00);
+    const __m256i mul0 = _mm256_set1_epi32(0x04000040);
+    const __m256i mask1 = _mm256_set1_epi32(0x003F03F0);
+    const __m256i mul1 = _mm256_set1_epi32(0x01000010);
+    const __m256i c51 = _mm256_set1_epi8(51);
+    const __m256i c26 = _mm256_set1_epi8(26);
+    const __m256i c13 = _mm256_set1_epi8(13);
+    const __m256i lut = _mm256_setr_epi8(
+        71, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -19, -16, 65, 0, 0,
+        71, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -19, -16, 65, 0, 0);
+    size_t i = 0, o = 0;
+
+    /* Safe load of src[i+12..i+27] requires i + 28 <= src_len (and i + 24 <= full_bytes). */
+    while (i + 28u <= src_len && i + 24u <= full_bytes) {
+        const __m128i lo = _mm_loadu_si128((const __m128i *)(src + i));
+        const __m128i hi = _mm_loadu_si128((const __m128i *)(src + i + 12));
+        const __m256i raw = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+        const __m256i in = _mm256_shuffle_epi8(raw, shuf);
+        const __m256i t0 = _mm256_and_si256(in, mask0);
+        const __m256i t1 = _mm256_mulhi_epu16(t0, mul0);
+        const __m256i t2 = _mm256_and_si256(in, mask1);
+        const __m256i t3 = _mm256_mullo_epi16(t2, mul1);
+        const __m256i idx = _mm256_or_si256(t1, t3);
+        const __m256i sub = _mm256_subs_epu8(idx, c51);
+        const __m256i less = _mm256_cmpgt_epi8(c26, idx);
+        const __m256i sel = _mm256_or_si256(sub, _mm256_and_si256(less, c13));
+        const __m256i out = _mm256_add_epi8(idx, _mm256_shuffle_epi8(lut, sel));
+        _mm256_storeu_si256((__m256i *)(dst + o), out);
+        i += 24u;
+        o += 32u;
+    }
+    return i;
+}
 #endif
 
 #ifndef MAP_FAILED
@@ -125,6 +222,17 @@ static size_t KITTY_Base64Encode(const Uint8 *src, size_t src_len, char *dst, si
             vst4q_u8((uint8_t *)(dst + o), out);
             i += 48u;
             o += 64u;
+        }
+    }
+#elif defined(KITTY_HAVE_X86_B64)
+    if (full_bytes >= 24u) {
+        const int lv = KITTY_GetX86B64Level();
+        if (lv >= 2 && src_len >= 28u) {
+            i = KITTY_Base64Encode_AVX2(src, src_len, full_bytes, dst);
+            o = (i / 3u) * 4u;
+        } else if (lv >= 1 && src_len >= 16u) {
+            i = KITTY_Base64Encode_SSSE3(src, src_len, full_bytes, dst);
+            o = (i / 3u) * 4u;
         }
     }
 #endif
@@ -313,7 +421,11 @@ static void KITTY_ParallelZlibWorker(void *arg, size_t idx)
 
     sl->ok = false;
     sl->out_len = 0;
+#ifdef SDL_KITTY_HAVE_LIBDEFLATE
+    sl->adler = (uLong)libdeflate_adler32(1u, in, in_len);
+#else
     sl->adler = adler32(adler32(0L, Z_NULL, 0), in, (uInt)in_len);
+#endif
 
     zerr = deflateReset(zs);
     if (zerr != Z_OK) {
@@ -338,6 +450,10 @@ typedef struct __attribute__((aligned(128))) KITTY_MultiRectSlot
 {
     z_stream zs;
     bool zs_init;
+#ifdef SDL_KITTY_HAVE_LIBDEFLATE
+    struct libdeflate_compressor *ld_comp;
+    int ld_level;
+#endif
     Uint8 *pack_buf;
     size_t pack_cap;
     Uint8 *z_buf;
@@ -376,6 +492,12 @@ static void KITTY_FreeMultiRectCtx(SDL_VideoData *vdata)
             deflateEnd(&ctx->slots[i].zs);
             ctx->slots[i].zs_init = false;
         }
+#ifdef SDL_KITTY_HAVE_LIBDEFLATE
+        if (ctx->slots[i].ld_comp) {
+            libdeflate_free_compressor(ctx->slots[i].ld_comp);
+            ctx->slots[i].ld_comp = NULL;
+        }
+#endif
         SDL_free(ctx->slots[i].pack_buf);
         SDL_free(ctx->slots[i].z_buf);
         SDL_free(ctx->slots[i].apc_buf);
@@ -423,6 +545,36 @@ static void KITTY_MultiRectWorker(void *arg, size_t idx)
     body = s->pack_buf;
     body_len = raw_len;
     if (use_z) {
+#ifdef SDL_KITTY_HAVE_LIBDEFLATE
+        const int lv = (ctx->zlevel >= 1 && ctx->zlevel <= 12) ? ctx->zlevel : 1;
+        size_t bound, zlen;
+        if (!s->ld_comp || s->ld_level != lv) {
+            if (s->ld_comp) {
+                libdeflate_free_compressor(s->ld_comp);
+            }
+            s->ld_comp = libdeflate_alloc_compressor(lv);
+            s->ld_level = lv;
+            if (!s->ld_comp) {
+                return;
+            }
+        }
+        bound = libdeflate_zlib_compress_bound(s->ld_comp, raw_len);
+        if (s->z_cap < bound) {
+            Uint8 *nb = (Uint8 *)SDL_realloc(s->z_buf, bound);
+            if (!nb) {
+                return;
+            }
+            s->z_buf = nb;
+            s->z_cap = bound;
+        }
+        zlen = libdeflate_zlib_compress(s->ld_comp, s->pack_buf, raw_len, s->z_buf, s->z_cap);
+        if (zlen > 0 && zlen < raw_len) {
+            body = s->z_buf;
+            body_len = zlen;
+        } else {
+            use_z = false;
+        }
+#else
         uLongf bound;
         if (!s->zs_init) {
             if (deflateInit2(&s->zs, ctx->zlevel, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
@@ -454,6 +606,7 @@ static void KITTY_MultiRectWorker(void *arg, size_t idx)
         } else {
             use_z = false;
         }
+#endif
     }
 
     b64_len = ((body_len + 2u) / 3u) * 4u;
@@ -509,6 +662,14 @@ typedef struct KITTY_AsyncWriter
     char *stage_buf;
     size_t stage_cap;
     size_t stage_len;
+    /* Optional latest-frame drop mailbox (for full a=T frames over SSH/slow PTY). */
+    char *pending_buf;
+    size_t pending_cap;
+    size_t pending_len;
+    int pending_fd;
+    bool has_pending;
+    bool drop_stale;
+    Uint64 dropped_frames;
     bool batching;
     bool busy;
     bool writer_sleeping;
@@ -523,10 +684,23 @@ static void *KITTY_AsyncWriterMain(void *arg)
     KITTY_AsyncWriter *w = (KITTY_AsyncWriter *)arg;
     pthread_mutex_lock(&w->mu);
     for (;;) {
-        while (!w->busy && !w->stop) {
+        while (!w->busy && !w->has_pending && !w->stop) {
             w->writer_sleeping = true;
             pthread_cond_wait(&w->cv_work, &w->mu);
             w->writer_sleeping = false;
+        }
+        if (!w->busy && w->has_pending) {
+            char *tmp_buf = w->buf;
+            size_t tmp_cap = w->cap;
+            w->buf = w->pending_buf;
+            w->cap = w->pending_cap;
+            w->pending_buf = tmp_buf;
+            w->pending_cap = tmp_cap;
+            w->fd = w->pending_fd;
+            w->len = w->pending_len;
+            w->pending_len = 0;
+            w->has_pending = false;
+            w->busy = true;
         }
         if (!w->busy && w->stop) {
             break;
@@ -544,7 +718,7 @@ static void *KITTY_AsyncWriterMain(void *arg)
             }
             w->busy = false;
             w->len = 0;
-            if (w->main_waiting) {
+            if (!w->has_pending && w->main_waiting) {
                 pthread_cond_signal(&w->cv_idle);
             }
         }
@@ -560,7 +734,9 @@ static KITTY_AsyncWriter *KITTY_GetAsyncWriter(SDL_VideoData *vdata)
         return NULL;
     }
     if (vdata->tx_async) {
-        return (KITTY_AsyncWriter *)vdata->tx_async;
+        w = (KITTY_AsyncWriter *)vdata->tx_async;
+        w->drop_stale = vdata->cfg_async_drop;
+        return w;
     }
     w = (KITTY_AsyncWriter *)SDL_calloc(1, sizeof(KITTY_AsyncWriter));
     if (!w) {
@@ -588,6 +764,7 @@ static KITTY_AsyncWriter *KITTY_GetAsyncWriter(SDL_VideoData *vdata)
         SDL_free(w);
         return NULL;
     }
+    w->drop_stale = vdata->cfg_async_drop;
     w->started = true;
     vdata->tx_async = w;
     return w;
@@ -613,14 +790,39 @@ static char *KITTY_AsyncEnsureStage(KITTY_AsyncWriter *w, size_t need)
     return p;
 }
 
-static bool KITTY_AsyncSubmitStage(KITTY_AsyncWriter *w, int fd, size_t len)
+static bool KITTY_AsyncSubmitStage(SDL_VideoData *vdata, KITTY_AsyncWriter *w, int fd, size_t len,
+                                   bool droppable)
 {
     bool prev_err;
     char *tmp_buf;
     size_t tmp_cap;
 
     pthread_mutex_lock(&w->mu);
-    while (w->busy) {
+    if (droppable && w->drop_stale && w->busy) {
+        /* Non-blocking latest-frame mailbox: swap stage into pending slot so the
+         * app/emulator loop never stalls on a slow SSH/WAN PTY drain. */
+        if (w->has_pending) {
+            w->dropped_frames++;
+            if (vdata) {
+                vdata->async_dropped_frames = w->dropped_frames;
+            }
+        }
+        prev_err = w->write_err;
+        w->write_err = false;
+        tmp_buf = w->pending_buf;
+        tmp_cap = w->pending_cap;
+        w->pending_buf = w->stage_buf;
+        w->pending_cap = w->stage_cap;
+        w->stage_buf = tmp_buf;
+        w->stage_cap = tmp_cap;
+        w->pending_fd = fd;
+        w->pending_len = len;
+        w->has_pending = true;
+        w->stage_len = 0;
+        pthread_mutex_unlock(&w->mu);
+        return !prev_err;
+    }
+    while (w->busy || w->has_pending) {
         w->main_waiting = true;
         pthread_cond_wait(&w->cv_idle, &w->mu);
         w->main_waiting = false;
@@ -679,7 +881,7 @@ bool KITTY_CommitAsyncBatch(SDL_VideoData *vdata)
     if (len == 0) {
         return true;
     }
-    if (!KITTY_AsyncSubmitStage(w, vdata->tty_fd, len)) {
+    if (!KITTY_AsyncSubmitStage(vdata, w, vdata->tty_fd, len, false)) {
         return SDL_SetError("kitty async batch write failed");
     }
     return true;
@@ -693,7 +895,7 @@ void KITTY_FlushAsyncWriter(SDL_VideoData *vdata)
     }
     w = (KITTY_AsyncWriter *)vdata->tx_async;
     pthread_mutex_lock(&w->mu);
-    while (w->busy) {
+    while (w->busy || w->has_pending) {
         w->main_waiting = true;
         pthread_cond_wait(&w->cv_idle, &w->mu);
         w->main_waiting = false;
@@ -721,8 +923,218 @@ static void KITTY_DestroyAsyncWriter(SDL_VideoData *vdata)
     pthread_mutex_destroy(&w->mu);
     SDL_free(w->buf);
     SDL_free(w->stage_buf);
+    SDL_free(w->pending_buf);
     SDL_free(w);
     vdata->tx_async = NULL;
+}
+
+/*
+ * Background POSIX SHM slot pre-allocator & async munmap/close pool.
+ * Keeps 1 freshly created, ftruncated, mmapped SHM segment ready so
+ * KITTY_TransmitShm avoids shm_open/ftruncate/mmap/munmap/close syscalls on
+ * the app's present critical path while honoring Kitty's unique-name unlink rule.
+ */
+typedef struct KITTY_ShmPool
+{
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool started;
+    bool stop;
+    Uint32 seq;
+
+    bool ready_valid;
+    char ready_name[80];
+    int ready_fd;
+    void *ready_map;
+    size_t ready_len;
+
+    size_t want_len;
+
+    bool retire_valid;
+    int retire_fd;
+    void *retire_map;
+    size_t retire_len;
+} KITTY_ShmPool;
+
+static void *KITTY_ShmPoolMain(void *arg)
+{
+    KITTY_ShmPool *p = (KITTY_ShmPool *)arg;
+    pthread_mutex_lock(&p->mu);
+    for (;;) {
+        while (!p->stop && !p->retire_valid &&
+               !(p->want_len > 0 && (!p->ready_valid || p->ready_len != p->want_len))) {
+            pthread_cond_wait(&p->cv, &p->mu);
+        }
+        if (p->retire_valid) {
+            void *rmap = p->retire_map;
+            size_t rlen = p->retire_len;
+            int rfd = p->retire_fd;
+            p->retire_valid = false;
+            p->retire_map = MAP_FAILED;
+            p->retire_fd = -1;
+            pthread_mutex_unlock(&p->mu);
+            if (rmap != MAP_FAILED && rlen > 0) {
+                munmap(rmap, rlen);
+            }
+            if (rfd >= 0) {
+                close(rfd);
+            }
+            pthread_mutex_lock(&p->mu);
+            continue;
+        }
+        if (p->stop) {
+            break;
+        }
+        if (p->want_len > 0 && (!p->ready_valid || p->ready_len != p->want_len)) {
+            char old_name[80];
+            void *old_map = MAP_FAILED;
+            size_t old_len = 0;
+            int old_fd = -1;
+            bool had_old = p->ready_valid;
+            size_t need_len = p->want_len;
+            Uint32 seq = ++p->seq;
+            char new_name[80];
+            int new_fd;
+            void *new_map = MAP_FAILED;
+
+            if (had_old) {
+                SDL_strlcpy(old_name, p->ready_name, sizeof(old_name));
+                old_map = p->ready_map;
+                old_len = p->ready_len;
+                old_fd = p->ready_fd;
+                p->ready_valid = false;
+                p->ready_map = MAP_FAILED;
+                p->ready_fd = -1;
+                p->ready_len = 0;
+            }
+            pthread_mutex_unlock(&p->mu);
+
+            if (had_old) {
+                if (old_map != MAP_FAILED && old_len > 0) {
+                    munmap(old_map, old_len);
+                }
+                if (old_fd >= 0) {
+                    close(old_fd);
+                }
+                shm_unlink(old_name);
+            }
+
+            SDL_snprintf(new_name, sizeof(new_name), "/sk-%x-p-%x", (unsigned)getpid(), (unsigned)seq);
+            new_fd = shm_open(new_name, O_CREAT | O_RDWR | O_EXCL, 0600);
+            if (new_fd < 0 && errno == EEXIST) {
+                shm_unlink(new_name);
+                new_fd = shm_open(new_name, O_CREAT | O_RDWR | O_EXCL, 0600);
+            }
+            if (new_fd >= 0) {
+                if (ftruncate(new_fd, (off_t)need_len) == 0) {
+                    new_map = mmap(NULL, need_len, PROT_READ | PROT_WRITE, MAP_SHARED, new_fd, 0);
+                }
+                if (new_map == MAP_FAILED) {
+                    close(new_fd);
+                    shm_unlink(new_name);
+                    new_fd = -1;
+                }
+            }
+
+            pthread_mutex_lock(&p->mu);
+            if (new_fd >= 0 && new_map != MAP_FAILED) {
+                if (!p->stop && p->want_len == need_len && !p->ready_valid) {
+                    SDL_strlcpy(p->ready_name, new_name, sizeof(p->ready_name));
+                    p->ready_fd = new_fd;
+                    p->ready_map = new_map;
+                    p->ready_len = need_len;
+                    p->ready_valid = true;
+                } else {
+                    pthread_mutex_unlock(&p->mu);
+                    munmap(new_map, need_len);
+                    close(new_fd);
+                    shm_unlink(new_name);
+                    pthread_mutex_lock(&p->mu);
+                }
+            } else {
+                /* Avoid tight spin on transient SHM failure. */
+                p->want_len = 0;
+            }
+        }
+    }
+    pthread_mutex_unlock(&p->mu);
+    return NULL;
+}
+
+static KITTY_ShmPool *KITTY_GetShmPool(SDL_VideoData *vdata)
+{
+    KITTY_ShmPool *p;
+    if (!vdata) {
+        return NULL;
+    }
+    if (vdata->tx_shm_pool) {
+        return (KITTY_ShmPool *)vdata->tx_shm_pool;
+    }
+    p = (KITTY_ShmPool *)SDL_calloc(1, sizeof(KITTY_ShmPool));
+    if (!p) {
+        return NULL;
+    }
+    p->ready_fd = -1;
+    p->ready_map = MAP_FAILED;
+    p->retire_fd = -1;
+    p->retire_map = MAP_FAILED;
+    if (pthread_mutex_init(&p->mu, NULL) != 0) {
+        SDL_free(p);
+        return NULL;
+    }
+    if (pthread_cond_init(&p->cv, NULL) != 0) {
+        pthread_mutex_destroy(&p->mu);
+        SDL_free(p);
+        return NULL;
+    }
+    if (pthread_create(&p->thread, NULL, KITTY_ShmPoolMain, p) != 0) {
+        pthread_cond_destroy(&p->cv);
+        pthread_mutex_destroy(&p->mu);
+        SDL_free(p);
+        return NULL;
+    }
+    p->started = true;
+    vdata->tx_shm_pool = p;
+    return p;
+}
+
+static void KITTY_DestroyShmPool(SDL_VideoData *vdata)
+{
+    KITTY_ShmPool *p;
+    if (!vdata || !vdata->tx_shm_pool) {
+        return;
+    }
+    p = (KITTY_ShmPool *)vdata->tx_shm_pool;
+    if (p->started) {
+        pthread_mutex_lock(&p->mu);
+        p->stop = true;
+        pthread_cond_signal(&p->cv);
+        pthread_mutex_unlock(&p->mu);
+        pthread_join(p->thread, NULL);
+        p->started = false;
+    }
+    if (p->ready_valid) {
+        if (p->ready_map != MAP_FAILED && p->ready_len > 0) {
+            munmap(p->ready_map, p->ready_len);
+        }
+        if (p->ready_fd >= 0) {
+            close(p->ready_fd);
+        }
+        shm_unlink(p->ready_name);
+    }
+    if (p->retire_valid) {
+        if (p->retire_map != MAP_FAILED && p->retire_len > 0) {
+            munmap(p->retire_map, p->retire_len);
+        }
+        if (p->retire_fd >= 0) {
+            close(p->retire_fd);
+        }
+    }
+    pthread_cond_destroy(&p->cv);
+    pthread_mutex_destroy(&p->mu);
+    SDL_free(p);
+    vdata->tx_shm_pool = NULL;
 }
 
 /*
@@ -734,8 +1146,16 @@ void KITTY_FreeTransmitBuffers(SDL_VideoData *vdata)
         return;
     }
     KITTY_DestroyAsyncWriter(vdata);
+    KITTY_DestroyShmPool(vdata);
     KITTY_FreeParallelZlib(vdata);
     KITTY_FreeMultiRectCtx(vdata);
+#ifdef SDL_KITTY_HAVE_LIBDEFLATE
+    if (vdata->tx_ld_comp) {
+        libdeflate_free_compressor((struct libdeflate_compressor *)vdata->tx_ld_comp);
+        vdata->tx_ld_comp = NULL;
+        vdata->tx_ld_level = 0;
+    }
+#endif
     if (vdata->tx_zstream) {
         deflateEnd((z_stream *)vdata->tx_zstream);
         SDL_free(vdata->tx_zstream);
@@ -898,6 +1318,36 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
             }
         }
     }
+#ifdef SDL_KITTY_HAVE_LIBDEFLATE
+    {
+        const int ld_level = (vdata->cfg_zlib_level >= 1 && vdata->cfg_zlib_level <= 12)
+                                 ? vdata->cfg_zlib_level
+                                 : 1;
+        struct libdeflate_compressor *comp = (struct libdeflate_compressor *)vdata->tx_ld_comp;
+        size_t bound_ld, zlen;
+        if (!comp || vdata->tx_ld_level != ld_level) {
+            if (comp) {
+                libdeflate_free_compressor(comp);
+            }
+            comp = libdeflate_alloc_compressor(ld_level);
+            vdata->tx_ld_comp = comp;
+            vdata->tx_ld_level = comp ? ld_level : 0;
+        }
+        if (comp) {
+            bound_ld = libdeflate_zlib_compress_bound(comp, src_len);
+            dst = KITTY_EnsureZBuf(vdata, bound_ld);
+            if (!dst) {
+                return false;
+            }
+            zlen = libdeflate_zlib_compress(comp, src, src_len, dst, bound_ld);
+            if (zlen > 0) {
+                *out_buf = dst;
+                *out_len = zlen;
+                return true;
+            }
+        }
+    }
+#endif
     if (!vdata->tx_zstream) {
         const int serial_level = (vdata->cfg_zlib_level >= 1 && vdata->cfg_zlib_level <= 9)
                                      ? vdata->cfg_zlib_level
@@ -1006,7 +1456,7 @@ static bool KITTY_TransmitDirectPayload(SDL_VideoData *vdata, int fd, Uint32 ima
             dst[(size_t)header_len + encoded] = '\033';
             dst[(size_t)header_len + encoded + 1u] = '\\';
             wire = (size_t)header_len + encoded + 2u;
-            if (!KITTY_AsyncSubmitStage(aw, fd, wire)) {
+            if (!KITTY_AsyncSubmitStage(vdata, aw, fd, wire, true)) {
                 return SDL_SetError("kitty async write failed");
             }
             if (out_wire_bytes) {
@@ -1228,10 +1678,11 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
     char name[80];
     const int bpp = (kitty_f == 32) ? 4 : 3;
     const size_t raw_len = (size_t)w * (size_t)h * (size_t)bpp;
-    const Uint32 seq = vdata ? ++vdata->shm_seq : 1u;
     int shm_fd = -1;
     void *map = MAP_FAILED;
     bool ok = false;
+    bool from_pool = false;
+    KITTY_ShmPool *pool = NULL;
     int fd;
 
     if (!vdata) {
@@ -1239,27 +1690,50 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
     }
     fd = vdata->tty_fd;
 
-    /* Keep name well under macOS PSHMNAMLEN (31 bytes). Unique per (pid, id, seq)
-     * so skip the guaranteed-ENOENT pre-unlink unless EEXIST actually happens. */
-    SDL_snprintf(name, sizeof(name), "/sk-%x-%x-%x", (unsigned)getpid(), (unsigned)image_id,
-                 (unsigned)seq);
+    /* Fast path: pop a pre-created, pre-ftruncated, pre-mmapped SHM segment
+     * from the background pool (zero shm_open/ftruncate/mmap on main thread). */
+    pool = KITTY_GetShmPool(vdata);
+    if (pool) {
+        pthread_mutex_lock(&pool->mu);
+        if (pool->ready_valid && pool->ready_len == raw_len) {
+            SDL_strlcpy(name, pool->ready_name, sizeof(name));
+            shm_fd = pool->ready_fd;
+            map = pool->ready_map;
+            pool->ready_valid = false;
+            pool->ready_fd = -1;
+            pool->ready_map = MAP_FAILED;
+            pool->ready_len = 0;
+            from_pool = true;
+        }
+        pool->want_len = raw_len;
+        pthread_cond_signal(&pool->cv);
+        pthread_mutex_unlock(&pool->mu);
+    }
 
-    shm_fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0600);
-    if (shm_fd < 0 && errno == EEXIST) {
-        shm_unlink(name);
+    if (!from_pool) {
+        const Uint32 seq = ++vdata->shm_seq;
+        /* Keep name well under macOS PSHMNAMLEN (31 bytes). Unique per (pid, id, seq)
+         * so skip the guaranteed-ENOENT pre-unlink unless EEXIST actually happens. */
+        SDL_snprintf(name, sizeof(name), "/sk-%x-%x-%x", (unsigned)getpid(), (unsigned)image_id,
+                     (unsigned)seq);
+
         shm_fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0600);
-    }
-    if (shm_fd < 0) {
-        return SDL_SetError("shm_open failed: %s", strerror(errno));
-    }
-    if (ftruncate(shm_fd, (off_t)raw_len) != 0) {
-        SDL_SetError("ftruncate shm failed: %s", strerror(errno));
-        goto done;
-    }
-    map = mmap(NULL, raw_len, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (map == MAP_FAILED) {
-        SDL_SetError("mmap shm failed: %s", strerror(errno));
-        goto done;
+        if (shm_fd < 0 && errno == EEXIST) {
+            shm_unlink(name);
+            shm_fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0600);
+        }
+        if (shm_fd < 0) {
+            return SDL_SetError("shm_open failed: %s", strerror(errno));
+        }
+        if (ftruncate(shm_fd, (off_t)raw_len) != 0) {
+            SDL_SetError("ftruncate shm failed: %s", strerror(errno));
+            goto done;
+        }
+        map = mmap(NULL, raw_len, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+        if (map == MAP_FAILED) {
+            SDL_SetError("mmap shm failed: %s", strerror(errno));
+            goto done;
+        }
     }
     SDL_memcpy(map, rgb, raw_len);
 
@@ -1270,6 +1744,7 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
         char ctrl[192];
         char apc[400];
         int ctrl_len, apc_len;
+        const bool client_unlink = (vdata->term_profile && vdata->term_profile->shm_unlink_after_send);
 
         if (encoded == 0) {
             SDL_SetError("shm name base64 failed");
@@ -1290,14 +1765,49 @@ static bool KITTY_TransmitShm(SDL_VideoData *vdata, Uint32 image_id, const Uint8
             SDL_SetError("shm apc snprintf failed");
             goto done;
         }
-        KITTY_FlushAsyncWriter(vdata);
-        if (!KITTY_WriteAll(fd, apc, (size_t)apc_len)) {
-            goto done;
+        if (!home_cursor && !client_unlink) {
+            KITTY_AsyncWriter *aw = KITTY_GetAsyncWriter(vdata);
+            if (aw) {
+                char *dst = KITTY_AsyncEnsureStage(aw, (size_t)apc_len + 1u);
+                if (dst) {
+                    SDL_memcpy(dst, apc, (size_t)apc_len);
+                    if (!KITTY_AsyncSubmitStage(vdata, aw, fd, (size_t)apc_len, false)) {
+                        SDL_SetError("kitty async shm write failed");
+                        goto done;
+                    }
+                    ok = true;
+                }
+            }
         }
-        ok = true;
+        if (!ok) {
+            KITTY_FlushAsyncWriter(vdata);
+            if (!KITTY_WriteAll(fd, apc, (size_t)apc_len)) {
+                goto done;
+            }
+            ok = true;
+        }
     }
 
 done:
+    if (ok && pool && map != MAP_FAILED && shm_fd >= 0 &&
+        !(vdata->term_profile && vdata->term_profile->shm_unlink_after_send)) {
+        /* Retire munmap+close on the background pool thread to avoid VM churn on main thread. */
+        bool retired = false;
+        pthread_mutex_lock(&pool->mu);
+        if (!pool->retire_valid) {
+            pool->retire_map = map;
+            pool->retire_len = raw_len;
+            pool->retire_fd = shm_fd;
+            pool->retire_valid = true;
+            pthread_cond_signal(&pool->cv);
+            retired = true;
+        }
+        pthread_mutex_unlock(&pool->mu);
+        if (retired) {
+            map = MAP_FAILED;
+            shm_fd = -1;
+        }
+    }
     if (map != MAP_FAILED) {
         munmap(map, raw_len);
     }
@@ -2448,7 +2958,7 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                 }
                 add = (size_t)header_len + b64_len + 2u;
                 if (aw->batching && aw->stage_len + add > KITTY_ASYNC_MAX_BYTES && aw->stage_len > 0) {
-                    if (!KITTY_AsyncSubmitStage(aw, vdata->tty_fd, aw->stage_len)) {
+                    if (!KITTY_AsyncSubmitStage(vdata, aw, vdata->tty_fd, aw->stage_len, false)) {
                         return SDL_SetError("kitty async rect-edit flush failed");
                     }
                 }
@@ -2469,7 +2979,7 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                     wire = (size_t)header_len + encoded + 2u;
                     if (aw->batching) {
                         aw->stage_len = base + wire;
-                    } else if (!KITTY_AsyncSubmitStage(aw, vdata->tty_fd, wire)) {
+                    } else if (!KITTY_AsyncSubmitStage(vdata, aw, vdata->tty_fd, wire, false)) {
                         return SDL_SetError("kitty async rect-edit write failed");
                     }
                 }
@@ -2647,7 +3157,7 @@ bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
             pos += ctx->slots[i].wire_len;
         }
     }
-    if (!KITTY_AsyncSubmitStage(aw, vdata->tty_fd, total_wire)) {
+    if (!KITTY_AsyncSubmitStage(vdata, aw, vdata->tty_fd, total_wire, false)) {
         return false;
     }
 
@@ -2870,6 +3380,122 @@ bool KITTY_TransmitRGB(SDL_VideoData *vdata, Uint32 image_id, const Uint8 *rgb, 
 #endif /* SDL_KITTY_PERF_ACK */
         }
         return ok;
+    }
+}
+
+static int KITTY_B64Val(unsigned char c)
+{
+    if (c >= 'A' && c <= 'Z') return (int)(c - 'A');
+    if (c >= 'a' && c <= 'z') return (int)(c - 'a') + 26;
+    if (c >= '0' && c <= '9') return (int)(c - '0') + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+bool KITTY_Osc52SetClipboard(SDL_VideoData *vdata, const char *utf8)
+{
+    size_t len, b64_cap, enc;
+    char *buf;
+    size_t hdr_len = 7; /* "\033]52;c;" */
+    bool ok;
+
+    if (!vdata || vdata->tty_out < 0 || !utf8) {
+        return false;
+    }
+    len = SDL_strlen(utf8);
+    if (len > 65536u) {
+        len = 65536u;
+    }
+    b64_cap = ((len + 2u) / 3u) * 4u + 1u;
+    buf = (char *)SDL_malloc(hdr_len + b64_cap + 2u);
+    if (!buf) {
+        return false;
+    }
+    SDL_memcpy(buf, "\033]52;c;", hdr_len);
+    if (len > 0) {
+        enc = KITTY_Base64Encode((const Uint8 *)utf8, len, buf + hdr_len, b64_cap);
+    } else {
+        enc = 0;
+    }
+    buf[hdr_len + enc + 0] = '\033';
+    buf[hdr_len + enc + 1] = '\\';
+
+    KITTY_FlushAsyncWriter(vdata);
+    ok = KITTY_WriteAll(vdata->tty_out, buf, hdr_len + enc + 2u);
+    SDL_free(buf);
+    return ok;
+}
+
+char *KITTY_Osc52GetClipboard(SDL_VideoData *vdata, int timeout_ms)
+{
+    char resp[8192];
+    size_t rlen = 0;
+    const Uint64 deadline = SDL_GetTicks() + (Uint64)(timeout_ms > 0 ? timeout_ms : 60);
+    const char *p, *b64_start = NULL, *b64_end = NULL;
+
+    if (!vdata || vdata->tty_out < 0 || vdata->tty_in < 0) {
+        return NULL;
+    }
+    KITTY_FlushAsyncWriter(vdata);
+    if (!KITTY_WriteAll(vdata->tty_out, "\033]52;c;?\033\\", 10)) {
+        return NULL;
+    }
+    while (SDL_GetTicks() < deadline && rlen + 1 < sizeof(resp)) {
+        const Uint64 now = SDL_GetTicks();
+        const int rem = (now < deadline) ? (int)(deadline - now) : 0;
+        ssize_t n;
+        if (!KITTY_PollReadable(vdata->tty_in, rem > 0 ? rem : 1)) {
+            break;
+        }
+        n = read(vdata->tty_in, resp + rlen, sizeof(resp) - 1u - rlen);
+        if (n <= 0) {
+            break;
+        }
+        rlen += (size_t)n;
+        resp[rlen] = '\0';
+        p = SDL_strstr(resp, "\033]52;");
+        if (p) {
+            const char *semi = SDL_strchr(p + 5, ';');
+            if (semi) {
+                const char *st = SDL_strstr(semi + 1, "\033\\");
+                const char *bel = SDL_strchr(semi + 1, '\007');
+                if (st || bel) {
+                    b64_start = semi + 1;
+                    b64_end = (st && (!bel || st < bel)) ? st : bel;
+                    break;
+                }
+            }
+        }
+    }
+    if (!b64_start || !b64_end || b64_end < b64_start) {
+        return NULL;
+    }
+    {
+        const size_t blen = (size_t)(b64_end - b64_start);
+        char *out = (char *)SDL_malloc((blen * 3u) / 4u + 4u);
+        size_t o = 0;
+        Uint32 accum = 0;
+        int bits = 0;
+        size_t i;
+        if (!out) {
+            return NULL;
+        }
+        for (i = 0; i < blen; ++i) {
+            const unsigned char ch = (unsigned char)b64_start[i];
+            int v;
+            if (ch == '=') break;
+            v = KITTY_B64Val(ch);
+            if (v < 0) continue;
+            accum = (accum << 6) | (Uint32)v;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                out[o++] = (char)((accum >> bits) & 0xFFu);
+            }
+        }
+        out[o] = '\0';
+        return out;
     }
 }
 

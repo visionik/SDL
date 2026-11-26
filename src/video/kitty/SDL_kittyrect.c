@@ -39,6 +39,231 @@
 #if defined(__ARM_NEON) && (SDL_BYTEORDER == SDL_LIL_ENDIAN)
 #include <arm_neon.h>
 #define KITTY_HAVE_NEON_LE 1
+#elif (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__)) && (SDL_BYTEORDER == SDL_LIL_ENDIAN)
+#include <immintrin.h>
+#define KITTY_HAVE_X86_SIMD 1
+
+static int KITTY_GetX86SimdLevel(void)
+{
+    static int cached = -1;
+    int lv = cached;
+    if (lv < 0) {
+        if (__builtin_cpu_supports("avx2")) {
+            lv = 2;
+        } else if (__builtin_cpu_supports("ssse3")) {
+            lv = 1;
+        } else {
+            lv = 0;
+        }
+        cached = lv;
+    }
+    return lv;
+}
+
+__attribute__((target("avx2")))
+static size_t KITTY_FindFirstDiff_AVX2(const Uint8 *a, const Uint8 *b, size_t len)
+{
+    size_t i = 0;
+    while (i + 128u <= len) {
+        const __m256i c0 = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(a + i)),
+                                             _mm256_loadu_si256((const __m256i *)(b + i)));
+        const __m256i c1 = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(a + i + 32)),
+                                             _mm256_loadu_si256((const __m256i *)(b + i + 32)));
+        const __m256i c2 = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(a + i + 64)),
+                                             _mm256_loadu_si256((const __m256i *)(b + i + 64)));
+        const __m256i c3 = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(a + i + 96)),
+                                             _mm256_loadu_si256((const __m256i *)(b + i + 96)));
+        const __m256i all = _mm256_and_si256(_mm256_and_si256(c0, c1), _mm256_and_si256(c2, c3));
+        if ((unsigned)_mm256_movemask_epi8(all) != 0xFFFFFFFFu) {
+            if ((unsigned)_mm256_movemask_epi8(c0) == 0xFFFFFFFFu) {
+                i += 32u;
+                if ((unsigned)_mm256_movemask_epi8(c1) == 0xFFFFFFFFu) {
+                    i += 32u;
+                    if ((unsigned)_mm256_movemask_epi8(c2) == 0xFFFFFFFFu) {
+                        i += 32u;
+                    }
+                }
+            }
+            while (i < len && a[i] == b[i]) {
+                i++;
+            }
+            return i;
+        }
+        i += 128u;
+    }
+    while (i + 32u <= len) {
+        const __m256i c = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(a + i)),
+                                            _mm256_loadu_si256((const __m256i *)(b + i)));
+        const unsigned eq = (unsigned)_mm256_movemask_epi8(c);
+        if (eq != 0xFFFFFFFFu) {
+            return i + (size_t)__builtin_ctz(~eq);
+        }
+        i += 32u;
+    }
+    while (i < len && a[i] == b[i]) {
+        i++;
+    }
+    return i;
+}
+
+__attribute__((target("ssse3")))
+static void KITTY_ConvertRowRGB_SSSE3(const Uint32 *src, Uint8 *dst, int count)
+{
+    const __m128i shuf = _mm_setr_epi8(2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1);
+    int x = 0;
+    /* Safe 16-byte stores while at least 4 extra destination bytes remain. */
+    for (; x + 8 <= count; x += 4) {
+        const __m128i bgra = _mm_loadu_si128((const __m128i *)(src + x));
+        const __m128i rgb = _mm_shuffle_epi8(bgra, shuf);
+        _mm_storeu_si128((__m128i *)dst, rgb);
+        dst += 12;
+    }
+    for (; x + 4 <= count; x += 4) {
+        const __m128i bgra = _mm_loadu_si128((const __m128i *)(src + x));
+        const __m128i rgb = _mm_shuffle_epi8(bgra, shuf);
+        const Uint64 lo = (Uint64)_mm_cvtsi128_si64(rgb);
+        const Uint32 hi = (Uint32)_mm_cvtsi128_si32(_mm_srli_si128(rgb, 8));
+        SDL_memcpy(dst, &lo, 8);
+        SDL_memcpy(dst + 8, &hi, 4);
+        dst += 12;
+    }
+    for (; x < count; ++x) {
+        const Uint32 p = src[x];
+        *dst++ = (Uint8)((p >> 16) & 0xFF);
+        *dst++ = (Uint8)((p >> 8) & 0xFF);
+        *dst++ = (Uint8)(p & 0xFF);
+    }
+}
+
+__attribute__((target("ssse3")))
+static void KITTY_ConvertRowRGBA_SSSE3(const Uint32 *src, Uint8 *dst, int count)
+{
+    const __m128i shuf = _mm_setr_epi8(2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
+    int x = 0;
+    for (; x + 8 <= count; x += 8) {
+        const __m128i p0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(src + x)), shuf);
+        const __m128i p1 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(src + x + 4)), shuf);
+        _mm_storeu_si128((__m128i *)dst, p0);
+        _mm_storeu_si128((__m128i *)(dst + 16), p1);
+        dst += 32;
+    }
+    for (; x + 4 <= count; x += 4) {
+        const __m128i p0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(src + x)), shuf);
+        _mm_storeu_si128((__m128i *)dst, p0);
+        dst += 16;
+    }
+    for (; x < count; ++x) {
+        const Uint32 p = src[x];
+        *dst++ = (Uint8)((p >> 16) & 0xFF);
+        *dst++ = (Uint8)((p >> 8) & 0xFF);
+        *dst++ = (Uint8)(p & 0xFF);
+        *dst++ = (Uint8)((p >> 24) & 0xFF);
+    }
+}
+
+__attribute__((target("ssse3")))
+static void KITTY_ConvertRowDualRGB_SSSE3(const Uint32 *src, Uint8 *dst_s, Uint8 *dst_p, int count)
+{
+    const __m128i shuf = _mm_setr_epi8(2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1);
+    int x = 0;
+    for (; x + 8 <= count; x += 4) {
+        const __m128i rgb = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(src + x)), shuf);
+        _mm_storeu_si128((__m128i *)dst_s, rgb);
+        _mm_storeu_si128((__m128i *)dst_p, rgb);
+        dst_s += 12;
+        dst_p += 12;
+    }
+    for (; x < count; ++x) {
+        const Uint32 p = src[x];
+        const Uint8 r = (Uint8)((p >> 16) & 0xFF);
+        const Uint8 g = (Uint8)((p >> 8) & 0xFF);
+        const Uint8 b = (Uint8)(p & 0xFF);
+        dst_s[0] = r; dst_s[1] = g; dst_s[2] = b;
+        dst_p[0] = r; dst_p[1] = g; dst_p[2] = b;
+        dst_s += 3;
+        dst_p += 3;
+    }
+}
+
+__attribute__((target("ssse3")))
+static void KITTY_ConvertRowDualRGBA_SSSE3(const Uint32 *src, Uint8 *dst_s, Uint8 *dst_p, int count)
+{
+    const __m128i shuf = _mm_setr_epi8(2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
+    int x = 0;
+    for (; x + 4 <= count; x += 4) {
+        const __m128i rgba = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(src + x)), shuf);
+        _mm_storeu_si128((__m128i *)dst_s, rgba);
+        _mm_storeu_si128((__m128i *)dst_p, rgba);
+        dst_s += 16;
+        dst_p += 16;
+    }
+    for (; x < count; ++x) {
+        const Uint32 p = src[x];
+        const Uint8 r = (Uint8)((p >> 16) & 0xFF);
+        const Uint8 g = (Uint8)((p >> 8) & 0xFF);
+        const Uint8 b = (Uint8)(p & 0xFF);
+        const Uint8 a = (Uint8)((p >> 24) & 0xFF);
+        dst_s[0] = r; dst_s[1] = g; dst_s[2] = b; dst_s[3] = a;
+        dst_p[0] = r; dst_p[1] = g; dst_p[2] = b; dst_p[3] = a;
+        dst_s += 4;
+        dst_p += 4;
+    }
+}
+
+__attribute__((target("ssse3")))
+static bool KITTY_CleanRowCheck_SSSE3(const Uint32 *s, const Uint8 *d, int fb_w, bool use_rgba, int *out_x)
+{
+    int x = 0;
+    if (!use_rgba) {
+        const __m128i shuf = _mm_setr_epi8(2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1);
+        /* Safe 16B load on d while >= 4 bytes remain after the 12B compare. */
+        for (; x + 8 <= fb_w; x += 4) {
+            const __m128i rgb = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(s + x)), shuf);
+            const __m128i old = _mm_loadu_si128((const __m128i *)d);
+            const int eq = _mm_movemask_epi8(_mm_cmpeq_epi8(rgb, old)) & 0x0FFF;
+            if (eq != 0x0FFF) {
+                *out_x = x;
+                return true;
+            }
+            d += 12;
+        }
+        for (; x < fb_w; ++x) {
+            const Uint32 p = s[x];
+            if (d[0] != (Uint8)((p >> 16) & 0xFF) ||
+                d[1] != (Uint8)((p >> 8) & 0xFF) ||
+                d[2] != (Uint8)(p & 0xFF)) {
+                *out_x = x;
+                return true;
+            }
+            d += 3;
+        }
+    } else {
+        const __m128i shuf = _mm_setr_epi8(2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
+        for (; x + 8 <= fb_w; x += 8) {
+            const __m128i p0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(s + x)), shuf);
+            const __m128i p1 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(s + x + 4)), shuf);
+            const __m128i e0 = _mm_cmpeq_epi8(p0, _mm_loadu_si128((const __m128i *)d));
+            const __m128i e1 = _mm_cmpeq_epi8(p1, _mm_loadu_si128((const __m128i *)(d + 16)));
+            if (_mm_movemask_epi8(_mm_and_si128(e0, e1)) != 0xFFFF) {
+                *out_x = x;
+                return true;
+            }
+            d += 32;
+        }
+        for (; x < fb_w; ++x) {
+            const Uint32 p = s[x];
+            if (d[0] != (Uint8)((p >> 16) & 0xFF) ||
+                d[1] != (Uint8)((p >> 8) & 0xFF) ||
+                d[2] != (Uint8)(p & 0xFF) ||
+                d[3] != (Uint8)((p >> 24) & 0xFF)) {
+                *out_x = x;
+                return true;
+            }
+            d += 4;
+        }
+    }
+    return false;
+}
 #endif
 
 /*
@@ -575,6 +800,22 @@ static size_t KITTY_FindFirstDiff(const Uint8 *a, const Uint8 *b, size_t len)
         }
         i += 16u;
     }
+#elif defined(KITTY_HAVE_X86_SIMD)
+    if (len >= 32u && KITTY_GetX86SimdLevel() >= 2) {
+        return KITTY_FindFirstDiff_AVX2(a, b, len);
+    }
+    while (i + 8u <= len) {
+        Uint64 wa, wb;
+        SDL_memcpy(&wa, a + i, 8);
+        SDL_memcpy(&wb, b + i, 8);
+        if (wa != wb) {
+            while (i < len && a[i] == b[i]) {
+                i++;
+            }
+            return i;
+        }
+        i += 8u;
+    }
 #else
     while (i + 8u <= len) {
         Uint64 wa, wb;
@@ -942,6 +1183,11 @@ static inline void KITTY_ConvertRowRGB(const Uint32 *src, Uint8 *dst, int count)
         vst3q_u8(dst, rgb);
         dst += 48;
     }
+#elif defined(KITTY_HAVE_X86_SIMD)
+    if (count >= 8 && KITTY_GetX86SimdLevel() >= 1) {
+        KITTY_ConvertRowRGB_SSSE3(src, dst, count);
+        return;
+    }
 #endif
     for (; x < count; ++x) {
         const Uint32 p = src[x];
@@ -964,6 +1210,11 @@ static inline void KITTY_ConvertRowRGBA(const Uint32 *src, Uint8 *dst, int count
         rgba.val[3] = bgra.val[3];
         vst4q_u8(dst, rgba);
         dst += 64;
+    }
+#elif defined(KITTY_HAVE_X86_SIMD)
+    if (count >= 4 && KITTY_GetX86SimdLevel() >= 1) {
+        KITTY_ConvertRowRGBA_SSSE3(src, dst, count);
+        return;
     }
 #endif
     for (; x < count; ++x) {
@@ -1117,6 +1368,16 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
                 continue;
             }
             tx_idx = x / tile;
+        } else {
+            tx_idx = 0;
+        }
+#elif defined(KITTY_HAVE_X86_SIMD)
+        if (dirty_in_band == 0 && fb_w >= 8 && KITTY_GetX86SimdLevel() >= 1) {
+            int first_x = 0;
+            if (!KITTY_CleanRowCheck_SSSE3(row_src, row_dst, fb_w, use_rgba, &first_x)) {
+                continue;
+            }
+            tx_idx = first_x / tile;
         } else {
             tx_idx = 0;
         }
@@ -1875,6 +2136,11 @@ static inline void KITTY_ConvertRowDualRGB(const Uint32 *src, Uint8 *dst_s, Uint
         dst_s += 48;
         dst_p += 48;
     }
+#elif defined(KITTY_HAVE_X86_SIMD)
+    if (count >= 8 && KITTY_GetX86SimdLevel() >= 1) {
+        KITTY_ConvertRowDualRGB_SSSE3(src, dst_s, dst_p, count);
+        return;
+    }
 #endif
     for (; x < count; ++x) {
         const Uint32 p = src[x];
@@ -1903,6 +2169,11 @@ static inline void KITTY_ConvertRowDualRGBA(const Uint32 *src, Uint8 *dst_s, Uin
         vst4q_u8(dst_p, rgba);
         dst_s += 64;
         dst_p += 64;
+    }
+#elif defined(KITTY_HAVE_X86_SIMD)
+    if (count >= 4 && KITTY_GetX86SimdLevel() >= 1) {
+        KITTY_ConvertRowDualRGBA_SSSE3(src, dst_s, dst_p, count);
+        return;
     }
 #endif
     for (; x < count; ++x) {

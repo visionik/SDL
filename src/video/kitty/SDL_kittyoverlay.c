@@ -22,6 +22,7 @@
 
 #ifdef SDL_VIDEO_DRIVER_KITTY
 
+#include "SDL_kittyfont.h"
 #include "SDL_kittyoverlay.h"
 
 #include <fcntl.h>
@@ -524,6 +525,159 @@ static bool KITTY_OverlayRenderBitmap(KITTY_ToastOverlay *ov, int fb_w, int fb_h
         return false;
     }
 
+    /* Retina-sharp Geist-Regular TTF + glassmorphic floating pill path. */
+    if (KITTY_FontEnsureInit()) {
+        const char *tlines[16];
+        size_t tlens[16];
+        int tn = 0;
+        const char *tp = ov->text;
+        float px_sz;
+        float max_w = 0.0f;
+        int li;
+        int shadow_pad, card_w, card_h, pad_x_t, pad_y_t, lh_t;
+
+        while (*tp && tn < 16) {
+            const char *start = tp;
+            while (*tp && *tp != '\n') {
+                tp++;
+            }
+            tlines[tn] = start;
+            tlens[tn] = (size_t)(tp - start);
+            tn++;
+            if (*tp == '\n') tp++;
+        }
+        if (tn == 0) {
+            return false;
+        }
+
+        if (ov->req_scale > 0) {
+            px_sz = (float)ov->req_scale * 11.0f;
+        } else {
+            px_sz = (float)fb_h / 34.0f;
+            if (px_sz < 14.0f) px_sz = 14.0f;
+            if (px_sz > 26.0f) px_sz = 26.0f;
+        }
+        /* Shrink cleanly so pill stays <= 92% of framebuffer width. */
+        for (;;) {
+            max_w = 0.0f;
+            for (li = 0; li < tn; ++li) {
+                const float w = KITTY_FontMeasureUTF8(tlines[li], tlens[li], px_sz, false);
+                if (w > max_w) max_w = w;
+            }
+            if (px_sz <= 11.0f || max_w + px_sz * 2.4f <= (float)fb_w * 0.92f) {
+                break;
+            }
+            px_sz -= 1.5f;
+        }
+        if (max_w < 1.0f) {
+            return false;
+        }
+
+        pad_x_t = (int)(px_sz * 1.05f + 0.5f);
+        pad_y_t = (int)(px_sz * 0.58f + 0.5f);
+        lh_t = (int)(px_sz * 1.38f + 0.5f);
+        shadow_pad = (int)(px_sz * 0.42f + 0.5f);
+        card_w = (int)(max_w + 0.5f) + pad_x_t * 2;
+        card_h = tn * lh_t - (int)(px_sz * 0.30f) + pad_y_t * 2;
+        bw = card_w + shadow_pad * 2;
+        bh = card_h + shadow_pad * 2 + 2;
+        if (bw > fb_w - 8) bw = fb_w - 8;
+        if (bh > fb_h - 8) bh = fb_h - 8;
+        if (bw <= 8 || bh <= 8) {
+            return false;
+        }
+
+        need = (size_t)bw * (size_t)bh * 4u;
+        if (ov->rgba_cap < need) {
+            Uint8 *nb = (Uint8 *)SDL_realloc(ov->rgba, need);
+            if (!nb) {
+                return false;
+            }
+            ov->rgba = nb;
+            ov->rgba_cap = need;
+        }
+        SDL_memset(ov->rgba, 0, need);
+
+        {
+            KITTY_Canvas canvas;
+            Uint8 bg_top[4], bg_bot[4];
+            float corner_r;
+            canvas.rgba = ov->rgba;
+            canvas.w = bw;
+            canvas.h = bh;
+
+            bg_top[0] = (Uint8)SDL_min(255, (int)ov->bg[0] + 10);
+            bg_top[1] = (Uint8)SDL_min(255, (int)ov->bg[1] + 12);
+            bg_top[2] = (Uint8)SDL_min(255, (int)ov->bg[2] + 16);
+            bg_top[3] = ov->bg[3];
+            bg_bot[0] = (Uint8)SDL_max(0, (int)ov->bg[0] - 6);
+            bg_bot[1] = (Uint8)SDL_max(0, (int)ov->bg[1] - 6);
+            bg_bot[2] = (Uint8)SDL_max(0, (int)ov->bg[2] - 8);
+            bg_bot[3] = (Uint8)SDL_min(255, (int)ov->bg[3] + 8);
+
+            corner_r = (tn == 1) ? ((float)card_h * 0.45f) : (px_sz * 0.65f);
+            KITTY_CanvasDrawRoundedCard(&canvas, shadow_pad, shadow_pad, card_w, card_h,
+                                        corner_r, bg_top, bg_bot, ov->border, shadow_pad, 36);
+
+            for (li = 0; li < tn; ++li) {
+                const float lw = KITTY_FontMeasureUTF8(tlines[li], tlens[li], px_sz, false);
+                float tx = (float)shadow_pad + ((float)card_w - lw) * 0.5f;
+                const float ty = (float)(shadow_pad + pad_y_t + li * lh_t) + px_sz * 0.80f;
+                if (tx < (float)(shadow_pad + pad_x_t)) {
+                    tx = (float)(shadow_pad + pad_x_t);
+                }
+                KITTY_FontDrawUTF8(&canvas, tx, ty, tlines[li], tlens[li], px_sz,
+                                   ov->fg, true, false);
+            }
+        }
+
+        margin_x = (fb_w >= 480) ? 18 : 8;
+        margin_y = (fb_h >= 360) ? 14 : 6;
+        switch (ov->pos) {
+        case KITTY_OV_POS_TOP:
+            ox = (fb_w - bw) / 2;
+            oy = margin_y;
+            break;
+        case KITTY_OV_POS_CENTER:
+            ox = (fb_w - bw) / 2;
+            oy = (fb_h - bh) / 2;
+            break;
+        case KITTY_OV_POS_TOP_LEFT:
+            ox = margin_x;
+            oy = margin_y;
+            break;
+        case KITTY_OV_POS_TOP_RIGHT:
+            ox = fb_w - bw - margin_x;
+            oy = margin_y;
+            break;
+        case KITTY_OV_POS_BOTTOM_LEFT:
+            ox = margin_x;
+            oy = fb_h - bh - margin_y;
+            break;
+        case KITTY_OV_POS_BOTTOM_RIGHT:
+            ox = fb_w - bw - margin_x;
+            oy = fb_h - bh - margin_y;
+            break;
+        case KITTY_OV_POS_BOTTOM:
+        default:
+            ox = (fb_w - bw) / 2;
+            oy = fb_h - bh - margin_y;
+            break;
+        }
+        if (ox < 0) ox = 0;
+        if (oy < 0) oy = 0;
+        if (ox + bw > fb_w) ox = fb_w - bw;
+        if (oy + bh > fb_h) oy = fb_h - bh;
+
+        ov->rect.x = ox;
+        ov->rect.y = oy;
+        ov->rect.w = bw;
+        ov->rect.h = bh;
+        ov->cache_fb_w = fb_w;
+        ov->cache_fb_h = fb_h;
+        return true;
+    }
+
     /* Split into up to 16 lines and count glyph columns per line. */
     while (*p && n_lines < 16) {
         const char *start = p;
@@ -957,6 +1111,35 @@ bool KITTY_OverlayHandleKey(KITTY_ToastOverlay *ov, SDL_Scancode scancode, Uint6
         ov->delay_ms = 0;
     }
     return true;
+}
+
+void KITTY_OverlayShowTransient(KITTY_ToastOverlay **ov_slot, const char *text,
+                                Uint64 duration_ms, Uint64 now_ms)
+{
+    KITTY_ToastOverlay *ov;
+    if (!ov_slot || !text || !text[0]) {
+        return;
+    }
+    if (!*ov_slot) {
+        ov = (KITTY_ToastOverlay *)SDL_calloc(1, sizeof(KITTY_ToastOverlay));
+        if (!ov) {
+            return;
+        }
+        ov->pos = KITTY_OV_POS_BOTTOM;
+        ov->fade_ms = 500;
+        KITTY_OverlaySetTheme(ov, "tokyo");
+        *ov_slot = ov;
+    } else {
+        ov = *ov_slot;
+    }
+    KITTY_CopyTextEscaped(ov->text, sizeof(ov->text), text, SDL_strlen(text));
+    ov->delay_ms = 0;
+    ov->duration_ms = duration_ms > 0 ? duration_ms : 2800u;
+    ov->hidden_by_user = false;
+    ov->started = true;
+    ov->start_ms = now_ms;
+    ov->cache_fb_w = 0;
+    ov->cache_fb_h = 0;
 }
 
 #endif /* SDL_VIDEO_DRIVER_KITTY */

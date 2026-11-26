@@ -156,12 +156,20 @@ typedef struct SDL_VideoData
     char *tx_b64_buf;
     size_t tx_b64_cap;
     void *tx_zstream; /* z_stream*, lazily initialized with deflateInit */
+    void *tx_ld_comp; /* struct libdeflate_compressor*, if SDL_KITTY_HAVE_LIBDEFLATE */
+    int tx_ld_level;
     void *tx_pz_ctx;  /* parallel zlib slice streams/buffers, lazily initialized */
     void *tx_mr_ctx;  /* parallel multi-rect a=f pack+zlib+b64 worker pool */
     void *tx_async;   /* depth-1 pipelined async PTY writer thread */
+    void *tx_shm_pool; /* background pre-allocated POSIX SHM slot pool */
+    Uint64 async_dropped_frames; /* full frames dropped under SSH/PTY backpressure */
     void *overlay;    /* KITTY_ToastOverlay* from SDL_KITTY_OVERLAY, if configured */
+    void *hud;        /* KITTY_PerfHud* (F12 live perf HUD + REC badge) */
+    void *capture;    /* KITTY_Capture* (F10 PNG screenshot + Shift+F10 video) */
+    char *clipboard_text; /* local cache synced via OSC 52 */
     /* Cached hot-path present/transmit policy resolved once at VideoInit. */
     bool cfg_cached;
+    bool cfg_async_drop; /* drop stale queued full frames when PTY writer is busy */
     bool cfg_dirty_enabled;
     bool cfg_fb_diff;
     int cfg_fb_diff_tile;

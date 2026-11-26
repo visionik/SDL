@@ -63,6 +63,13 @@ void KITTY_OverlayMarkDrawn(KITTY_ToastOverlay *ov, Uint8 alpha);
  */
 bool KITTY_OverlayHandleKey(KITTY_ToastOverlay *ov, SDL_Scancode scancode, Uint64 now_ms);
 
+/*
+ * Show a temporary transient toast notification (e.g. screenshot saved),
+ * lazily creating the overlay instance if *ov_slot is NULL.
+ */
+void KITTY_OverlayShowTransient(KITTY_ToastOverlay **ov_slot, const char *text,
+                                Uint64 duration_ms, Uint64 now_ms);
+
 #endif /* SDL_kittyoverlay_h_ */
 
 #endif /* SDL_VIDEO_DRIVER_KITTY */

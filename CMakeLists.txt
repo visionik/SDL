@@ -3562,6 +3562,17 @@ if(SDL_VIDEO)
     else()
       sdl_link_dependency(kitty_zlib LIBS z)
     endif()
+    # Optional libdeflate fast-path (prefer static archive so relocatable
+    # builds stay self-contained without an extra runtime dylib/so).
+    find_path(KITTY_LIBDEFLATE_INCLUDE_DIR libdeflate.h
+      HINTS /opt/homebrew/include /usr/local/include /usr/include)
+    find_library(KITTY_LIBDEFLATE_STATIC_LIB NAMES libdeflate.a
+      HINTS /opt/homebrew/lib /usr/local/lib /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu)
+    if(KITTY_LIBDEFLATE_INCLUDE_DIR AND KITTY_LIBDEFLATE_STATIC_LIB)
+      sdl_include_directories(PRIVATE "${KITTY_LIBDEFLATE_INCLUDE_DIR}")
+      sdl_link_dependency(kitty_libdeflate LIBS "${KITTY_LIBDEFLATE_STATIC_LIB}")
+      sdl_compile_definitions(PRIVATE "SDL_KITTY_HAVE_LIBDEFLATE=1")
+    endif()
     set(HAVE_KITTY TRUE)
     set(HAVE_SDL_VIDEO TRUE)
   endif()

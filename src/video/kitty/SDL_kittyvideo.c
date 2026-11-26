@@ -31,9 +31,12 @@
 #include "../SDL_pixels_c.h"
 #include "../SDL_sysvideo.h"
 
+#include "SDL_kittycapture.h"
 #include "SDL_kittyevents_c.h"
+#include "SDL_kittyfont.h"
 #include "SDL_kittyframebuffer_c.h"
 #include "SDL_kittygraphics.h"
+#include "SDL_kittyhud.h"
 #include "SDL_kittyoverlay.h"
 #include "SDL_kittyprobe.h"
 #include "SDL_kittyprofile.h"
@@ -54,6 +57,43 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this);
  * Restore the previous SIGWINCH handler and leave owned terminal modes
  * (keyboard/mouse/APC state) before the video device is torn down.
  */
+static bool KITTY_SetClipboardText(SDL_VideoDevice *_this, const char *text)
+{
+    SDL_VideoData *data = (SDL_VideoData *)_this->internal;
+    if (!data) {
+        return false;
+    }
+    SDL_free(data->clipboard_text);
+    data->clipboard_text = text ? SDL_strdup(text) : SDL_strdup("");
+    if (data->terminal_owned && text) {
+        (void)KITTY_Osc52SetClipboard(data, text);
+    }
+    return data->clipboard_text != NULL;
+}
+
+static char *KITTY_GetClipboardText(SDL_VideoDevice *_this)
+{
+    SDL_VideoData *data = (SDL_VideoData *)_this->internal;
+    if (!data) {
+        return SDL_strdup("");
+    }
+    if (data->terminal_owned) {
+        char *remote = KITTY_Osc52GetClipboard(data, 70);
+        if (remote) {
+            SDL_free(data->clipboard_text);
+            data->clipboard_text = SDL_strdup(remote);
+            return remote;
+        }
+    }
+    return data->clipboard_text ? SDL_strdup(data->clipboard_text) : SDL_strdup("");
+}
+
+static bool KITTY_HasClipboardText(SDL_VideoDevice *_this)
+{
+    SDL_VideoData *data = (SDL_VideoData *)_this->internal;
+    return data && data->clipboard_text && data->clipboard_text[0] != '\0';
+}
+
 static void KITTY_VideoQuit(SDL_VideoDevice *_this);
 
 static SDL_VideoData * volatile KITTY_winch_data = NULL;
@@ -239,6 +279,9 @@ static SDL_VideoDevice *KITTY_CreateDevice(void)
     device->ShowWindow = KITTY_ShowWindow;
     device->HideWindow = KITTY_HideWindow;
     device->SetWindowSize = KITTY_SetWindowSize;
+    device->SetClipboardText = KITTY_SetClipboardText;
+    device->GetClipboardText = KITTY_GetClipboardText;
+    device->HasClipboardText = KITTY_HasClipboardText;
     device->free = KITTY_DeleteDevice;
 
     return device;
@@ -406,6 +449,21 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
              * for ~350 us extra parallel CPU, substantially improving FPS. */
             data->cfg_zlib_level = 4;
         }
+        env = SDL_getenv("SDL_KITTY_ASYNC_DROP");
+        if (env && env[0]) {
+            data->cfg_async_drop = (env[0] == '1' || SDL_strcasecmp(env, "true") == 0 ||
+                                    SDL_strcasecmp(env, "yes") == 0 ||
+                                    SDL_strcasecmp(env, "on") == 0);
+        } else {
+            const char *aenv = SDL_getenv("SDL_KITTY_ASYNC");
+            if (aenv && SDL_strcasecmp(aenv, "drop") == 0) {
+                data->cfg_async_drop = true;
+            } else {
+                /* Auto-enable non-blocking stale-frame drop over SSH so slow WAN
+                 * links never stall the app/emulator simulation loop. */
+                data->cfg_async_drop = (SDL_getenv("SSH_CONNECTION") != NULL);
+            }
+        }
         env = SDL_getenv("SDL_KITTY_TRANSMIT");
         if (env && env[0]) {
             if (SDL_strcasecmp(env, "direct") == 0) {
@@ -425,6 +483,8 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
                                          : ((size_t)1920 * 1080 * 4);
         data->cfg_apc_chunk_bytes = KITTY_ProfileApcChunkBytes(prof);
         data->overlay = KITTY_OverlayCreate(SDL_getenv("SDL_KITTY_OVERLAY"));
+        data->hud = KITTY_HudCreate(SDL_getenv("SDL_KITTY_HUD"));
+        data->capture = KITTY_CaptureCreate();
         data->cfg_cached = true;
     }
 
@@ -501,9 +561,16 @@ static void KITTY_VideoQuit(SDL_VideoDevice *_this)
         data->terminal_owned = false;
     }
     if (data) {
+        KITTY_CaptureDestroy((KITTY_Capture *)data->capture);
+        data->capture = NULL;
+        KITTY_HudDestroy((KITTY_PerfHud *)data->hud);
+        data->hud = NULL;
         KITTY_OverlayDestroy((KITTY_ToastOverlay *)data->overlay);
         data->overlay = NULL;
+        SDL_free(data->clipboard_text);
+        data->clipboard_text = NULL;
         KITTY_FreeTransmitBuffers(data);
+        KITTY_FontShutdown();
     }
 }
 

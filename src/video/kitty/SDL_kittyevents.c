@@ -34,8 +34,10 @@
 #include "../../events/SDL_keyboard_c.h"
 #include "../../events/SDL_mouse_c.h"
 #include "../../events/SDL_windowevents_c.h"
+#include "SDL_kittycapture.h"
 #include "SDL_kittyevents_c.h"
 #include "SDL_kittygraphics.h"
+#include "SDL_kittyhud.h"
 #include "SDL_kittyoverlay.h"
 #include "SDL_kittyprobe.h"
 #include "SDL_kittyprofile.h"
@@ -211,9 +213,22 @@ static void KITTY_SendKey(SDL_Scancode scancode, bool pressed)
     }
     if (pressed) {
         SDL_VideoData *vd = KITTY_ActiveVideoData();
-        if (vd && vd->overlay &&
-            KITTY_OverlayHandleKey((KITTY_ToastOverlay *)vd->overlay, scancode, SDL_GetTicks())) {
-            return;
+        if (vd) {
+            if (vd->overlay &&
+                KITTY_OverlayHandleKey((KITTY_ToastOverlay *)vd->overlay, scancode, SDL_GetTicks())) {
+                return;
+            }
+            if (vd->hud && KITTY_HudHandleKey((KITTY_PerfHud *)vd->hud, scancode)) {
+                return;
+            }
+            if (scancode == SDL_SCANCODE_F10 && vd->capture) {
+                if ((SDL_GetModState() & SDL_KMOD_SHIFT) != 0) {
+                    KITTY_CaptureToggleVideo((KITTY_Capture *)vd->capture);
+                } else {
+                    KITTY_CaptureRequestPng((KITTY_Capture *)vd->capture);
+                }
+                return;
+            }
         }
     }
     SDL_SendKeyboardKey(0, SDL_GLOBAL_KEYBOARD_ID, 0, scancode, pressed);

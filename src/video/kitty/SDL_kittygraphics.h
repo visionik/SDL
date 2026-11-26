@@ -182,6 +182,10 @@ bool KITTY_DeleteAllImages(int fd);
  */
 bool KITTY_DeleteImage(int fd, Uint32 image_id);
 
+/* Emit OSC 52 clipboard write (\033]52;c;<b64>\033\\) and query (\033]52;c;?\033\\). */
+bool KITTY_Osc52SetClipboard(SDL_VideoData *vdata, const char *utf8);
+char *KITTY_Osc52GetClipboard(SDL_VideoData *vdata, int timeout_ms);
+
 #endif // SDL_kittygraphics_h_
 
 #endif // SDL_VIDEO_DRIVER_KITTY
