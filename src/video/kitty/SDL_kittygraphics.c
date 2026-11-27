@@ -511,6 +511,7 @@ typedef struct KITTY_MultiRectCtx
     int fb_h;
     int kitty_f;
     Uint32 image_id;
+    Uint32 frame_num;
     size_t chunk_cap;
     int zlevel;
     bool want_zlib;
@@ -651,8 +652,9 @@ static void KITTY_MultiRectWorker(void *arg, size_t idx)
         return;
     }
     header_len = SDL_snprintf(header, sizeof(header),
-                              "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
+                              "\033_Ga=f,f=%d,t=d,%si=%u,r=%u,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
                               ctx->kitty_f, use_z ? "o=z," : "", (unsigned)ctx->image_id,
+                              (unsigned)(ctx->frame_num ? ctx->frame_num : 1u),
                               s->rect.x, s->rect.y, s->rect.w, s->rect.h);
     if (header_len <= 0) {
         return;
@@ -898,6 +900,46 @@ void KITTY_BeginAsyncBatch(SDL_VideoData *vdata)
     }
     w->stage_len = 0;
     w->batching = true;
+}
+
+bool KITTY_AppendRawAsyncApc(SDL_VideoData *vdata, const char *apc, size_t len)
+{
+    KITTY_AsyncWriter *w;
+    if (!vdata || !apc || len == 0) {
+        return true;
+    }
+    w = KITTY_GetAsyncWriter(vdata);
+    if (w && w->batching) {
+        char *dst;
+        if (w->stage_len + len > KITTY_ASYNC_MAX_BYTES && w->stage_len > 0) {
+            if (!KITTY_AsyncSubmitStage(vdata, w, vdata->tty_fd, w->stage_len, false)) {
+                return false;
+            }
+        }
+        dst = KITTY_AsyncEnsureStage(w, w->stage_len + len + 1u);
+        if (!dst) {
+            return false;
+        }
+        SDL_memcpy(dst + w->stage_len, apc, len);
+        w->stage_len += len;
+    } else if (w && len <= KITTY_ASYNC_MAX_BYTES) {
+        char *dst = KITTY_AsyncEnsureStage(w, len + 1u);
+        if (!dst) {
+            return false;
+        }
+        SDL_memcpy(dst, apc, len);
+        if (!KITTY_AsyncSubmitStage(vdata, w, vdata->tty_fd, len, false)) {
+            return false;
+        }
+    } else {
+        KITTY_FlushAsyncWriter(vdata);
+        if (!KITTY_WriteAll(vdata->tty_fd, apc, len)) {
+            return false;
+        }
+    }
+    vdata->last_wire_bytes += len;
+    vdata->total_wire_bytes += len;
+    return true;
 }
 
 void KITTY_CancelAsyncBatch(SDL_VideoData *vdata)
@@ -3060,10 +3102,11 @@ static bool KITTY_EmitRectEditPayload(SDL_VideoData *vdata, Uint32 image_id,
         KITTY_AsyncWriter *aw = KITTY_GetAsyncWriter(vdata);
         if (aw) {
             char header[160];
+            const Uint32 edit_frame = vdata->active_edit_frame ? vdata->active_edit_frame : 1u;
             const int header_len = SDL_snprintf(header, sizeof(header),
-                                                "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
+                                                "\033_Ga=f,f=%d,t=d,%si=%u,r=%u,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
                                                 kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id,
-                                                x, y, rw, rh);
+                                                (unsigned)edit_frame, x, y, rw, rh);
             size_t add;
             char *dst;
             size_t wire;
@@ -3138,10 +3181,12 @@ static bool KITTY_EmitRectEditPayload(SDL_VideoData *vdata, Uint32 image_id,
             }
             more = (offset + chunk < encoded) ? 1 : 0;
             if (first) {
-                /* r=1 edits root; X=1 overwrite; q=2 quiet (no APC OK). */
+                /* r=edit_frame edits active frame; X=1 overwrite; q=2 quiet (no APC OK). */
+                const Uint32 edit_frame = vdata->active_edit_frame ? vdata->active_edit_frame : 1u;
                 header_len = SDL_snprintf(header, sizeof(header),
-                                          "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2%s;",
-                                          kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id, x, y, rw, rh,
+                                          "\033_Ga=f,f=%d,t=d,%si=%u,r=%u,X=1,x=%d,y=%d,s=%d,v=%d,q=2%s;",
+                                          kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id,
+                                          (unsigned)edit_frame, x, y, rw, rh,
                                           more ? ",m=1" : "");
                 first = false;
             } else {
@@ -3347,6 +3392,7 @@ bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     ctx->fb_h = fb_h;
     ctx->kitty_f = kitty_f;
     ctx->image_id = image_id;
+    ctx->frame_num = vdata->active_edit_frame ? vdata->active_edit_frame : 1u;
     ctx->chunk_cap = vdata->cfg_cached
                          ? vdata->cfg_apc_chunk_bytes
                          : KITTY_ProfileApcChunkBytes(vdata->term_profile);
@@ -3378,19 +3424,38 @@ bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     if (!aw) {
         return false;
     }
-    dst = KITTY_AsyncEnsureStage(aw, total_wire + 1u);
-    if (!dst) {
-        return false;
-    }
-    {
-        size_t pos = 0;
+    if (aw->batching) {
+        size_t pos;
+        if (aw->stage_len + total_wire > KITTY_ASYNC_MAX_BYTES && aw->stage_len > 0) {
+            if (!KITTY_AsyncSubmitStage(vdata, aw, vdata->tty_fd, aw->stage_len, false)) {
+                return false;
+            }
+        }
+        dst = KITTY_AsyncEnsureStage(aw, aw->stage_len + total_wire + 1u);
+        if (!dst) {
+            return false;
+        }
+        pos = aw->stage_len;
         for (i = 0; i < valid_n; ++i) {
             SDL_memcpy(dst + pos, ctx->slots[i].apc_buf, ctx->slots[i].wire_len);
             pos += ctx->slots[i].wire_len;
         }
-    }
-    if (!KITTY_AsyncSubmitStage(vdata, aw, vdata->tty_fd, total_wire, false)) {
-        return false;
+        aw->stage_len = pos;
+    } else {
+        dst = KITTY_AsyncEnsureStage(aw, total_wire + 1u);
+        if (!dst) {
+            return false;
+        }
+        {
+            size_t pos = 0;
+            for (i = 0; i < valid_n; ++i) {
+                SDL_memcpy(dst + pos, ctx->slots[i].apc_buf, ctx->slots[i].wire_len);
+                pos += ctx->slots[i].wire_len;
+            }
+        }
+        if (!KITTY_AsyncSubmitStage(vdata, aw, vdata->tty_fd, total_wire, false)) {
+            return false;
+        }
     }
 
     {

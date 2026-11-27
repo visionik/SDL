@@ -41,6 +41,9 @@
 #include "SDL_kittyprobe.h"
 #include "SDL_kittyprofile.h"
 #include "SDL_kittyrect.h"
+#ifdef SDL_KITTY_HAVE_LIBKITTYOPS
+#include <kittyops.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -304,6 +307,8 @@ static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
     }
     SDL_free(wdata->rgb_scratch);
     wdata->rgb_scratch = NULL;
+    SDL_free(wdata->prev_rgb_scratch);
+    wdata->prev_rgb_scratch = NULL;
     SDL_free(wdata->pack_scratch);
     wdata->pack_scratch = NULL;
     wdata->pack_scratch_cap = 0;
@@ -311,7 +316,10 @@ static void KITTY_FreeRGBScratch(SDL_WindowData *wdata)
     wdata->rgb_h = 0;
     wdata->scratch_bpp = 0;
     wdata->rgb_valid = false;
+    wdata->prev_rgb_valid = false;
     wdata->live_image_id = 0;
+    wdata->active_frame = 1u;
+    wdata->frame2_created = false;
     wdata->overlay_count = 0;
     wdata->last_upload_hash = 0;
     wdata->last_upload_hash_valid = false;
@@ -507,6 +515,12 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         bool hud_needs_redraw = false;
         bool hud_applied = false;
         SDL_Rect hud_rect = { 0, 0, 0, 0 };
+        bool scroll_compose_ok = false;
+        bool scroll_compose_hit = false;
+        int scroll_dx = 0;
+        int scroll_dy = 0;
+        SDL_Rect scroll_rects[16];
+        int scroll_numrects = 0;
         Uint64 pre_hash = 0;
         SDL_Rect diff_rects[16];
         int diff_n = 0;
@@ -868,6 +882,75 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             }
         }
 
+#ifdef SDL_KITTY_HAVE_LIBKITTYOPS
+        /* Scroll detection + shifted diff on pristine game pixels (before HUD blend)
+         * when terminal supports a=c compose and has enough storage for 2 RGBA frames. */
+        {
+            const size_t storage_lim = vdata->term_profile ? vdata->term_profile->facts.storage_bytes : 0u;
+            const size_t two_frame_rgba = (size_t)surface->w * (size_t)surface->h * 4u * 2u;
+            scroll_compose_ok =
+                vdata->cfg_cached && vdata->cfg_scroll_compose && vdata->cfg_dirty_bw &&
+                wdata->rgb_scratch != NULL &&
+                (storage_lim == 0u || two_frame_rgba <= storage_lim);
+            if (scroll_compose_ok && !wdata->prev_rgb_scratch) {
+                wdata->prev_rgb_scratch = (Uint8 *)SDL_malloc((size_t)surface->w * (size_t)surface->h * (size_t)bpp);
+                wdata->prev_rgb_valid = false;
+            }
+            if (scroll_compose_ok && wdata->prev_rgb_scratch && wdata->prev_rgb_valid &&
+                wdata->placed && wdata->live_image_id != 0 &&
+                convert_mode == KITTY_CONVERT_DIRTY &&
+                KITTY_CoverageRatio(surface->w, surface->h, &dirty) >= 0.20f) {
+                /* Adaptive backoff: after 4 consecutive misses (e.g. fractionally-scaled
+                 * emulator or 3D scene), probe only every 30th large frame (~0 overhead). */
+                const bool probe_now = (wdata->scroll_miss_streak < 4) ||
+                                       ((wdata->scroll_miss_streak % 30) == 0);
+                kops_rect kroi = { dirty.x, dirty.y, dirty.w, dirty.h };
+                int32_t sdx = 0, sdy = 0;
+                float sconf = 0.0f;
+                if (probe_now &&
+                    kops_detect_scroll(wdata->prev_rgb_scratch, wdata->rgb_scratch,
+                                       surface->w, surface->h, bpp, &kroi, &sdx, &sdy, &sconf)) {
+                    kops_rect ksrects[12];
+                    kops_rect ksbbox;
+                    int32_t ksn = 0;
+                    const int tile = vdata->cfg_fb_diff_tile > 0 ? vdata->cfg_fb_diff_tile : 32;
+                    if (kops_diff_shifted_rects(wdata->prev_rgb_scratch, wdata->rgb_scratch,
+                                                surface->w, surface->h, bpp, sdx, sdy, tile, 0.90f,
+                                                ksrects, 12, &ksn, &ksbbox) == KOPS_DIFF_RECT && ksn > 0) {
+                        size_t shifted_px = 0, unshifted_px = 0;
+                        int si;
+                        for (si = 0; si < ksn; ++si) {
+                            shifted_px += (size_t)ksrects[si].w * (size_t)ksrects[si].h;
+                        }
+                        if (multi_rects && multi_numrects > 1) {
+                            for (si = 0; si < multi_numrects; ++si) {
+                                unshifted_px += (size_t)multi_rects[si].w * (size_t)multi_rects[si].h;
+                            }
+                        } else {
+                            unshifted_px = (size_t)dirty.w * (size_t)dirty.h;
+                        }
+                        if (shifted_px * 5u < unshifted_px * 3u) {
+                            for (si = 0; si < ksn && si < 12; ++si) {
+                                scroll_rects[si].x = ksrects[si].x;
+                                scroll_rects[si].y = ksrects[si].y;
+                                scroll_rects[si].w = ksrects[si].w;
+                                scroll_rects[si].h = ksrects[si].h;
+                            }
+                            scroll_numrects = ksn;
+                            scroll_dx = (int)sdx;
+                            scroll_dy = (int)sdy;
+                            scroll_compose_hit = true;
+                            wdata->scroll_miss_streak = 0;
+                        }
+                    }
+                }
+                if (!scroll_compose_hit) {
+                    wdata->scroll_miss_streak++;
+                }
+            }
+        }
+#endif
+
         /* Temporarily composite active HUD toast & F12 perf HUD onto rgb_scratch
          * ONLY when their rect is actually going to be transmitted (redrawing or
          * overlapping dirty rects). Skips 80-90% of HUD blend+restore work on
@@ -876,7 +959,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             stage_t0 = SDL_GetTicksNS();
         }
         if (ov_active && wdata->rgb_scratch &&
-            (ov_needs_redraw || KITTY_RectOverlapsDirty(&ov_rect, convert_mode, multi_rects, multi_numrects, &dirty))) {
+            (scroll_compose_hit || ov_needs_redraw || KITTY_RectOverlapsDirty(&ov_rect, convert_mode, multi_rects, multi_numrects, &dirty))) {
             ov_applied = KITTY_OverlayApply((KITTY_ToastOverlay *)vdata->overlay,
                                             wdata->rgb_scratch, surface->w, surface->h,
                                             bpp, ov_alpha);
@@ -885,7 +968,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             }
         }
         if (hud_active && wdata->rgb_scratch &&
-            (hud_needs_redraw || KITTY_RectOverlapsDirty(&hud_rect, convert_mode, multi_rects, multi_numrects, &dirty))) {
+            (scroll_compose_hit || hud_needs_redraw || KITTY_RectOverlapsDirty(&hud_rect, convert_mode, multi_rects, multi_numrects, &dirty))) {
             hud_applied = KITTY_HudApply((KITTY_PerfHud *)vdata->hud,
                                          wdata->rgb_scratch, surface->w, surface->h, bpp);
             if (hud_applied && single_prepacked && SDL_HasRectIntersection(&dirty, &hud_rect)) {
@@ -988,7 +1071,130 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 wdata->placed &&
                 wdata->live_image_id != 0;
 
-            if (want_af && multi_rects && multi_numrects > 1) {
+            vdata->active_edit_frame = wdata->active_frame ? wdata->active_frame : 1u;
+
+#ifdef SDL_KITTY_HAVE_LIBKITTYOPS
+            if (want_af && scroll_compose_hit && scroll_numrects > 0) {
+                const Uint32 src_f = wdata->active_frame ? wdata->active_frame : 1u;
+                const Uint32 dst_f = (src_f == 1u) ? 2u : 1u;
+                const int copy_w = surface->w - (scroll_dx >= 0 ? scroll_dx : -scroll_dx);
+                const int copy_h = surface->h - (scroll_dy >= 0 ? scroll_dy : -scroll_dy);
+                const int src_x = scroll_dx < 0 ? -scroll_dx : 0;
+                const int src_y = scroll_dy < 0 ? -scroll_dy : 0;
+                const int dst_x = scroll_dx > 0 ? scroll_dx : 0;
+                const int dst_y = scroll_dy > 0 ? scroll_dy : 0;
+                SDL_Rect fb_box = { 0, 0, surface->w, surface->h };
+                SDL_Rect patch_buf[16];
+                int patch_n = scroll_numrects;
+                char cmd[192];
+                size_t clen;
+                bool sc_ok = true;
+                size_t sc_upload = 0;
+
+                /* Include fixed HUD/overlay + their shifted ghosts so a=c never leaves HUD ghosts. */
+                if (hud_active && hud_rect.w > 0 && hud_rect.h > 0 && patch_n + 2 <= 16) {
+                    SDL_Rect ghost = { hud_rect.x + scroll_dx, hud_rect.y + scroll_dy, hud_rect.w, hud_rect.h };
+                    SDL_Rect gclip;
+                    if (SDL_GetRectIntersection(&ghost, &fb_box, &gclip) && gclip.w > 0 && gclip.h > 0) {
+                        scroll_rects[patch_n++] = gclip;
+                    }
+                    scroll_rects[patch_n++] = hud_rect;
+                }
+                if (ov_active && ov_rect.w > 0 && ov_rect.h > 0 && patch_n + 2 <= 16) {
+                    SDL_Rect ghost = { ov_rect.x + scroll_dx, ov_rect.y + scroll_dy, ov_rect.w, ov_rect.h };
+                    SDL_Rect gclip;
+                    if (SDL_GetRectIntersection(&ghost, &fb_box, &gclip) && gclip.w > 0 && gclip.h > 0) {
+                        scroll_rects[patch_n++] = gclip;
+                    }
+                    scroll_rects[patch_n++] = ov_rect;
+                }
+                {
+                    const int cn = KITTY_CoalesceRects(surface->w, surface->h, scroll_rects, patch_n,
+                                                       2, patch_buf, 16);
+                    if (cn > 0) {
+                        patch_n = cn;
+                    } else {
+                        SDL_memcpy(patch_buf, scroll_rects, (size_t)patch_n * sizeof(SDL_Rect));
+                    }
+                }
+
+                KITTY_BeginAsyncBatch(vdata);
+                if (!wdata->frame2_created) {
+                    const int fn = SDL_snprintf(cmd, sizeof(cmd),
+                                                "\033_Ga=f,i=%u,f=24,s=1,v=1,t=d,q=2;AAAA\033\\",
+                                                (unsigned)wdata->live_image_id);
+                    if (fn <= 0 || !KITTY_AppendRawAsyncApc(vdata, cmd, (size_t)fn)) {
+                        sc_ok = false;
+                    } else {
+                        wdata->frame2_created = true;
+                    }
+                }
+                if (sc_ok) {
+                    clen = kops_format_compose_apc(cmd, sizeof(cmd), wdata->live_image_id,
+                                                   src_f, dst_f, src_x, src_y, dst_x, dst_y,
+                                                   copy_w, copy_h);
+                    if (clen == 0 || !KITTY_AppendRawAsyncApc(vdata, cmd, clen)) {
+                        sc_ok = false;
+                    }
+                }
+                if (sc_ok) {
+                    vdata->active_edit_frame = dst_f;
+                    if (patch_n >= 3 && patch_n <= 16 &&
+                        KITTY_TransmitMultiRectEdit(vdata, wdata->live_image_id, wdata->rgb_scratch,
+                                                    surface->w, surface->h, patch_buf, patch_n,
+                                                    kitty_f, &sc_upload)) {
+                        /* batched into active async stage */
+                    } else {
+                        int pi;
+                        for (pi = 0; sc_ok && pi < patch_n; ++pi) {
+                            SDL_Rect cl;
+                            size_t rpx, plen = 0;
+                            if (!SDL_GetRectIntersection(&patch_buf[pi], &fb_box, &cl) || cl.w <= 0 || cl.h <= 0) {
+                                continue;
+                            }
+                            rpx = (size_t)cl.w * (size_t)cl.h;
+                            if (KITTY_TransmitRGBRectEditFromScratch(vdata, wdata->live_image_id,
+                                                                     wdata->rgb_scratch, surface->w, surface->h,
+                                                                     &cl, kitty_f)) {
+                                sc_upload += rpx;
+                                continue;
+                            }
+                            SDL_ClearError();
+                            packed = KITTY_EnsurePackScratch(wdata, rpx * (size_t)bpp);
+                            if (!packed ||
+                                !(use_rgba
+                                      ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h, &cl, packed, rpx * (size_t)bpp, &plen)
+                                      : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h, &cl, packed, rpx * (size_t)bpp, &plen)) ||
+                                !KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed, cl.x, cl.y, cl.w, cl.h, kitty_f)) {
+                                sc_ok = false;
+                                break;
+                            }
+                            sc_upload += rpx;
+                        }
+                    }
+                }
+                if (sc_ok) {
+                    clen = kops_format_animate_select_apc(cmd, sizeof(cmd), wdata->live_image_id, dst_f);
+                    if (clen == 0 || !KITTY_AppendRawAsyncApc(vdata, cmd, clen)) {
+                        sc_ok = false;
+                    }
+                }
+                if (sc_ok && KITTY_CommitAsyncBatch(vdata)) {
+                    ok = true;
+                    wire_mode = KITTY_WIRE_DIRTY_BW;
+                    upload_px = sc_upload;
+                    wdata->rgb_valid = true;
+                    wdata->active_frame = dst_f;
+                    KITTY_ClearOverlays(vdata, wdata);
+                } else {
+                    KITTY_CancelAsyncBatch(vdata);
+                    vdata->active_edit_frame = src_f;
+                    scroll_compose_hit = false;
+                }
+            }
+#endif
+
+            if (!ok && want_af && multi_rects && multi_numrects > 1) {
                 bool multi_ok = true;
                 size_t multi_upload = 0;
                 size_t multi_total_px = 0;
@@ -1444,6 +1650,8 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 wdata->placed = true;
                 wdata->rgb_valid = true;
                 wdata->live_image_id = image_id;
+                wdata->active_frame = 1u;
+                wdata->frame2_created = false;
                 if (wire_mode != KITTY_WIRE_DIRTY_BW && wire_mode != KITTY_WIRE_DIRTY_AT) {
                     wire_mode = (convert_mode == KITTY_CONVERT_DIRTY) ? KITTY_WIRE_DIRTY_CPU : KITTY_WIRE_FULL;
                 }
@@ -1466,6 +1674,11 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             hud_ns += SDL_GetTicksNS() - stage_t0;
             stage_t0 = 0;
         }
+        if (ok && scroll_compose_ok && wdata->prev_rgb_scratch && wdata->rgb_scratch) {
+            SDL_memcpy(wdata->prev_rgb_scratch, wdata->rgb_scratch,
+                       (size_t)surface->w * (size_t)surface->h * (size_t)bpp);
+            wdata->prev_rgb_valid = true;
+        }
         if (ok && wire_mode != KITTY_WIRE_UPLOAD_SKIP) {
             if (vdata->hud) {
                 KITTY_HudMarkDrawn((KITTY_PerfHud *)vdata->hud, hud_active);
@@ -1484,7 +1697,7 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             const char *tag = "DIRECT";
             if (dirty_pct > 100.0f) dirty_pct = 100.0f;
             if (wire_mode == KITTY_WIRE_DIRTY_BW) {
-                tag = vdata->cfg_af_zlib ? "A=F +Z" : "A=F";
+                tag = scroll_compose_hit ? "A=C +F" : (vdata->cfg_af_zlib ? "A=F +Z" : "A=F");
             } else if (wire_mode == KITTY_WIRE_DIRTY_AT) {
                 tag = "A=T";
             } else if (wire_mode == KITTY_WIRE_UPLOAD_SKIP) {

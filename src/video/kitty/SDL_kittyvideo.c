@@ -490,6 +490,17 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
                                          ? prof->max_direct_bytes
                                          : ((size_t)1920 * 1080 * 4);
         data->cfg_apc_chunk_bytes = KITTY_ProfileApcChunkBytes(prof);
+        data->active_edit_frame = 1u;
+        env = SDL_getenv("SDL_KITTY_SCROLL_COMPOSE");
+        if (env && env[0]) {
+            data->cfg_scroll_compose = !(env[0] == '0' || SDL_strcasecmp(env, "false") == 0 ||
+                                         SDL_strcasecmp(env, "no") == 0 ||
+                                         SDL_strcasecmp(env, "off") == 0);
+        } else {
+            data->cfg_scroll_compose =
+                data->frame_edit_ok && !data->cfg_async_drop &&
+                prof && prof->facts.animation == KITTY_FACT_YES;
+        }
         data->overlay = KITTY_OverlayCreate(SDL_getenv("SDL_KITTY_OVERLAY"));
         data->hud = KITTY_HudCreate(SDL_getenv("SDL_KITTY_HUD"));
         data->capture = KITTY_CaptureCreate();

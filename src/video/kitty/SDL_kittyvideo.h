@@ -189,6 +189,8 @@ typedef struct SDL_VideoData
     bool cfg_af_zlib;
     int cfg_zlib_level; /* 0 = auto (3 parallel full-frame, 1 serial/a=f); 1..9 override */
     bool cfg_perf_ack;
+    bool cfg_scroll_compose;
+    Uint32 active_edit_frame; /* 1-based target frame for a=f edits (1 or 2) */
     size_t cfg_max_direct_bytes;
     size_t cfg_apc_chunk_bytes;
 } SDL_VideoData;
@@ -209,12 +211,17 @@ typedef struct SDL_WindowData
     bool placed;
     /* Retained RGB24/RGBA32 scratch (updated in-place by fused convert+tile-diff). */
     Uint8 *rgb_scratch;
+    Uint8 *prev_rgb_scratch; /* previous pristine frame for a=c scroll-compose */
     int rgb_w;
     int rgb_h;
     int scratch_bpp; /* 3 (f=24) or 4 (f=32) */
     bool rgb_valid;
+    bool prev_rgb_valid;
     /* Image id of the last successful full place (Step 1b a=f target). */
     Uint32 live_image_id;
+    Uint32 active_frame; /* 1 or 2 for a=c ping-pong scrolling */
+    bool frame2_created;
+    int scroll_miss_streak; /* adaptive backoff when content isn't integer-scrolling */
     /* Active dirty_at overlay image ids from the previous present. */
     Uint32 overlay_ids[KITTY_OVERLAY_MAX];
     int overlay_count;
