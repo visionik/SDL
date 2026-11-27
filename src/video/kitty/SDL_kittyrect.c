@@ -35,6 +35,9 @@
 
 #include "SDL_kittyparallel.h"
 #include "SDL_kittyrect.h"
+#ifdef SDL_KITTY_HAVE_LIBKITTYOPS
+#include <kittyops.h>
+#endif
 
 #if defined(__ARM_NEON) && (SDL_BYTEORDER == SDL_LIL_ENDIAN)
 #include <arm_neon.h>
@@ -461,6 +464,9 @@ static inline Uint64 KITTY_Rotl64(Uint64 x, unsigned r)
 
 Uint64 KITTY_FastHash64(const Uint8 *data, size_t len)
 {
+#ifdef SDL_KITTY_HAVE_LIBKITTYOPS
+    return (Uint64)kops_fast_hash64(data, len);
+#else
     static const Uint64 P1 = 11400714785074694791ULL;
     static const Uint64 P2 = 14029467366897019727ULL;
     static const Uint64 P3 = 1609587929392839161ULL;
@@ -522,6 +528,7 @@ Uint64 KITTY_FastHash64(const Uint8 *data, size_t len)
         h ^= h >> 32;
         return h;
     }
+#endif
 }
 
 /*
@@ -592,6 +599,30 @@ bool KITTY_FitAspectCells(int cols, int rows, int cell_w, int cell_h, int fb_w, 
 int KITTY_CoalesceRects(int fb_w, int fb_h, const SDL_Rect *in, int n_in,
                         int gap_px, SDL_Rect *out, int max_out)
 {
+#ifdef SDL_KITTY_HAVE_LIBKITTYOPS
+    kops_rect kin[64];
+    kops_rect kout[64];
+    int n_copy, cn, ci;
+    if (!in || !out || max_out <= 0 || fb_w <= 0 || fb_h <= 0 || n_in <= 0) {
+        return 0;
+    }
+    n_copy = n_in < 64 ? n_in : 64;
+    for (ci = 0; ci < n_copy; ++ci) {
+        kin[ci].x = in[ci].x;
+        kin[ci].y = in[ci].y;
+        kin[ci].w = in[ci].w;
+        kin[ci].h = in[ci].h;
+    }
+    cn = (int)kops_coalesce_rects(fb_w, fb_h, kin, n_copy, gap_px, 0u,
+                                  kout, max_out < 64 ? max_out : 64);
+    for (ci = 0; ci < cn; ++ci) {
+        out[ci].x = kout[ci].x;
+        out[ci].y = kout[ci].y;
+        out[ci].w = kout[ci].w;
+        out[ci].h = kout[ci].h;
+    }
+    return cn;
+#else
     SDL_Rect tmp[64];
     int n = 0;
     int i;
@@ -681,6 +712,7 @@ int KITTY_CoalesceRects(int fb_w, int fb_h, const SDL_Rect *in, int n_in,
         out[i] = tmp[i];
     }
     return n;
+#endif
 }
 
 /*
@@ -1636,6 +1668,38 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
         }
         return KITTY_DIFF_FULL;
     }
+#if defined(SDL_KITTY_HAVE_LIBKITTYOPS) && (SDL_BYTEORDER == SDL_LIL_ENDIAN)
+    if (surface->format == SDL_PIXELFORMAT_XRGB8888 || surface->format == SDL_PIXELFORMAT_ARGB8888) {
+        kops_rect krects[KOPS_MAX_RECTS];
+        kops_rect kbbox;
+        int32_t kcnt = 0;
+        const int32_t cap = (max_rects > KOPS_MAX_RECTS) ? KOPS_MAX_RECTS : max_rects;
+        const kops_diff_outcome kres = kops_convert_xrgb_and_diff(
+            (const uint8_t *)surface->pixels, surface->pitch, rgb_scratch,
+            surface->w, surface->h, use_rgba, tile, cover_limit,
+            (rects_out && cap > 0) ? krects : NULL, cap > 0 ? cap : 0, &kcnt, &kbbox);
+        if (bbox_out) {
+            bbox_out->x = kbbox.x;
+            bbox_out->y = kbbox.y;
+            bbox_out->w = kbbox.w;
+            bbox_out->h = kbbox.h;
+        }
+        if (rects_out && cap > 0) {
+            int32_t ri;
+            for (ri = 0; ri < kcnt && ri < cap; ++ri) {
+                rects_out[ri].x = krects[ri].x;
+                rects_out[ri].y = krects[ri].y;
+                rects_out[ri].w = krects[ri].w;
+                rects_out[ri].h = krects[ri].h;
+            }
+        }
+        if (out_count) {
+            *out_count = (int)kcnt;
+        }
+        return (kres == KOPS_DIFF_NONE) ? KITTY_DIFF_NONE
+                                        : ((kres == KOPS_DIFF_RECT) ? KITTY_DIFF_RECT : KITTY_DIFF_FULL);
+    }
+#endif
 
     fb_w = surface->w;
     fb_h = surface->h;
@@ -1893,6 +1957,14 @@ KITTY_PresentConvertMode KITTY_ChooseConvertMode(int fb_w, int fb_h,
 bool KITTY_PackRGBRect(const Uint8 *rgb_scratch, int fb_w, int fb_h,
                        const SDL_Rect *rect, Uint8 *out, size_t out_cap, size_t *out_len)
 {
+#ifdef SDL_KITTY_HAVE_LIBKITTYOPS
+    kops_rect kr;
+    if (!rect) {
+        return false;
+    }
+    kr.x = rect->x; kr.y = rect->y; kr.w = rect->w; kr.h = rect->h;
+    return kops_pack_rect(rgb_scratch, fb_w, fb_h, 3, &kr, out, out_cap, out_len);
+#else
     SDL_Rect fb, area;
     int y;
     size_t need;
@@ -1931,6 +2003,7 @@ bool KITTY_PackRGBRect(const Uint8 *rgb_scratch, int fb_w, int fb_h,
         *out_len = need;
     }
     return true;
+#endif
 }
 
 /*
@@ -2417,6 +2490,14 @@ bool KITTY_ConvertSurfaceRectCheckAndPack(SDL_Surface *surface, const SDL_Rect *
 bool KITTY_PackRGBARect(const Uint8 *rgba_scratch, int fb_w, int fb_h,
                         const SDL_Rect *rect, Uint8 *out, size_t out_cap, size_t *out_len)
 {
+#ifdef SDL_KITTY_HAVE_LIBKITTYOPS
+    kops_rect kr;
+    if (!rect) {
+        return false;
+    }
+    kr.x = rect->x; kr.y = rect->y; kr.w = rect->w; kr.h = rect->h;
+    return kops_pack_rect(rgba_scratch, fb_w, fb_h, 4, &kr, out, out_cap, out_len);
+#else
     SDL_Rect fb, area;
     int y;
     size_t need;
@@ -2455,6 +2536,7 @@ bool KITTY_PackRGBARect(const Uint8 *rgba_scratch, int fb_w, int fb_h,
         *out_len = need;
     }
     return true;
+#endif
 }
 
 #endif /* SDL_VIDEO_DRIVER_KITTY || KITTY_RECT_STANDALONE */
