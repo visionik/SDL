@@ -25,6 +25,11 @@
 #include "SDL_kittyfont.h"
 #include "SDL_kittyhud.h"
 
+#if defined(__ARM_NEON) && (SDL_BYTEORDER == SDL_LIL_ENDIAN)
+#include <arm_neon.h>
+#define KITTY_HUD_HAVE_NEON 1
+#endif
+
 #define KITTY_HUD_SAMPLES 96
 
 typedef enum KITTY_HudPos
@@ -87,7 +92,7 @@ struct KITTY_PerfHud
     bool rec_active;
     Uint64 rec_start_ms;
 
-    /* Rendered RGBA bitmap cache (re-rendered at ~15 Hz) */
+    /* Rendered RGBA bitmap cache (re-rendered at ~11 Hz) */
     Uint64 last_render_ms;
     int cache_fb_w;
     int cache_fb_h;
@@ -95,6 +100,13 @@ struct KITTY_PerfHud
     SDL_Rect rect;
     Uint8 *rgba;
     size_t rgba_cap;
+
+    /* Static glassmorphic card background cache (avoids per-update SDF sqrtf) */
+    Uint8 *bg_rgba;
+    size_t bg_cap;
+    int bg_w;
+    int bg_h;
+    bool bg_rec_mode;
 
     /* Backing store for clean rgb_scratch pixels under rect */
     Uint8 *save_buf;
@@ -225,6 +237,7 @@ void KITTY_HudDestroy(KITTY_PerfHud *hud)
         return;
     }
     SDL_free(hud->rgba);
+    SDL_free(hud->bg_rgba);
     SDL_free(hud->save_buf);
     SDL_free(hud);
 }
@@ -426,17 +439,63 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
         hud->rgba = nb;
         hud->rgba_cap = need;
     }
-    SDL_memset(hud->rgba, 0, need);
-    canvas.rgba = hud->rgba;
-    canvas.w = bw;
-    canvas.h = bh;
     cx = shadow_pad;
     cy = shadow_pad;
 
-    /* 1) Floating glassmorphic card */
-    KITTY_CanvasDrawRoundedCard(&canvas, cx, cy, card_w, card_h, 11.0f * s,
-                                hud->pal.bg_top, hud->pal.bg_bot,
-                                hud->pal.border, shadow_pad, hud->pal.sheen);
+    /* 1) Floating glassmorphic card + static chart well + static chrome cached
+     * once per (bw, bh, rec_active) so 90ms refreshes skip 64K SDF sqrtf calls. */
+    if (!hud->bg_rgba || hud->bg_w != bw || hud->bg_h != bh || hud->bg_rec_mode != hud->rec_active) {
+        KITTY_Canvas bgc;
+        const int pad = (int)(11.0f * s + 0.5f);
+        const int inner_x = cx + pad;
+        const int inner_w = card_w - pad * 2;
+        const int chart_x = inner_x;
+        const int chart_y = cy + (int)(36.0f * s + 0.5f);
+        const int chart_w = inner_w;
+        const int chart_h = (int)(38.0f * s + 0.5f);
+        if (hud->bg_cap < need) {
+            Uint8 *nb = (Uint8 *)SDL_realloc(hud->bg_rgba, need);
+            if (!nb) {
+                return false;
+            }
+            hud->bg_rgba = nb;
+            hud->bg_cap = need;
+        }
+        SDL_memset(hud->bg_rgba, 0, need);
+        bgc.rgba = hud->bg_rgba;
+        bgc.w = bw;
+        bgc.h = bh;
+        KITTY_CanvasDrawRoundedCard(&bgc, cx, cy, card_w, card_h, 11.0f * s,
+                                    hud->pal.bg_top, hud->pal.bg_bot,
+                                    hud->pal.border, shadow_pad, hud->pal.sheen);
+        KITTY_CanvasDrawPill(&bgc, chart_x, chart_y, chart_w, chart_h, 6.0f * s,
+                             hud->pal.well_bg, hud->pal.well_border);
+        {
+            const char *leg = "60Hz";
+            const float lpx = 11.5f * s;
+            const float lw = KITTY_FontMeasureUTF8(leg, 4, lpx, true);
+            KITTY_FontDrawUTF8(&bgc, (float)(chart_x + chart_w) - lw - 5.0f * s,
+                               (float)chart_y + 13.0f * s, leg, 4, lpx,
+                               hud->pal.muted, false, true);
+        }
+        {
+            const float lbl_px = 12.5f * s;
+            const float row_y = (float)cy + 95.0f * s;
+            const int bar_w = (int)(44.0f * s + 0.5f);
+            const int bar_x = (inner_x + inner_w) - bar_w;
+            const float dlw = KITTY_FontMeasureUTF8("DIRTY", 5, lbl_px, false);
+            KITTY_FontDrawUTF8(&bgc, (float)bar_x - dlw - 6.0f * s, row_y, "DIRTY", 5,
+                               lbl_px, hud->pal.muted, false, false);
+        }
+        hud->bg_w = bw;
+        hud->bg_h = bh;
+        hud->bg_rec_mode = hud->rec_active;
+    }
+
+    SDL_memcpy(hud->rgba, hud->bg_rgba, need);
+    canvas.rgba = hud->rgba;
+    canvas.w = bw;
+    canvas.h = bh;
 
     {
         const int pad = (int)(11.0f * s + 0.5f);
@@ -523,9 +582,7 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
             float max_ms;
             int i;
 
-            KITTY_CanvasDrawPill(&canvas, chart_x, chart_y, chart_w, chart_h, 6.0f * s,
-                                 hud->pal.well_bg, hud->pal.well_border);
-
+            /* Chart well & "60Hz" legend are pre-rendered in hud->bg_rgba. */
             if (n >= 2) {
                 const int start = (hud->ring_head - n + KITTY_HUD_SAMPLES) % KITTY_HUD_SAMPLES;
                 for (i = 0; i < n; ++i) {
@@ -580,14 +637,6 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
                                           hud->pal.spark_line,
                                           hud->pal.spark_top, hud->pal.spark_bot, true);
             }
-            {
-                const char *leg = "60Hz";
-                const float lpx = 11.5f * s;
-                const float lw = KITTY_FontMeasureUTF8(leg, 4, lpx, true);
-                KITTY_FontDrawUTF8(&canvas, (float)(chart_x + chart_w) - lw - 5.0f * s,
-                                   (float)chart_y + 13.0f * s, leg, 4, lpx,
-                                   hud->pal.muted, false, true);
-            }
         }
 
         /* 4) Crisp labeled Telemetry Strip: TX <ms>  WIRE <KB>  DIRTY [bar] */
@@ -597,7 +646,7 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
             const float row_y = (float)cy + 95.0f * s;
             char tx_buf[20], wire_buf[24];
             float xcur = (float)inner_x;
-            float dirty_t, dlw;
+            float dirty_t;
             int bar_w, bar_x;
 
             xcur = KITTY_FontDrawUTF8(&canvas, xcur, row_y, "TX", 2, lbl_px,
@@ -616,12 +665,9 @@ static bool KITTY_HudRenderBitmap(KITTY_PerfHud *hud, int fb_w, int fb_h, Uint64
             (void)KITTY_FontDrawUTF8(&canvas, xcur + 4.5f * s, row_y, wire_buf, SDL_strlen(wire_buf),
                                      val_px, hud->pal.fg, true, true);
 
-            /* Compact right-aligned DIRTY label + petite ~44px gradient meter */
+            /* Compact right-aligned DIRTY meter (label pre-rendered in bg_rgba) */
             bar_w = (int)(44.0f * s + 0.5f);
             bar_x = (inner_x + inner_w) - bar_w;
-            dlw = KITTY_FontMeasureUTF8("DIRTY", 5, lbl_px, false);
-            KITTY_FontDrawUTF8(&canvas, (float)bar_x - dlw - 6.0f * s, row_y, "DIRTY", 5,
-                               lbl_px, hud->pal.muted, false, false);
             dirty_t = (float)(hud->ewma_dirty_pct / 100.0);
             if (dirty_t < 0.0f) dirty_t = 0.0f;
             if (dirty_t > 1.0f) dirty_t = 1.0f;
@@ -738,7 +784,37 @@ bool KITTY_HudApply(KITTY_PerfHud *hud, Uint8 *rgb_scratch, int fb_w, int fb_h, 
         Uint8 *sav = hud->save_buf + (size_t)y * row_bytes;
         SDL_memcpy(sav, dst, row_bytes);
 
-        for (x = 0; x < hud->rect.w; ++x) {
+        x = 0;
+#ifdef KITTY_HUD_HAVE_NEON
+        if (bpp == 3) {
+            const uint8x16_t v255 = vdupq_n_u8(255);
+            const uint16x8_t v128 = vdupq_n_u16(128);
+            for (; x + 16 <= hud->rect.w; x += 16) {
+                const uint8x16x4_t s4 = vld4q_u8(src + x * 4);
+                uint8x16x3_t d3;
+                uint8x16_t inv;
+                int ch;
+                if (vmaxvq_u32(vreinterpretq_u32_u8(s4.val[3])) == 0) {
+                    continue;
+                }
+                d3 = vld3q_u8(dst + x * 3);
+                inv = vsubq_u8(v255, s4.val[3]);
+                for (ch = 0; ch < 3; ++ch) {
+                    uint16x8_t lo = vmlal_u8(vmull_u8(vget_low_u8(s4.val[ch]), vget_low_u8(s4.val[3])),
+                                             vget_low_u8(d3.val[ch]), vget_low_u8(inv));
+                    uint16x8_t hi = vmlal_u8(vmull_u8(vget_high_u8(s4.val[ch]), vget_high_u8(s4.val[3])),
+                                             vget_high_u8(d3.val[ch]), vget_high_u8(inv));
+                    lo = vaddq_u16(lo, v128);
+                    hi = vaddq_u16(hi, v128);
+                    lo = vaddq_u16(lo, vshrq_n_u16(lo, 8));
+                    hi = vaddq_u16(hi, vshrq_n_u16(hi, 8));
+                    d3.val[ch] = vcombine_u8(vshrn_n_u16(lo, 8), vshrn_n_u16(hi, 8));
+                }
+                vst3q_u8(dst + x * 3, d3);
+            }
+        }
+#endif
+        for (; x < hud->rect.w; ++x) {
             const Uint32 sa = src[x * 4 + 3];
             if (sa == 0) {
                 continue;
@@ -750,9 +826,12 @@ bool KITTY_HudApply(KITTY_PerfHud *hud, Uint8 *rgb_scratch, int fb_w, int fb_h, 
                 if (bpp == 4) dst[x * bpp + 3] = 255u;
             } else {
                 const Uint32 inv = 255u - sa;
-                dst[x * bpp + 0] = (Uint8)((src[x * 4 + 0] * sa + dst[x * bpp + 0] * inv + 127u) / 255u);
-                dst[x * bpp + 1] = (Uint8)((src[x * 4 + 1] * sa + dst[x * bpp + 1] * inv + 127u) / 255u);
-                dst[x * bpp + 2] = (Uint8)((src[x * 4 + 2] * sa + dst[x * bpp + 2] * inv + 127u) / 255u);
+                const Uint32 r = src[x * 4 + 0] * sa + dst[x * bpp + 0] * inv + 128u;
+                const Uint32 g = src[x * 4 + 1] * sa + dst[x * bpp + 1] * inv + 128u;
+                const Uint32 b = src[x * 4 + 2] * sa + dst[x * bpp + 2] * inv + 128u;
+                dst[x * bpp + 0] = (Uint8)((r + (r >> 8)) >> 8);
+                dst[x * bpp + 1] = (Uint8)((g + (g >> 8)) >> 8);
+                dst[x * bpp + 2] = (Uint8)((b + (b >> 8)) >> 8);
                 if (bpp == 4) dst[x * bpp + 3] = 255u;
             }
         }

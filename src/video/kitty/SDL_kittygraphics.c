@@ -362,8 +362,8 @@ static bool KITTY_PollReadable(int fd, int timeout_ms)
     return pr > 0 && (pfd.revents & POLLIN) != 0;
 }
 
-#define KITTY_PZ_MAX_SLICES 16
-#define KITTY_PZ_MIN_BYTES ((size_t)128 * 1024)
+#define KITTY_PZ_MAX_SLICES 24
+#define KITTY_PZ_MIN_BYTES ((size_t)224 * 1024)
 
 /* 128-byte aligned per-worker slice eliminates false sharing on Apple Silicon
  * (where L1 cache lines are 128 B and sizeof(z_stream) == 112 B). */
@@ -371,10 +371,14 @@ typedef struct __attribute__((aligned(128))) KITTY_ParallelZlibSlice
 {
     z_stream stream;
     bool stream_init;
+    Uint8 *in_buf;
+    size_t in_cap;
     Uint8 *out_buf;
     size_t out_cap;
     size_t off;
     size_t in_len;
+    int y0;
+    int y1;
     size_t out_len;
     uLong adler;
     bool ok;
@@ -385,6 +389,9 @@ typedef struct KITTY_ParallelZlibCtx
     KITTY_ParallelZlibSlice slices[KITTY_PZ_MAX_SLICES];
     int max_slices;
     const Uint8 *src;
+    bool strided;
+    size_t row_bytes;
+    size_t src_stride;
     int active_slices;
 } KITTY_ParallelZlibCtx;
 
@@ -401,6 +408,9 @@ static void KITTY_FreeParallelZlib(SDL_VideoData *vdata)
             deflateEnd(&ctx->slices[i].stream);
             ctx->slices[i].stream_init = false;
         }
+        SDL_free(ctx->slices[i].in_buf);
+        ctx->slices[i].in_buf = NULL;
+        ctx->slices[i].in_cap = 0;
         SDL_free(ctx->slices[i].out_buf);
         ctx->slices[i].out_buf = NULL;
         ctx->slices[i].out_cap = 0;
@@ -414,13 +424,40 @@ static void KITTY_ParallelZlibWorker(void *arg, size_t idx)
     KITTY_ParallelZlibCtx *ctx = (KITTY_ParallelZlibCtx *)arg;
     KITTY_ParallelZlibSlice *sl = &ctx->slices[idx];
     z_stream *zs = &sl->stream;
-    const Uint8 *in = ctx->src + sl->off;
-    const size_t in_len = sl->in_len;
+    const Uint8 *in;
+    size_t in_len;
     const int flush = ((int)idx + 1 == ctx->active_slices) ? Z_FINISH : Z_SYNC_FLUSH;
     int zerr;
 
     sl->ok = false;
     sl->out_len = 0;
+
+    if (ctx->strided) {
+        const int rows = sl->y1 - sl->y0;
+        const size_t rb = ctx->row_bytes;
+        const size_t st = ctx->src_stride;
+        const Uint8 *rs = ctx->src + (size_t)sl->y0 * st;
+        in_len = (size_t)rows * rb;
+        if (rb == st) {
+            in = rs;
+        } else {
+            Uint8 *dst = sl->in_buf;
+            int r;
+            if (!dst || sl->in_cap < in_len) {
+                return;
+            }
+            for (r = 0; r < rows; ++r) {
+                SDL_memcpy(dst, rs, rb);
+                dst += rb;
+                rs += st;
+            }
+            in = sl->in_buf;
+        }
+        sl->in_len = in_len;
+    } else {
+        in = ctx->src + sl->off;
+        in_len = sl->in_len;
+    }
 #ifdef SDL_KITTY_HAVE_LIBDEFLATE
     sl->adler = (uLong)libdeflate_adler32(1u, in, in_len);
 #else
@@ -796,6 +833,7 @@ static bool KITTY_AsyncSubmitStage(SDL_VideoData *vdata, KITTY_AsyncWriter *w, i
     bool prev_err;
     char *tmp_buf;
     size_t tmp_cap;
+    const Uint64 st0 = (vdata && vdata->bench) ? SDL_GetTicksNS() : 0u;
 
     pthread_mutex_lock(&w->mu);
     if (droppable && w->drop_stale && w->busy) {
@@ -820,6 +858,9 @@ static bool KITTY_AsyncSubmitStage(SDL_VideoData *vdata, KITTY_AsyncWriter *w, i
         w->has_pending = true;
         w->stage_len = 0;
         pthread_mutex_unlock(&w->mu);
+        if (st0) {
+            vdata->last_ms_submit += (double)(SDL_GetTicksNS() - st0) / 1000000.0;
+        }
         return !prev_err;
     }
     while (w->busy || w->has_pending) {
@@ -843,6 +884,9 @@ static bool KITTY_AsyncSubmitStage(SDL_VideoData *vdata, KITTY_AsyncWriter *w, i
         pthread_cond_signal(&w->cv_work);
     }
     pthread_mutex_unlock(&w->mu);
+    if (st0) {
+        vdata->last_ms_submit += (double)(SDL_GetTicksNS() - st0) / 1000000.0;
+    }
     return !prev_err;
 }
 
@@ -1199,6 +1243,184 @@ static Uint8 *KITTY_EnsureZBuf(SDL_VideoData *vdata, size_t need)
     return p;
 }
 
+static KITTY_ParallelZlibCtx *KITTY_EnsureParallelZlibCtx(SDL_VideoData *vdata)
+{
+    KITTY_ParallelZlibCtx *ctx = (KITTY_ParallelZlibCtx *)vdata->tx_pz_ctx;
+    int i;
+    if (ctx) {
+        return ctx;
+    }
+    ctx = (KITTY_ParallelZlibCtx *)SDL_calloc(1, sizeof(KITTY_ParallelZlibCtx));
+    if (!ctx) {
+        return NULL;
+    }
+    {
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        int max_s = (ncpu >= KITTY_PZ_MAX_SLICES) ? KITTY_PZ_MAX_SLICES
+                                                  : (ncpu >= 2 ? (int)ncpu : 2);
+        bool init_ok = true;
+        const int pz_level = (vdata->cfg_zlib_level >= 1 && vdata->cfg_zlib_level <= 9)
+                                 ? vdata->cfg_zlib_level
+                                 : 3;
+        ctx->max_slices = max_s;
+        for (i = 0; i < max_s; ++i) {
+            /* Default level 3 stays on Apple's fast deflate path while shrinking
+             * wire bytes enough to reduce overlapped PTY drain time; override
+             * with SDL_KITTY_ZLIB_LEVEL=1..9 (e.g. 4 for ~2x smaller wire over SSH). */
+            if (deflateInit2(&ctx->slices[i].stream, pz_level, Z_DEFLATED, -15, 8,
+                             Z_DEFAULT_STRATEGY) != Z_OK) {
+                init_ok = false;
+                break;
+            }
+            ctx->slices[i].stream_init = true;
+        }
+        vdata->tx_pz_ctx = ctx;
+        if (!init_ok) {
+            KITTY_FreeParallelZlib(vdata);
+            return NULL;
+        }
+    }
+    return ctx;
+}
+
+static int KITTY_ChooseParallelSlices(int max_slices, size_t raw_len)
+{
+    int n_slices;
+    if (raw_len >= 1536u * 1024u) {
+        n_slices = max_slices;
+    } else if (raw_len >= 512u * 1024u) {
+        n_slices = 12;
+    } else if (raw_len >= 256u * 1024u) {
+        n_slices = 8;
+    } else {
+        n_slices = 4;
+    }
+    if (n_slices > max_slices) {
+        n_slices = max_slices;
+    }
+    if (n_slices < 2) {
+        n_slices = 2;
+    }
+    return n_slices;
+}
+
+static bool KITTY_AssembleParallelZlib(SDL_VideoData *vdata, KITTY_ParallelZlibCtx *ctx, int n_slices,
+                                       Uint8 **out_buf, size_t *out_len)
+{
+    int i;
+    size_t total = 2u + 4u; /* 2B zlib header + 4B adler32 trailer */
+    Uint8 *dst;
+    uLong combined;
+    size_t pos;
+
+    for (i = 0; i < n_slices; ++i) {
+        if (!ctx->slices[i].ok) {
+            return false;
+        }
+        total += ctx->slices[i].out_len;
+    }
+    dst = KITTY_EnsureZBuf(vdata, total);
+    if (!dst) {
+        return false;
+    }
+    combined = ctx->slices[0].adler;
+    pos = 2u;
+    dst[0] = 0x78u; /* CM=8 deflate, CINFO=7 (32K window) */
+    dst[1] = 0x01u; /* FLEVEL=0, FCHECK=1 (0x7801 % 31 == 0) */
+    for (i = 0; i < n_slices; ++i) {
+        SDL_memcpy(dst + pos, ctx->slices[i].out_buf, ctx->slices[i].out_len);
+        pos += ctx->slices[i].out_len;
+        if (i > 0) {
+            combined = adler32_combine(combined, ctx->slices[i].adler,
+                                       (z_off_t)ctx->slices[i].in_len);
+        }
+    }
+    dst[pos + 0] = (Uint8)((combined >> 24) & 0xFFu);
+    dst[pos + 1] = (Uint8)((combined >> 16) & 0xFFu);
+    dst[pos + 2] = (Uint8)((combined >> 8) & 0xFFu);
+    dst[pos + 3] = (Uint8)(combined & 0xFFu);
+    *out_buf = dst;
+    *out_len = total;
+    return true;
+}
+
+/*
+ * Strided zero-copy parallel-pack + parallel-zlib directly from full-FB
+ * rgb_scratch for large a=f dirty rectangles (>= 128 KB). Each worker packs
+ * only its row band into an L2-hot slice buffer, hashes adler32, and deflates.
+ */
+static bool KITTY_ZlibCompressRect(SDL_VideoData *vdata, const Uint8 *rgb_scratch,
+                                   int fb_w, int fb_h, const SDL_Rect *rect, int bpp,
+                                   Uint8 **out_buf, size_t *out_len)
+{
+    const Uint64 zt0 = (vdata && vdata->bench) ? SDL_GetTicksNS() : 0u;
+    KITTY_ParallelZlibCtx *ctx;
+    size_t row_bytes, src_stride, raw_len;
+    int n_slices, i;
+
+    if (!vdata || !rgb_scratch || !rect || !out_buf || !out_len ||
+        fb_w <= 0 || fb_h <= 0 || rect->w <= 0 || rect->h < 4 ||
+        rect->x < 0 || rect->y < 0 || rect->x + rect->w > fb_w || rect->y + rect->h > fb_h) {
+        return false;
+    }
+    row_bytes = (size_t)rect->w * (size_t)bpp;
+    src_stride = (size_t)fb_w * (size_t)bpp;
+    raw_len = row_bytes * (size_t)rect->h;
+    if (raw_len < KITTY_PZ_MIN_BYTES) {
+        return false;
+    }
+
+    ctx = KITTY_EnsureParallelZlibCtx(vdata);
+    if (!ctx) {
+        return false;
+    }
+    n_slices = KITTY_ChooseParallelSlices(ctx->max_slices, raw_len);
+    if (n_slices > rect->h) {
+        n_slices = rect->h;
+    }
+    ctx->src = rgb_scratch + ((size_t)rect->y * (size_t)fb_w + (size_t)rect->x) * (size_t)bpp;
+    ctx->strided = true;
+    ctx->row_bytes = row_bytes;
+    ctx->src_stride = src_stride;
+    ctx->active_slices = n_slices;
+
+    for (i = 0; i < n_slices; ++i) {
+        KITTY_ParallelZlibSlice *sl = &ctx->slices[i];
+        const int y0 = (i * rect->h) / n_slices;
+        const int y1 = ((i + 1) * rect->h) / n_slices;
+        const size_t slen = (size_t)(y1 - y0) * row_bytes;
+        const size_t sbound = (size_t)deflateBound(&sl->stream, (uLong)slen) + 16u;
+        sl->y0 = y0;
+        sl->y1 = y1;
+        sl->in_len = slen;
+        if (row_bytes != src_stride && sl->in_cap < slen) {
+            Uint8 *nb = (Uint8 *)SDL_realloc(sl->in_buf, slen);
+            if (!nb) {
+                return false;
+            }
+            sl->in_buf = nb;
+            sl->in_cap = slen;
+        }
+        if (sl->out_cap < sbound) {
+            Uint8 *nb = (Uint8 *)SDL_realloc(sl->out_buf, sbound);
+            if (!nb) {
+                return false;
+            }
+            sl->out_buf = nb;
+            sl->out_cap = sbound;
+        }
+    }
+
+    KITTY_ParallelFor((size_t)n_slices, KITTY_ParallelZlibWorker, ctx);
+    if (!KITTY_AssembleParallelZlib(vdata, ctx, n_slices, out_buf, out_len)) {
+        return false;
+    }
+    if (zt0) {
+        vdata->last_ms_compress += (double)(SDL_GetTicksNS() - zt0) / 1000000.0;
+    }
+    return true;
+}
+
 /*
  * Compress src into vdata->tx_z_buf reusing a persistent z_stream (deflateReset)
  * so we never pay deflateInit/deflateEnd (~256 KB alloc+memset) per frame/rect.
@@ -1210,58 +1432,24 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
     uLongf bound;
     Uint8 *dst;
     int zerr;
+    const Uint64 zt0 = (vdata && vdata->bench) ? SDL_GetTicksNS() : 0u;
 
     if (!vdata || !src || src_len == 0 || !out_buf || !out_len) {
         return false;
     }
 
-    /* Multi-core RFC 1950 zlib for large full-frame payloads: up to 16 raw
+    /* Multi-core RFC 1950 zlib for large full-frame payloads: up to 24 raw
      * deflate slices concatenated via Z_SYNC_FLUSH + Z_FINISH + adler32_combine. */
     if (src_len >= KITTY_PZ_MIN_BYTES) {
-        KITTY_ParallelZlibCtx *ctx = (KITTY_ParallelZlibCtx *)vdata->tx_pz_ctx;
+        KITTY_ParallelZlibCtx *ctx = KITTY_EnsureParallelZlibCtx(vdata);
         int i;
-        if (!ctx) {
-            ctx = (KITTY_ParallelZlibCtx *)SDL_calloc(1, sizeof(KITTY_ParallelZlibCtx));
-            if (ctx) {
-                long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-                int max_s = (ncpu >= KITTY_PZ_MAX_SLICES) ? KITTY_PZ_MAX_SLICES
-                                                          : (ncpu >= 2 ? (int)ncpu : 2);
-                bool init_ok = true;
-                const int pz_level = (vdata->cfg_zlib_level >= 1 && vdata->cfg_zlib_level <= 9)
-                                         ? vdata->cfg_zlib_level
-                                         : 3;
-                ctx->max_slices = max_s;
-                for (i = 0; i < max_s; ++i) {
-                    /* Default level 3 stays on Apple's fast deflate path while shrinking
-                     * wire bytes enough to reduce overlapped PTY drain time; override
-                     * with SDL_KITTY_ZLIB_LEVEL=1..9 (e.g. 4 for ~2x smaller wire over SSH). */
-                    if (deflateInit2(&ctx->slices[i].stream, pz_level, Z_DEFLATED, -15, 8,
-                                     Z_DEFAULT_STRATEGY) != Z_OK) {
-                        init_ok = false;
-                        break;
-                    }
-                    ctx->slices[i].stream_init = true;
-                }
-                if (init_ok) {
-                    vdata->tx_pz_ctx = ctx;
-                } else {
-                    vdata->tx_pz_ctx = ctx;
-                    KITTY_FreeParallelZlib(vdata);
-                    ctx = NULL;
-                }
-            }
-        }
         if (ctx) {
-            int n_slices = (src_len >= 3072u * 1024u)
-                               ? ctx->max_slices
-                               : (src_len >= 1536u * 1024u ? 12 : (src_len >= 512u * 1024u ? 8 : 4));
-            if (n_slices > ctx->max_slices) {
-                n_slices = ctx->max_slices;
-            }
+            const int n_slices = KITTY_ChooseParallelSlices(ctx->max_slices, src_len);
             const size_t base = src_len / (size_t)n_slices;
             size_t off = 0;
             bool cap_ok = true;
             ctx->src = src;
+            ctx->strided = false;
             ctx->active_slices = n_slices;
             for (i = 0; i < n_slices; ++i) {
                 KITTY_ParallelZlibSlice *sl = &ctx->slices[i];
@@ -1281,39 +1469,12 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
                 }
             }
             if (cap_ok) {
-                bool all_ok = true;
-                size_t total = 2u + 4u; /* 2B zlib header + 4B adler32 trailer */
                 KITTY_ParallelFor((size_t)n_slices, KITTY_ParallelZlibWorker, ctx);
-                for (i = 0; i < n_slices; ++i) {
-                    if (!ctx->slices[i].ok) {
-                        all_ok = false;
-                        break;
+                if (KITTY_AssembleParallelZlib(vdata, ctx, n_slices, out_buf, out_len)) {
+                    if (zt0) {
+                        vdata->last_ms_compress += (double)(SDL_GetTicksNS() - zt0) / 1000000.0;
                     }
-                    total += ctx->slices[i].out_len;
-                }
-                if (all_ok) {
-                    dst = KITTY_EnsureZBuf(vdata, total);
-                    if (dst) {
-                        uLong combined = ctx->slices[0].adler;
-                        size_t pos = 2u;
-                        dst[0] = 0x78u; /* CM=8 deflate, CINFO=7 (32K window) */
-                        dst[1] = 0x01u; /* FLEVEL=0, FCHECK=1 (0x7801 % 31 == 0) */
-                        for (i = 0; i < n_slices; ++i) {
-                            SDL_memcpy(dst + pos, ctx->slices[i].out_buf, ctx->slices[i].out_len);
-                            pos += ctx->slices[i].out_len;
-                            if (i > 0) {
-                                combined = adler32_combine(combined, ctx->slices[i].adler,
-                                                           (z_off_t)ctx->slices[i].in_len);
-                            }
-                        }
-                        dst[pos + 0] = (Uint8)((combined >> 24) & 0xFFu);
-                        dst[pos + 1] = (Uint8)((combined >> 16) & 0xFFu);
-                        dst[pos + 2] = (Uint8)((combined >> 8) & 0xFFu);
-                        dst[pos + 3] = (Uint8)(combined & 0xFFu);
-                        *out_buf = dst;
-                        *out_len = total;
-                        return true;
-                    }
+                    return true;
                 }
             }
         }
@@ -1343,6 +1504,9 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
             if (zlen > 0) {
                 *out_buf = dst;
                 *out_len = zlen;
+                if (zt0) {
+                    vdata->last_ms_compress += (double)(SDL_GetTicksNS() - zt0) / 1000000.0;
+                }
                 return true;
             }
         }
@@ -1388,6 +1552,9 @@ static bool KITTY_ZlibCompress(SDL_VideoData *vdata, const Uint8 *src, size_t sr
 
     *out_buf = dst;
     *out_len = (size_t)zs->total_out;
+    if (zt0) {
+        vdata->last_ms_compress += (double)(SDL_GetTicksNS() - zt0) / 1000000.0;
+    }
     return true;
 }
 
@@ -2875,6 +3042,147 @@ bool KITTY_EditsCompressed(const SDL_VideoData *vdata)
     return vdata && vdata->term_profile && vdata->term_profile->af_zlib;
 }
 
+static bool KITTY_EmitRectEditPayload(SDL_VideoData *vdata, Uint32 image_id,
+                                      const Uint8 *body, size_t body_len, size_t payload_len,
+                                      bool zlib_edit, int x, int y, int rw, int rh, int kitty_f,
+                                      Uint64 edit_t0)
+{
+    const size_t b64_len = ((body_len + 2u) / 3u) * 4u;
+    const size_t chunk_cap = vdata->cfg_cached
+                                 ? vdata->cfg_apc_chunk_bytes
+                                 : KITTY_ProfileApcChunkBytes(vdata->term_profile);
+    char *b64;
+    size_t encoded;
+    size_t offset = 0;
+    bool first = true;
+
+    if (b64_len <= KITTY_ASYNC_MAX_BYTES && b64_len <= chunk_cap) {
+        KITTY_AsyncWriter *aw = KITTY_GetAsyncWriter(vdata);
+        if (aw) {
+            char header[160];
+            const int header_len = SDL_snprintf(header, sizeof(header),
+                                                "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
+                                                kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id,
+                                                x, y, rw, rh);
+            size_t add;
+            char *dst;
+            size_t wire;
+            if (header_len <= 0) {
+                return SDL_SetError("frame-edit header snprintf failed");
+            }
+            add = (size_t)header_len + b64_len + 2u;
+            if (aw->batching && aw->stage_len + add > KITTY_ASYNC_MAX_BYTES && aw->stage_len > 0) {
+                if (!KITTY_AsyncSubmitStage(vdata, aw, vdata->tty_fd, aw->stage_len, false)) {
+                    return SDL_SetError("kitty async rect-edit flush failed");
+                }
+            }
+            {
+                const size_t base = aw->batching ? aw->stage_len : 0u;
+                dst = KITTY_AsyncEnsureStage(aw, base + add + 1u);
+                if (!dst) {
+                    return false;
+                }
+                dst += base;
+                SDL_memcpy(dst, header, (size_t)header_len);
+                encoded = KITTY_Base64Encode(body, body_len, dst + header_len, b64_len + 1u);
+                if (encoded == 0) {
+                    return SDL_SetError("base64 encode failed");
+                }
+                dst[(size_t)header_len + encoded] = '\033';
+                dst[(size_t)header_len + encoded + 1u] = '\\';
+                wire = (size_t)header_len + encoded + 2u;
+                if (aw->batching) {
+                    aw->stage_len = base + wire;
+                } else if (!KITTY_AsyncSubmitStage(vdata, aw, vdata->tty_fd, wire, false)) {
+                    return SDL_SetError("kitty async rect-edit write failed");
+                }
+            }
+            {
+                const double ms = (double)(SDL_GetTicksNS() - edit_t0) / 1000000.0;
+                vdata->last_wire_bytes += wire;
+                vdata->last_raw_bytes += payload_len;
+                vdata->last_ms_tx += ms;
+                vdata->last_ms_ack = -1.0;
+                vdata->last_af_rects += 1;
+                vdata->total_wire_bytes += wire;
+                vdata->total_ms_tx += ms;
+                vdata->wire_presents += 1;
+            }
+            return true;
+        }
+    }
+
+    KITTY_FlushAsyncWriter(vdata);
+
+    b64 = KITTY_EnsureB64Buf(vdata, b64_len + 1u);
+    if (!b64) {
+        return false;
+    }
+    encoded = KITTY_Base64Encode(body, body_len, b64, b64_len + 1u);
+    if (encoded == 0) {
+        return SDL_SetError("base64 encode failed");
+    }
+
+    /* Edit root frame in place — do not home cursor or re-place. */
+    {
+        size_t wire = 0;
+        const Uint64 t0 = SDL_GetTicksNS();
+
+        while (offset < encoded) {
+            size_t chunk = encoded - offset;
+            char header[256];
+            int header_len;
+            int more;
+            if (chunk > chunk_cap) {
+                chunk = chunk_cap;
+            }
+            more = (offset + chunk < encoded) ? 1 : 0;
+            if (first) {
+                /* r=1 edits root; X=1 overwrite; q=2 quiet (no APC OK). */
+                header_len = SDL_snprintf(header, sizeof(header),
+                                          "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2%s;",
+                                          kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id, x, y, rw, rh,
+                                          more ? ",m=1" : "");
+                first = false;
+            } else {
+                header_len = SDL_snprintf(header, sizeof(header), "\033_Ga=f,m=%d;", more);
+            }
+            if (header_len <= 0) {
+                return SDL_SetError("frame-edit header snprintf failed");
+            }
+            {
+                struct iovec iov[3];
+                iov[0].iov_base = header;
+                iov[0].iov_len = (size_t)header_len;
+                iov[1].iov_base = b64 + offset;
+                iov[1].iov_len = chunk;
+                iov[2].iov_base = (void *)"\033\\";
+                iov[2].iov_len = 2;
+                if (!KITTY_WritevAll(vdata->tty_fd, iov, 3)) {
+                    return false;
+                }
+            }
+            wire += (size_t)header_len + chunk + 2u;
+            offset += chunk;
+        }
+
+        {
+            const Uint64 t1 = SDL_GetTicksNS();
+            const double ms = (double)(t1 - t0) / 1000000.0;
+            /* Accumulate: framebuffer zeros last_* at present start (multi a=f). */
+            vdata->last_wire_bytes += wire;
+            vdata->last_raw_bytes += payload_len;
+            vdata->last_ms_tx += ms;
+            vdata->last_ms_ack = -1.0;
+            vdata->last_af_rects += 1;
+            vdata->total_wire_bytes += wire;
+            vdata->total_ms_tx += ms;
+            vdata->wire_presents += 1;
+        }
+    }
+    return true;
+}
+
 /*
  * Edit root frame (r=1) in place with packed RGB/RGBA for rectangle
  * x,y,s,v (Kitty a=f, t=d only). Chunked base64; does not home or re-place.
@@ -2882,13 +3190,9 @@ bool KITTY_EditsCompressed(const SDL_VideoData *vdata)
 bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                                const Uint8 *packed_rgb, int x, int y, int rw, int rh, int kitty_f)
 {
+    const Uint64 edit_t0 = SDL_GetTicksNS();
     const int bpp = (kitty_f == 32) ? 4 : 3;
     const size_t payload_len = (size_t)rw * (size_t)rh * (size_t)bpp;
-    size_t b64_len;
-    char *b64;
-    size_t encoded;
-    size_t offset = 0;
-    bool first = true;
     bool zlib_edit;
     Uint8 *compressed = NULL;
     const Uint8 *body = packed_rgb;
@@ -2900,10 +3204,6 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
     if (!vdata || !packed_rgb || image_id == 0 || rw <= 0 || rh <= 0 || x < 0 || y < 0) {
         return SDL_SetError("invalid RGB rect edit");
     }
-
-    /* a=f stays on direct (t=d). SHM a=f (t=s) wrote successfully on Kitty.app
-     * but left a blank image; frame_edit_probe also fails there. Full a=T/SHM
-     * is used for large updates instead. */
 
     /* Direct a=f ceiling — huge chunks paint base64 when the host drops the APC. */
     {
@@ -2919,9 +3219,6 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
         }
     }
 
-    /* Compress the edit (o=z) where the terminal shows compressed edits, as full a=T does with
-     * prefer_zlib. A desktop's changed rectangles are mostly text and flat colour, which zlib shrinks
-     * several times over. */
     zlib_edit = KITTY_EditsCompressed(vdata) && payload_len > 48u;
     if (zlib_edit) {
         size_t zlen = 0;
@@ -2936,132 +3233,47 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
         }
     }
 
-    b64_len = ((body_len + 2) / 3) * 4;
-    {
-        const size_t chunk_cap = vdata->cfg_cached
-                                     ? vdata->cfg_apc_chunk_bytes
-                                     : KITTY_ProfileApcChunkBytes(vdata->term_profile);
+    return KITTY_EmitRectEditPayload(vdata, image_id, body, body_len, payload_len,
+                                     zlib_edit, x, y, rw, rh, kitty_f, edit_t0);
+}
 
-        if (b64_len <= KITTY_ASYNC_MAX_BYTES && b64_len <= chunk_cap) {
-            KITTY_AsyncWriter *aw = KITTY_GetAsyncWriter(vdata);
-            if (aw) {
-                char header[160];
-                const int header_len = SDL_snprintf(header, sizeof(header),
-                                                    "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2;",
-                                                    kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id,
-                                                    x, y, rw, rh);
-                size_t add;
-                char *dst;
-                size_t wire;
-                if (header_len <= 0) {
-                    return SDL_SetError("frame-edit header snprintf failed");
-                }
-                add = (size_t)header_len + b64_len + 2u;
-                if (aw->batching && aw->stage_len + add > KITTY_ASYNC_MAX_BYTES && aw->stage_len > 0) {
-                    if (!KITTY_AsyncSubmitStage(vdata, aw, vdata->tty_fd, aw->stage_len, false)) {
-                        return SDL_SetError("kitty async rect-edit flush failed");
-                    }
-                }
-                {
-                    const size_t base = aw->batching ? aw->stage_len : 0u;
-                    dst = KITTY_AsyncEnsureStage(aw, base + add + 1u);
-                    if (!dst) {
-                        return false;
-                    }
-                    dst += base;
-                    SDL_memcpy(dst, header, (size_t)header_len);
-                    encoded = KITTY_Base64Encode(body, body_len, dst + header_len, b64_len + 1u);
-                    if (encoded == 0) {
-                        return SDL_SetError("base64 encode failed");
-                    }
-                    dst[(size_t)header_len + encoded] = '\033';
-                    dst[(size_t)header_len + encoded + 1u] = '\\';
-                    wire = (size_t)header_len + encoded + 2u;
-                    if (aw->batching) {
-                        aw->stage_len = base + wire;
-                    } else if (!KITTY_AsyncSubmitStage(vdata, aw, vdata->tty_fd, wire, false)) {
-                        return SDL_SetError("kitty async rect-edit write failed");
-                    }
-                }
-                vdata->last_wire_bytes += wire;
-                vdata->last_raw_bytes += payload_len;
-                vdata->last_ms_ack = -1.0;
-                vdata->total_wire_bytes += wire;
-                vdata->wire_presents += 1;
-                return true;
-            }
-        }
+bool KITTY_TransmitRGBRectEditFromScratch(SDL_VideoData *vdata, Uint32 image_id,
+                                          const Uint8 *rgb_scratch, int fb_w, int fb_h,
+                                          const SDL_Rect *rect, int kitty_f)
+{
+    const Uint64 edit_t0 = SDL_GetTicksNS();
+    const int bpp = (kitty_f == 32) ? 4 : 3;
+    size_t payload_len;
+    size_t max_direct;
+    Uint8 *compressed = NULL;
+    size_t zlen = 0;
 
-        KITTY_FlushAsyncWriter(vdata);
-
-        b64 = KITTY_EnsureB64Buf(vdata, b64_len + 1);
-        if (!b64) {
-            return false;
-        }
-        encoded = KITTY_Base64Encode(body, body_len, b64, b64_len + 1);
-        if (encoded == 0) {
-            return SDL_SetError("base64 encode failed");
-        }
-
-        /* Edit root frame in place — do not home cursor or re-place. */
-        {
-            size_t wire = 0;
-            const Uint64 t0 = SDL_GetTicksNS();
-
-            while (offset < encoded) {
-                size_t chunk = encoded - offset;
-                char header[256];
-                int header_len;
-                int more;
-                if (chunk > chunk_cap) {
-                    chunk = chunk_cap;
-                }
-                more = (offset + chunk < encoded) ? 1 : 0;
-                if (first) {
-                    /* r=1 edits root; X=1 overwrite; q=2 quiet (no APC OK). */
-                    header_len = SDL_snprintf(header, sizeof(header),
-                                              "\033_Ga=f,f=%d,t=d,%si=%u,r=1,X=1,x=%d,y=%d,s=%d,v=%d,q=2%s;",
-                                              kitty_f, zlib_edit ? "o=z," : "", (unsigned)image_id, x, y, rw, rh,
-                                              more ? ",m=1" : "");
-                    first = false;
-                } else {
-                    header_len = SDL_snprintf(header, sizeof(header), "\033_Ga=f,m=%d;", more);
-                }
-                if (header_len <= 0) {
-                    return SDL_SetError("frame-edit header snprintf failed");
-                }
-                {
-                    struct iovec iov[3];
-                    iov[0].iov_base = header;
-                    iov[0].iov_len = (size_t)header_len;
-                    iov[1].iov_base = b64 + offset;
-                    iov[1].iov_len = chunk;
-                    iov[2].iov_base = (void *)"\033\\";
-                    iov[2].iov_len = 2;
-                    if (!KITTY_WritevAll(vdata->tty_fd, iov, 3)) {
-                        return false;
-                    }
-                }
-                wire += (size_t)header_len + chunk + 2;
-                offset += chunk;
-            }
-
-            {
-                const Uint64 t1 = SDL_GetTicksNS();
-                const double ms = (double)(t1 - t0) / 1000000.0;
-                /* Accumulate: framebuffer zeros last_* at present start (multi a=f). */
-                vdata->last_wire_bytes += wire;
-                vdata->last_raw_bytes += payload_len;
-                vdata->last_ms_tx += ms;
-                vdata->last_ms_ack = -1.0;
-                vdata->total_wire_bytes += wire;
-                vdata->total_ms_tx += ms;
-                vdata->wire_presents += 1;
-            }
-        }
+    if (kitty_f != 24 && kitty_f != 32) {
+        kitty_f = 24;
     }
-
-    return true;
+    if (!vdata || !rgb_scratch || !rect || image_id == 0 || !KITTY_EditsCompressed(vdata) ||
+        fb_w <= 0 || fb_h <= 0 || rect->w <= 0 || rect->h < 4 ||
+        rect->x < 0 || rect->y < 0 || rect->x + rect->w > fb_w || rect->y + rect->h > fb_h) {
+        return false;
+    }
+    payload_len = (size_t)rect->w * (size_t)rect->h * (size_t)bpp;
+    if (payload_len < KITTY_PZ_MIN_BYTES) {
+        return false;
+    }
+    max_direct = vdata->cfg_cached
+                     ? vdata->cfg_max_direct_bytes
+                     : ((vdata->term_profile && vdata->term_profile->max_direct_bytes > 0)
+                            ? vdata->term_profile->max_direct_bytes
+                            : ((size_t)1920 * 1080 * 4));
+    if (payload_len > max_direct) {
+        return false;
+    }
+    if (!KITTY_ZlibCompressRect(vdata, rgb_scratch, fb_w, fb_h, rect, bpp, &compressed, &zlen) ||
+        zlen >= payload_len) {
+        return false;
+    }
+    return KITTY_EmitRectEditPayload(vdata, image_id, compressed, zlen, payload_len,
+                                     true, rect->x, rect->y, rect->w, rect->h, kitty_f, edit_t0);
 }
 
 bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
@@ -3069,6 +3281,7 @@ bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                                  const SDL_Rect *rects, int n_rects, int kitty_f,
                                  size_t *out_upload_px)
 {
+    const Uint64 mr_t0 = SDL_GetTicksNS();
     KITTY_MultiRectCtx *ctx;
     KITTY_AsyncWriter *aw;
     SDL_Rect fb;
@@ -3099,21 +3312,34 @@ bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
         vdata->tx_mr_ctx = ctx;
     }
 
-    fb.x = 0;
-    fb.y = 0;
-    fb.w = fb_w;
-    fb.h = fb_h;
-    for (i = 0; i < n_rects; ++i) {
-        SDL_Rect c;
-        if (!SDL_GetRectIntersection(&rects[i], &fb, &c) || c.w <= 0 || c.h <= 0) {
-            continue;
+    {
+        const size_t bpp = (kitty_f == 32) ? 4u : 3u;
+        size_t max_rect_bytes = 0;
+        fb.x = 0;
+        fb.y = 0;
+        fb.w = fb_w;
+        fb.h = fb_h;
+        for (i = 0; i < n_rects; ++i) {
+            SDL_Rect c;
+            size_t rpx, rbytes;
+            if (!SDL_GetRectIntersection(&rects[i], &fb, &c) || c.w <= 0 || c.h <= 0) {
+                continue;
+            }
+            rpx = (size_t)c.w * (size_t)c.h;
+            rbytes = rpx * bpp;
+            if (rbytes > max_rect_bytes) {
+                max_rect_bytes = rbytes;
+            }
+            ctx->slots[valid_n].rect = c;
+            total_px += rpx;
+            valid_n++;
         }
-        ctx->slots[valid_n].rect = c;
-        total_px += (size_t)c.w * (size_t)c.h;
-        valid_n++;
-    }
-    if (valid_n < 3 || total_px < 4096u) {
-        return false;
+        /* Don't serialize a huge rect (>= 256 KB) on 1 worker thread with libdeflate lv=1;
+         * fall back to the batched loop where KITTY_TransmitRGBRectEditFromScratch uses
+         * multi-core strided parallel zlib on large rects and libdeflate on tiny ones. */
+        if (valid_n < 3 || total_px < 4096u || max_rect_bytes >= (size_t)256 * 1024u) {
+            return false;
+        }
     }
 
     ctx->rgb_scratch = rgb_scratch;
@@ -3129,7 +3355,13 @@ bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                       : Z_BEST_SPEED;
     ctx->want_zlib = true;
 
-    KITTY_ParallelFor((size_t)valid_n, KITTY_MultiRectWorker, ctx);
+    {
+        const Uint64 pt0 = vdata->bench ? SDL_GetTicksNS() : 0u;
+        KITTY_ParallelFor((size_t)valid_n, KITTY_MultiRectWorker, ctx);
+        if (pt0) {
+            vdata->last_ms_compress += (double)(SDL_GetTicksNS() - pt0) / 1000000.0;
+        }
+    }
 
     for (i = 0; i < valid_n; ++i) {
         if (!ctx->slots[i].ok) {
@@ -3161,11 +3393,17 @@ bool KITTY_TransmitMultiRectEdit(SDL_VideoData *vdata, Uint32 image_id,
         return false;
     }
 
-    vdata->last_wire_bytes += total_wire;
-    vdata->last_raw_bytes += total_raw;
-    vdata->last_ms_ack = -1.0;
-    vdata->total_wire_bytes += total_wire;
-    vdata->wire_presents += (Uint32)valid_n;
+    {
+        const double ms = (double)(SDL_GetTicksNS() - mr_t0) / 1000000.0;
+        vdata->last_wire_bytes += total_wire;
+        vdata->last_raw_bytes += total_raw;
+        vdata->last_ms_tx += ms;
+        vdata->last_ms_ack = -1.0;
+        vdata->last_af_rects += valid_n;
+        vdata->total_wire_bytes += total_wire;
+        vdata->total_ms_tx += ms;
+        vdata->wire_presents += (Uint32)valid_n;
+    }
     if (out_upload_px) {
         *out_upload_px = total_px;
     }

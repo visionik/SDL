@@ -144,12 +144,16 @@ typedef struct SDL_VideoData
     size_t last_raw_bytes;  /* payload before b64 (zlib size or raw RGB) */
     double last_ms_tx;      /* client compress+encode+write wall time */
     double last_ms_ack;     /* host round-trip wait (-1 if not measured) */
+    double last_ms_compress; /* per-present zlib/libdeflate wall time (bench) */
+    double last_ms_submit;   /* per-present async submit/backpressure wait (bench) */
+    int last_af_rects;       /* per-present a=f rect count (bench) */
     Uint64 total_wire_bytes;
     double total_ms_tx;
     double total_ms_ack;
     Uint32 wire_presents;
     Uint32 ack_presents; /* presents where ms_ack was measured */
     Uint32 skip_presents;
+    void *bench; /* optional per-frame stage profiler (SDL_KITTY_BENCH_JSON) */
     /* Persistent grow-only transmit buffers + reusable z_stream (zero per-frame malloc). */
     Uint8 *tx_z_buf;
     size_t tx_z_cap;

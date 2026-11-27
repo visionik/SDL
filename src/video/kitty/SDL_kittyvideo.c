@@ -464,6 +464,14 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
                 data->cfg_async_drop = (SDL_getenv("SSH_CONNECTION") != NULL);
             }
         }
+        /* Over SSH/async_drop, cap default af_max_coverage to 0.40 so large
+         * updates stay on droppable full a=T frames unless explicitly overridden. */
+        if (data->cfg_async_drop && data->cfg_af_max_coverage > 0.40f) {
+            const char *cov_env = SDL_getenv("SDL_KITTY_AF_MAX_COVERAGE");
+            if (!cov_env || !cov_env[0]) {
+                data->cfg_af_max_coverage = 0.40f;
+            }
+        }
         env = SDL_getenv("SDL_KITTY_TRANSMIT");
         if (env && env[0]) {
             if (SDL_strcasecmp(env, "direct") == 0) {
@@ -485,6 +493,7 @@ static bool KITTY_VideoInit(SDL_VideoDevice *_this)
         data->overlay = KITTY_OverlayCreate(SDL_getenv("SDL_KITTY_OVERLAY"));
         data->hud = KITTY_HudCreate(SDL_getenv("SDL_KITTY_HUD"));
         data->capture = KITTY_CaptureCreate();
+        KITTY_BenchInit(data, SDL_getenv("SDL_KITTY_BENCH_JSON"));
         data->cfg_cached = true;
     }
 
@@ -561,6 +570,7 @@ static void KITTY_VideoQuit(SDL_VideoDevice *_this)
         data->terminal_owned = false;
     }
     if (data) {
+        KITTY_BenchQuit(data);
         KITTY_CaptureDestroy((KITTY_Capture *)data->capture);
         data->capture = NULL;
         KITTY_HudDestroy((KITTY_PerfHud *)data->hud);

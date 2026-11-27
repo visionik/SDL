@@ -48,6 +48,13 @@ extern bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window
  */
 extern void SDL_KITTY_DestroyWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window);
 
+/*
+ * Optional zero-overhead per-frame stage profiler (enabled only when
+ * SDL_KITTY_BENCH_JSON=<path> is set in the environment).
+ */
+extern void KITTY_BenchInit(SDL_VideoData *vdata, const char *json_path);
+extern void KITTY_BenchQuit(SDL_VideoData *vdata);
+
 #endif // SDL_kittyframebuffer_c_h_
 
 #endif // SDL_VIDEO_DRIVER_KITTY

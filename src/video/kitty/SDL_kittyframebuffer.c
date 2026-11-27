@@ -42,7 +42,256 @@
 #include "SDL_kittyprofile.h"
 #include "SDL_kittyrect.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
 #define KITTY_SURFACE "SDL.internal.window.surface"
+
+/*
+ * Optional zero-overhead per-frame stage profiler (enabled only when
+ * SDL_KITTY_BENCH_JSON=<path> is set). Writes a summary JSON on VideoQuit.
+ */
+#define KITTY_BENCH_MAX_SAMPLES 32768u
+
+enum
+{
+    KITTY_BMODE_DIFF_SKIP = 0,
+    KITTY_BMODE_UPLOAD_SKIP = 1,
+    KITTY_BMODE_AF_MULTI = 2,
+    KITTY_BMODE_AF_SINGLE = 3,
+    KITTY_BMODE_DIRTY_AT = 4,
+    KITTY_BMODE_FULL_ZLIB = 5,
+    KITTY_BMODE_FULL_DIRECT = 6,
+    KITTY_BMODE_FULL_SHM = 7
+};
+
+typedef struct KITTY_BenchSample
+{
+    float present_us;
+    float diff_conv_us;
+    float hud_us;
+    float compress_us;
+    float submit_us;
+    float dirty_pct;
+    Uint32 wire_bytes;
+    Uint32 raw_bytes;
+    Uint16 n_rects;
+    Uint8 mode;
+} KITTY_BenchSample;
+
+typedef struct KITTY_BenchRecorder
+{
+    char path[512];
+    KITTY_BenchSample *samples;
+    Uint32 count;
+    Uint32 cap;
+    Uint64 total_frames;
+    Uint64 first_ns;
+    Uint64 last_ns;
+    Uint64 mode_counts[8];
+    Uint64 total_wire_bytes;
+    Uint64 total_raw_bytes;
+    int fb_w;
+    int fb_h;
+} KITTY_BenchRecorder;
+
+static int KITTY_CmpFloatAsc(const void *a, const void *b)
+{
+    const float fa = *(const float *)a;
+    const float fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
+static void KITTY_WriteStatsObj(FILE *fp, const char *name, const float *vals, Uint32 n, bool comma)
+{
+    float *sorted;
+    double sum = 0.0;
+    float p50 = 0.0f, p95 = 0.0f, p99 = 0.0f, mx = 0.0f;
+    Uint32 i;
+    if (n == 0) {
+        fprintf(fp, "  \"%s\": {\"mean\": 0, \"p50\": 0, \"p95\": 0, \"p99\": 0, \"max\": 0}%s\n",
+                name, comma ? "," : "");
+        return;
+    }
+    sorted = (float *)SDL_malloc((size_t)n * sizeof(float));
+    if (!sorted) {
+        for (i = 0; i < n; ++i) {
+            sum += (double)vals[i];
+            if (vals[i] > mx) mx = vals[i];
+        }
+        fprintf(fp, "  \"%s\": {\"mean\": %.2f, \"p50\": 0, \"p95\": 0, \"p99\": 0, \"max\": %.2f}%s\n",
+                name, sum / (double)n, (double)mx, comma ? "," : "");
+        return;
+    }
+    for (i = 0; i < n; ++i) {
+        sorted[i] = vals[i];
+        sum += (double)vals[i];
+    }
+    qsort(sorted, (size_t)n, sizeof(float), KITTY_CmpFloatAsc);
+    p50 = sorted[(Uint32)((double)(n - 1) * 0.50)];
+    p95 = sorted[(Uint32)((double)(n - 1) * 0.95)];
+    p99 = sorted[(Uint32)((double)(n - 1) * 0.99)];
+    mx = sorted[n - 1];
+    SDL_free(sorted);
+    fprintf(fp, "  \"%s\": {\"mean\": %.2f, \"p50\": %.2f, \"p95\": %.2f, \"p99\": %.2f, \"max\": %.2f}%s\n",
+            name, sum / (double)n, (double)p50, (double)p95, (double)p99, (double)mx,
+            comma ? "," : "");
+}
+
+void KITTY_BenchInit(SDL_VideoData *vdata, const char *json_path)
+{
+    KITTY_BenchRecorder *b;
+    if (!vdata || !json_path || !json_path[0]) {
+        return;
+    }
+    b = (KITTY_BenchRecorder *)SDL_calloc(1, sizeof(KITTY_BenchRecorder));
+    if (!b) {
+        return;
+    }
+    SDL_strlcpy(b->path, json_path, sizeof(b->path));
+    b->cap = 4096u;
+    b->samples = (KITTY_BenchSample *)SDL_malloc((size_t)b->cap * sizeof(KITTY_BenchSample));
+    if (!b->samples) {
+        SDL_free(b);
+        return;
+    }
+    vdata->bench = b;
+}
+
+static void KITTY_BenchRecord(SDL_VideoData *vdata, int fb_w, int fb_h, Uint64 now_ns,
+                              double present_us, double diff_conv_us, double hud_us,
+                              double compress_us, double submit_us,
+                              size_t wire_bytes, size_t raw_bytes, float dirty_pct,
+                              Uint8 mode, int n_rects)
+{
+    KITTY_BenchRecorder *b;
+    if (!vdata || !vdata->bench) {
+        return;
+    }
+    b = (KITTY_BenchRecorder *)vdata->bench;
+    if (b->first_ns == 0) {
+        b->first_ns = now_ns;
+    }
+    b->last_ns = now_ns;
+    b->fb_w = fb_w;
+    b->fb_h = fb_h;
+    b->total_frames += 1;
+    if (mode < 8) {
+        b->mode_counts[mode] += 1;
+    }
+    b->total_wire_bytes += (Uint64)wire_bytes;
+    b->total_raw_bytes += (Uint64)raw_bytes;
+
+    if (b->count < KITTY_BENCH_MAX_SAMPLES) {
+        if (b->count >= b->cap) {
+            Uint32 ncap = b->cap * 2u;
+            KITTY_BenchSample *ns;
+            if (ncap > KITTY_BENCH_MAX_SAMPLES) {
+                ncap = KITTY_BENCH_MAX_SAMPLES;
+            }
+            ns = (KITTY_BenchSample *)SDL_realloc(b->samples, (size_t)ncap * sizeof(KITTY_BenchSample));
+            if (ns) {
+                b->samples = ns;
+                b->cap = ncap;
+            }
+        }
+        if (b->count < b->cap) {
+            KITTY_BenchSample *s = &b->samples[b->count++];
+            s->present_us = (float)present_us;
+            s->diff_conv_us = (float)diff_conv_us;
+            s->hud_us = (float)hud_us;
+            s->compress_us = (float)compress_us;
+            s->submit_us = (float)submit_us;
+            s->dirty_pct = dirty_pct;
+            s->wire_bytes = (Uint32)(wire_bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : wire_bytes);
+            s->raw_bytes = (Uint32)(raw_bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : raw_bytes);
+            s->n_rects = (Uint16)(n_rects > 0 ? n_rects : 0);
+            s->mode = mode;
+        }
+    }
+}
+
+void KITTY_BenchQuit(SDL_VideoData *vdata)
+{
+    KITTY_BenchRecorder *b;
+    FILE *fp;
+    double elapsed_s = 0.0;
+    double fps = 0.0;
+    double mb_per_sec = 0.0;
+    Uint32 start_i = 0;
+    Uint32 n = 0;
+    float *tmp = NULL;
+    Uint32 i;
+
+    if (!vdata || !vdata->bench) {
+        return;
+    }
+    b = (KITTY_BenchRecorder *)vdata->bench;
+    vdata->bench = NULL;
+
+    if (b->last_ns > b->first_ns) {
+        elapsed_s = (double)(b->last_ns - b->first_ns) / 1e9;
+    }
+    if (elapsed_s > 0.001 && b->total_frames > 1) {
+        fps = (double)(b->total_frames - 1) / elapsed_s;
+        mb_per_sec = ((double)b->total_wire_bytes / (1024.0 * 1024.0)) / elapsed_s;
+    }
+    if (b->count >= 30u) {
+        start_i = 5u; /* skip first 5 startup frames for percentiles */
+    }
+    n = (b->count > start_i) ? (b->count - start_i) : 0u;
+
+    fp = fopen(b->path, "w");
+    if (fp) {
+        fprintf(fp, "{\n");
+        fprintf(fp, "  \"term\": \"%s\",\n", vdata->term_profile ? vdata->term_profile->name : "unknown");
+        fprintf(fp, "  \"fb_w\": %d, \"fb_h\": %d, \"cols\": %d, \"rows\": %d,\n",
+                b->fb_w, b->fb_h, vdata->cols, vdata->rows);
+        fprintf(fp, "  \"elapsed_s\": %.3f, \"total_frames\": %llu, \"fps\": %.2f,\n",
+                elapsed_s, (unsigned long long)b->total_frames, fps);
+        fprintf(fp, "  \"total_wire_mb\": %.3f, \"wire_mb_per_s\": %.3f,\n",
+                (double)b->total_wire_bytes / (1024.0 * 1024.0), mb_per_sec);
+        fprintf(fp, "  \"total_raw_mb\": %.3f, \"async_drops\": %llu,\n",
+                (double)b->total_raw_bytes / (1024.0 * 1024.0),
+                (unsigned long long)vdata->async_dropped_frames);
+        fprintf(fp, "  \"modes\": {\"diff_skip\": %llu, \"upload_skip\": %llu, \"af_multi\": %llu, "
+                    "\"af_single\": %llu, \"dirty_at\": %llu, \"full_zlib\": %llu, "
+                    "\"full_direct\": %llu, \"full_shm\": %llu},\n",
+                (unsigned long long)b->mode_counts[0], (unsigned long long)b->mode_counts[1],
+                (unsigned long long)b->mode_counts[2], (unsigned long long)b->mode_counts[3],
+                (unsigned long long)b->mode_counts[4], (unsigned long long)b->mode_counts[5],
+                (unsigned long long)b->mode_counts[6], (unsigned long long)b->mode_counts[7]);
+        tmp = n > 0 ? (float *)SDL_malloc((size_t)n * sizeof(float)) : NULL;
+        if (tmp) {
+            for (i = 0; i < n; ++i) tmp[i] = b->samples[start_i + i].present_us / 1000.0f;
+            KITTY_WriteStatsObj(fp, "present_ms", tmp, n, true);
+            for (i = 0; i < n; ++i) tmp[i] = b->samples[start_i + i].diff_conv_us / 1000.0f;
+            KITTY_WriteStatsObj(fp, "diff_conv_ms", tmp, n, true);
+            for (i = 0; i < n; ++i) tmp[i] = b->samples[start_i + i].compress_us / 1000.0f;
+            KITTY_WriteStatsObj(fp, "compress_ms", tmp, n, true);
+            for (i = 0; i < n; ++i) tmp[i] = b->samples[start_i + i].submit_us / 1000.0f;
+            KITTY_WriteStatsObj(fp, "submit_ms", tmp, n, true);
+            for (i = 0; i < n; ++i) tmp[i] = b->samples[start_i + i].hud_us / 1000.0f;
+            KITTY_WriteStatsObj(fp, "hud_ms", tmp, n, true);
+            for (i = 0; i < n; ++i) tmp[i] = (float)b->samples[start_i + i].wire_bytes / 1024.0f;
+            KITTY_WriteStatsObj(fp, "wire_kb", tmp, n, true);
+            for (i = 0; i < n; ++i) tmp[i] = (float)b->samples[start_i + i].raw_bytes / 1024.0f;
+            KITTY_WriteStatsObj(fp, "raw_kb", tmp, n, true);
+            for (i = 0; i < n; ++i) tmp[i] = b->samples[start_i + i].dirty_pct;
+            KITTY_WriteStatsObj(fp, "dirty_pct", tmp, n, true);
+            for (i = 0; i < n; ++i) tmp[i] = (float)b->samples[start_i + i].n_rects;
+            KITTY_WriteStatsObj(fp, "af_rects", tmp, n, false);
+            SDL_free(tmp);
+        } else {
+            fprintf(fp, "  \"samples\": 0\n");
+        }
+        fprintf(fp, "}\n");
+        fclose(fp);
+    }
+
+    SDL_free(b->samples);
+    SDL_free(b);
+}
 
 /*
  * Free rgb_scratch/pack_scratch and reset present state on wdata: dimensions,
@@ -151,6 +400,28 @@ bool SDL_KITTY_CreateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
     return true;
 }
 
+static bool KITTY_RectOverlapsDirty(const SDL_Rect *r, KITTY_PresentConvertMode convert_mode,
+                                    const SDL_Rect *multi_rects, int multi_numrects,
+                                    const SDL_Rect *dirty)
+{
+    int i;
+    if (!r || r->w <= 0 || r->h <= 0) {
+        return false;
+    }
+    if (convert_mode != KITTY_CONVERT_DIRTY) {
+        return true;
+    }
+    if (multi_rects && multi_numrects > 1) {
+        for (i = 0; i < multi_numrects; ++i) {
+            if (SDL_HasRectIntersection(r, &multi_rects[i])) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return dirty ? SDL_HasRectIntersection(r, dirty) : true;
+}
+
 /*
  * Present window surface dirty rects over Kitty graphics. Converts to RGB(A)
  * scratch; may tile-diff (identical → early out), upload_skip on matching
@@ -210,10 +481,16 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
     vdata->last_raw_bytes = 0;
     vdata->last_ms_tx = 0.0;
     vdata->last_ms_ack = -1.0;
+    vdata->last_ms_compress = 0.0;
+    vdata->last_ms_submit = 0.0;
+    vdata->last_af_rects = 0;
 
     {
         const Uint64 present_t0 = SDL_GetTicksNS();
         const Uint64 now_ms = SDL_GetTicks();
+        Uint64 diff_conv_ns = 0;
+        Uint64 hud_ns = 0;
+        Uint64 stage_t0 = 0;
         const bool use_rgba = SDL_ISPIXELFORMAT_ALPHA(surface->format);
         const int bpp = use_rgba ? 4 : 3;
         const int kitty_f = use_rgba ? 32 : 24;
@@ -236,6 +513,9 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         const SDL_Rect *multi_rects = rects;
         int multi_numrects = numrects;
 
+        if (vdata->bench) {
+            stage_t0 = SDL_GetTicksNS();
+        }
         if (vdata->hud && vdata->capture) {
             Uint64 rec_start = 0;
             const bool is_rec = KITTY_CaptureIsRecording((const KITTY_Capture *)vdata->capture, &rec_start);
@@ -251,9 +531,15 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                                            surface->w, surface->h, now_ms,
                                            &hud_rect, &hud_needs_redraw);
         }
+        if (vdata->bench) {
+            hud_ns += SDL_GetTicksNS() - stage_t0;
+        }
 
         if (!KITTY_EnsureRGBScratch(wdata, surface->w, surface->h, bpp)) {
             return false;
+        }
+        if (vdata->bench) {
+            stage_t0 = SDL_GetTicksNS();
         }
 
         if (vdata->cfg_cached) {
@@ -301,10 +587,12 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                                             : KITTY_SelectFbDiffCover(
                                                   SDL_getenv("SDL_KITTY_FB_DIFF_COVER"),
                                                   vdata->term_profile ? vdata->term_profile->fb_diff_cover : 0.45f);
+                    /* Reserve 2 slots in diff_rects[16] for overlay + HUD appends so
+                     * multi_numrects stays <= KITTY_MR_MAX (16) and never drops HUD redraws. */
                     const KITTY_DiffOutcome diff =
                         KITTY_ConvertAndTileDiffRects(surface, wdata->rgb_scratch, use_rgba,
                                                       tile, cover, diff_rects,
-                                                      (int)(sizeof(diff_rects) / sizeof(diff_rects[0])),
+                                                      (int)(sizeof(diff_rects) / sizeof(diff_rects[0])) - 2,
                                                       &diff_n, &dirty);
                     if (diff == KITTY_DIFF_NONE) {
                         if (vdata->capture && wdata->rgb_scratch) {
@@ -334,6 +622,16 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                             diff_proved_changed = true;
                             convert_mode = KITTY_CONVERT_DIRTY;
                             goto kitty_present_after_convert;
+                        }
+                        if (vdata->bench) {
+                            const Uint64 t1 = SDL_GetTicksNS();
+                            diff_conv_ns += t1 - stage_t0;
+                            KITTY_BenchRecord(vdata, surface->w, surface->h, t1,
+                                              (double)(t1 - present_t0) / 1000.0,
+                                              (double)diff_conv_ns / 1000.0,
+                                              (double)hud_ns / 1000.0,
+                                              0.0, 0.0, 0u, 0u, 0.0f,
+                                              KITTY_BMODE_DIFF_SKIP, 0);
                         }
                         if (vdata->hud) {
                             KITTY_HudRecordFrame((KITTY_PerfHud *)vdata->hud, SDL_GetTicksNS(),
@@ -512,6 +810,10 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         }
 
     kitty_present_after_convert:
+        if (vdata->bench && stage_t0) {
+            diff_conv_ns += SDL_GetTicksNS() - stage_t0;
+            stage_t0 = 0;
+        }
         convert_px = (size_t)dirty.w * (size_t)dirty.h;
         upload_px = (size_t)surface->w * (size_t)surface->h;
         wire_mode = (convert_mode == KITTY_CONVERT_DIRTY) ? KITTY_WIRE_DIRTY_CPU : KITTY_WIRE_FULL;
@@ -567,8 +869,14 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         }
 
         /* Temporarily composite active HUD toast & F12 perf HUD onto rgb_scratch
-         * (restored right after transmit so rgb_scratch always holds pure game pixels). */
-        if (ov_active && wdata->rgb_scratch) {
+         * ONLY when their rect is actually going to be transmitted (redrawing or
+         * overlapping dirty rects). Skips 80-90% of HUD blend+restore work on
+         * sparse/pillarboxed frames; full a=T fallback applies lazily if needed. */
+        if (vdata->bench) {
+            stage_t0 = SDL_GetTicksNS();
+        }
+        if (ov_active && wdata->rgb_scratch &&
+            (ov_needs_redraw || KITTY_RectOverlapsDirty(&ov_rect, convert_mode, multi_rects, multi_numrects, &dirty))) {
             ov_applied = KITTY_OverlayApply((KITTY_ToastOverlay *)vdata->overlay,
                                             wdata->rgb_scratch, surface->w, surface->h,
                                             bpp, ov_alpha);
@@ -576,12 +884,17 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                 single_prepacked = false;
             }
         }
-        if (hud_active && wdata->rgb_scratch) {
+        if (hud_active && wdata->rgb_scratch &&
+            (hud_needs_redraw || KITTY_RectOverlapsDirty(&hud_rect, convert_mode, multi_rects, multi_numrects, &dirty))) {
             hud_applied = KITTY_HudApply((KITTY_PerfHud *)vdata->hud,
                                          wdata->rgb_scratch, surface->w, surface->h, bpp);
             if (hud_applied && single_prepacked && SDL_HasRectIntersection(&dirty, &hud_rect)) {
                 single_prepacked = false;
             }
+        }
+        if (vdata->bench && stage_t0) {
+            hud_ns += SDL_GetTicksNS() - stage_t0;
+            stage_t0 = 0;
         }
         if (ov_needs_redraw && convert_mode == KITTY_CONVERT_DIRTY && ov_rect.w > 0 && ov_rect.h > 0) {
             /* Ensure ov_rect is transmitted even if game dirty rects were elsewhere. */
@@ -690,20 +1003,35 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                                           SDL_getenv("SDL_KITTY_COALESCE_GAP"),
                                           vdata->term_profile ? vdata->term_profile->coalesce_gap_px : 0);
 
-                /* Exp 5: merge near/overlapping dirty rects before multi a=f. */
+                /* Exp 5: merge near/overlapping dirty rects before multi a=f,
+                 * but reject merges that heavily bloat dead/clean pixels (e.g.
+                 * a 4:3 game bbox overlapping a corner HUD card). */
                 if (gap > 0) {
                     const int cn = KITTY_CoalesceRects(
                         surface->w, surface->h, multi_rects, multi_numrects, gap, coal_buf,
                         (int)(sizeof(coal_buf) / sizeof(coal_buf[0])));
                     if (cn > 0) {
-                        af_rects = coal_buf;
-                        af_n = cn;
-#ifdef SDL_KITTY_RUNTIME_DEBUG
-                        if (KITTY_DebugEnabled() && cn != multi_numrects) {
-                            KITTY_DebugLog("kitty: coalesce %d -> %d rects (gap=%d)",
-                                           multi_numrects, cn, gap);
+                        size_t raw_px = 0, coal_px = 0;
+                        int ci;
+                        for (ci = 0; ci < multi_numrects; ++ci) {
+                            SDL_Rect cl;
+                            if (SDL_GetRectIntersection(&multi_rects[ci], &fb, &cl) && cl.w > 0 && cl.h > 0) {
+                                raw_px += (size_t)cl.w * (size_t)cl.h;
+                            }
                         }
+                        for (ci = 0; ci < cn; ++ci) {
+                            coal_px += (size_t)coal_buf[ci].w * (size_t)coal_buf[ci].h;
+                        }
+                        if (coal_px <= raw_px + 65536u) {
+                            af_rects = coal_buf;
+                            af_n = cn;
+#ifdef SDL_KITTY_RUNTIME_DEBUG
+                            if (KITTY_DebugEnabled() && cn != multi_numrects) {
+                                KITTY_DebugLog("kitty: coalesce %d -> %d rects (gap=%d)",
+                                               multi_numrects, cn, gap);
+                            }
 #endif
+                        }
                     }
                 }
 
@@ -757,6 +1085,13 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                             multi_ok = false;
                             break;
                         }
+                        if (KITTY_TransmitRGBRectEditFromScratch(vdata, wdata->live_image_id,
+                                                                 wdata->rgb_scratch, surface->w, surface->h,
+                                                                 &clipped, kitty_f)) {
+                            multi_upload += rpx;
+                            continue;
+                        }
+                        SDL_ClearError();
                         packed = KITTY_EnsurePackScratch(wdata, rpx * (size_t)bpp);
                         if (!packed) {
                             multi_ok = false;
@@ -798,35 +1133,47 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             if (!ok && want_af) {
                 const bool af_small = (cov < max_cov) && (convert_px <= max_af_px);
                 if (af_small) {
-                    size_t packed_len = 0;
-                    const size_t pack_cap = convert_px * (size_t)bpp;
-                    bool pack_ok = false;
-                    if (single_prepacked && wdata->pack_scratch && wdata->pack_scratch_cap >= pack_cap) {
-                        packed = wdata->pack_scratch;
-                        pack_ok = true;
-                    } else {
-                        packed = KITTY_EnsurePackScratch(wdata, pack_cap);
-                        if (packed) {
-                            pack_ok = use_rgba
-                                          ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h,
-                                                               &dirty, packed, pack_cap, &packed_len)
-                                          : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h,
-                                                              &dirty, packed, pack_cap, &packed_len);
-                        }
-                    }
-                    if (pack_ok &&
-                        KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed,
-                                                  dirty.x, dirty.y, dirty.w, dirty.h, kitty_f)) {
+                    if (!single_prepacked &&
+                        KITTY_TransmitRGBRectEditFromScratch(vdata, wdata->live_image_id,
+                                                             wdata->rgb_scratch, surface->w, surface->h,
+                                                             &dirty, kitty_f)) {
                         ok = true;
                         wire_mode = KITTY_WIRE_DIRTY_BW;
                         upload_px = convert_px;
                         wdata->rgb_valid = true;
-                        /* a=f patched the base; drop any leftover overlays. */
                         KITTY_ClearOverlays(vdata, wdata);
                     } else {
+                        size_t packed_len = 0;
+                        const size_t pack_cap = convert_px * (size_t)bpp;
+                        bool pack_ok = false;
                         SDL_ClearError();
+                        if (single_prepacked && wdata->pack_scratch && wdata->pack_scratch_cap >= pack_cap) {
+                            packed = wdata->pack_scratch;
+                            pack_ok = true;
+                        } else {
+                            packed = KITTY_EnsurePackScratch(wdata, pack_cap);
+                            if (packed) {
+                                pack_ok = use_rgba
+                                              ? KITTY_PackRGBARect(wdata->rgb_scratch, surface->w, surface->h,
+                                                                   &dirty, packed, pack_cap, &packed_len)
+                                              : KITTY_PackRGBRect(wdata->rgb_scratch, surface->w, surface->h,
+                                                                  &dirty, packed, pack_cap, &packed_len);
+                            }
+                        }
+                        if (pack_ok &&
+                            KITTY_TransmitRGBRectEdit(vdata, wdata->live_image_id, packed,
+                                                      dirty.x, dirty.y, dirty.w, dirty.h, kitty_f)) {
+                            ok = true;
+                            wire_mode = KITTY_WIRE_DIRTY_BW;
+                            upload_px = convert_px;
+                            wdata->rgb_valid = true;
+                            /* a=f patched the base; drop any leftover overlays. */
+                            KITTY_ClearOverlays(vdata, wdata);
+                        } else {
+                            SDL_ClearError();
+                        }
+                        packed = NULL;
                     }
-                    packed = NULL;
                 }
             }
 
@@ -1057,6 +1404,25 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
                                             vdata->term_profile && vdata->term_profile->pingpong);
             Uint32 prev = 0;
 
+            /* Full a=T transmits the entire rgb_scratch: ensure active toast/HUD
+             * are composited now if skipped earlier for non-overlapping dirty rects. */
+            if (vdata->bench && ((ov_active && !ov_applied) || (hud_active && !hud_applied))) {
+                stage_t0 = SDL_GetTicksNS();
+            }
+            if (ov_active && !ov_applied && wdata->rgb_scratch) {
+                ov_applied = KITTY_OverlayApply((KITTY_ToastOverlay *)vdata->overlay,
+                                                wdata->rgb_scratch, surface->w, surface->h,
+                                                bpp, ov_alpha);
+            }
+            if (hud_active && !hud_applied && wdata->rgb_scratch) {
+                hud_applied = KITTY_HudApply((KITTY_PerfHud *)vdata->hud,
+                                             wdata->rgb_scratch, surface->w, surface->h, bpp);
+            }
+            if (vdata->bench && stage_t0) {
+                hud_ns += SDL_GetTicksNS() - stage_t0;
+                stage_t0 = 0;
+            }
+
             /* Full replace must not leave stale overlays on top of the new base. */
             KITTY_ClearOverlays(vdata, wdata);
 
@@ -1085,6 +1451,9 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         }
 
         /* Restore clean game pixels in rgb_scratch (LIFO: HUD then overlay). */
+        if (vdata->bench && (hud_applied || ov_applied)) {
+            stage_t0 = SDL_GetTicksNS();
+        }
         if (hud_applied) {
             KITTY_HudRestore((KITTY_PerfHud *)vdata->hud,
                              wdata->rgb_scratch, surface->w, surface->h, bpp);
@@ -1092,6 +1461,10 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         if (ov_applied) {
             KITTY_OverlayRestore((KITTY_ToastOverlay *)vdata->overlay,
                                  wdata->rgb_scratch, surface->w, surface->h, bpp);
+        }
+        if (vdata->bench && stage_t0) {
+            hud_ns += SDL_GetTicksNS() - stage_t0;
+            stage_t0 = 0;
         }
         if (ok && wire_mode != KITTY_WIRE_UPLOAD_SKIP) {
             if (vdata->hud) {
@@ -1139,7 +1512,34 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
         }
 
     kitty_present_log:
-        (void)0;
+        if (vdata->bench) {
+            const Uint64 t1 = SDL_GetTicksNS();
+            const float fb_area = (float)surface->w * (float)surface->h;
+            float dpct = (fb_area > 0.0f) ? ((float)upload_px * 100.0f / fb_area) : 100.0f;
+            Uint8 bmode = KITTY_BMODE_FULL_DIRECT;
+            if (dpct > 100.0f) dpct = 100.0f;
+            if (wire_mode == KITTY_WIRE_UPLOAD_SKIP) {
+                bmode = KITTY_BMODE_UPLOAD_SKIP;
+                dpct = 0.0f;
+            } else if (wire_mode == KITTY_WIRE_DIRTY_BW) {
+                bmode = (vdata->last_af_rects > 1) ? KITTY_BMODE_AF_MULTI : KITTY_BMODE_AF_SINGLE;
+            } else if (wire_mode == KITTY_WIRE_DIRTY_AT) {
+                bmode = KITTY_BMODE_DIRTY_AT;
+            } else if (vdata->transmit_mode == KITTY_TRANSMIT_SHM && !vdata->shm_failed) {
+                bmode = KITTY_BMODE_FULL_SHM;
+            } else if (vdata->transmit_mode == KITTY_TRANSMIT_DIRECT_ZLIB) {
+                bmode = KITTY_BMODE_FULL_ZLIB;
+            }
+            KITTY_BenchRecord(vdata, surface->w, surface->h, t1,
+                              (double)(t1 - present_t0) / 1000.0,
+                              (double)diff_conv_ns / 1000.0,
+                              (double)hud_ns / 1000.0,
+                              vdata->last_ms_compress * 1000.0,
+                              vdata->last_ms_submit * 1000.0,
+                              ok ? vdata->last_wire_bytes : 0u,
+                              ok ? vdata->last_raw_bytes : 0u,
+                              dpct, bmode, vdata->last_af_rects);
+        }
     }
 
 #ifdef SDL_KITTY_RUNTIME_DEBUG

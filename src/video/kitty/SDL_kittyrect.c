@@ -1396,6 +1396,53 @@ static int KITTY_ConvertAndDiffBand(SDL_Surface *surface, Uint8 *rgb_scratch,
             if (!use_rgba) {
                 int x = 0;
 #ifdef KITTY_HAVE_NEON_LE
+                /* 32-pixel combined clean-tile fast path halves vmaxvq_u32 stalls
+                 * on static pillarbox & unchanged tiles in partially dirty bands. */
+                for (; x + 32 <= tw; x += 32) {
+                    const uint8x16x4_t b0 = vld4q_u8((const uint8_t *)(src + x));
+                    const uint8x16x3_t o0 = vld3q_u8(dst);
+                    const uint8x16x4_t b1 = vld4q_u8((const uint8_t *)(src + x + 16));
+                    const uint8x16x3_t o1 = vld3q_u8(dst + 48);
+                    const uint8x16_t d0 = vorrq_u8(
+                        vorrq_u8(veorq_u8(b0.val[2], o0.val[0]),
+                                 veorq_u8(b0.val[1], o0.val[1])),
+                        veorq_u8(b0.val[0], o0.val[2]));
+                    const uint8x16_t d1 = vorrq_u8(
+                        vorrq_u8(veorq_u8(b1.val[2], o1.val[0]),
+                                 veorq_u8(b1.val[1], o1.val[1])),
+                        veorq_u8(b1.val[0], o1.val[2]));
+                    if (vmaxvq_u32(vreinterpretq_u32_u8(vorrq_u8(d0, d1))) != 0) {
+                        if (vmaxvq_u32(vreinterpretq_u32_u8(d0)) != 0) {
+                            const uint8x16_t nz = vtstq_u8(d0, d0);
+                            const uint8x8_t nib = vshrn_n_u16(vreinterpretq_u16_u8(nz), 4);
+                            const Uint64 mask = vget_lane_u64(vreinterpret_u64_u8(nib), 0);
+                            const int fl = (int)(__builtin_ctzll(mask) >> 2);
+                            const int ll = 15 - (int)(__builtin_clzll(mask) >> 2);
+                            uint8x16x3_t rgb;
+                            if (x + fl < min_rx) { min_rx = x + fl; }
+                            if (x + ll + 1 > max_rx) { max_rx = x + ll + 1; }
+                            rgb.val[0] = b0.val[2];
+                            rgb.val[1] = b0.val[1];
+                            rgb.val[2] = b0.val[0];
+                            vst3q_u8(dst, rgb);
+                        }
+                        if (vmaxvq_u32(vreinterpretq_u32_u8(d1)) != 0) {
+                            const uint8x16_t nz = vtstq_u8(d1, d1);
+                            const uint8x8_t nib = vshrn_n_u16(vreinterpretq_u16_u8(nz), 4);
+                            const Uint64 mask = vget_lane_u64(vreinterpret_u64_u8(nib), 0);
+                            const int fl = (int)(__builtin_ctzll(mask) >> 2);
+                            const int ll = 15 - (int)(__builtin_clzll(mask) >> 2);
+                            uint8x16x3_t rgb;
+                            if (x + 16 + fl < min_rx) { min_rx = x + 16 + fl; }
+                            if (x + 16 + ll + 1 > max_rx) { max_rx = x + 16 + ll + 1; }
+                            rgb.val[0] = b1.val[2];
+                            rgb.val[1] = b1.val[1];
+                            rgb.val[2] = b1.val[0];
+                            vst3q_u8(dst + 48, rgb);
+                        }
+                    }
+                    dst += 96;
+                }
                 for (; x + 16 <= tw; x += 16) {
                     const uint8x16x4_t bgra = vld4q_u8((const uint8_t *)(src + x));
                     const uint8x16x3_t old = vld3q_u8(dst);
@@ -1632,7 +1679,7 @@ KITTY_DiffOutcome KITTY_ConvertAndTileDiffRects(SDL_Surface *surface, Uint8 *rgb
         ctx.tile = tile;
         ctx.tiles_x = tiles_x;
         ctx.num_bands = num_bands;
-        ctx.n_workers = 4;
+        ctx.n_workers = ((size_t)fb_w * (size_t)fb_h >= (size_t)1280 * 720 && num_bands >= 6) ? 6 : 4;
         ctx.all_spans = all_spans;
         ctx.band_counts = band_counts;
         KITTY_ParallelFor((size_t)ctx.n_workers, KITTY_ParallelDiffWorker, &ctx);

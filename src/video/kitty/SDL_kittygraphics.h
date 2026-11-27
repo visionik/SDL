@@ -141,6 +141,15 @@ bool KITTY_TransmitRGBRectEdit(SDL_VideoData *vdata, Uint32 image_id,
                                const Uint8 *packed_rgb, int x, int y, int rw, int rh, int kitty_f);
 
 /*
+ * Zero-copy strided parallel-pack + parallel-zlib a=f directly from full-FB
+ * rgb_scratch for large compressed dirty rects (>= 128 KB). Returns false to
+ * fall back to PackRGBRect + KITTY_TransmitRGBRectEdit.
+ */
+bool KITTY_TransmitRGBRectEditFromScratch(SDL_VideoData *vdata, Uint32 image_id,
+                                          const Uint8 *rgb_scratch, int fb_w, int fb_h,
+                                          const SDL_Rect *rect, int kitty_f);
+
+/*
  * Parallel multi-rect a=f pack + zlib + base64 + single async submit.
  * Returns true if all clipped rects were transmitted; false to fall back.
  */
