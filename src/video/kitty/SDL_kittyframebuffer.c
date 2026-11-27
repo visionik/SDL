@@ -1675,9 +1675,18 @@ bool SDL_KITTY_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *windo
             stage_t0 = 0;
         }
         if (ok && scroll_compose_ok && wdata->prev_rgb_scratch && wdata->rgb_scratch) {
-            SDL_memcpy(wdata->prev_rgb_scratch, wdata->rgb_scratch,
-                       (size_t)surface->w * (size_t)surface->h * (size_t)bpp);
-            wdata->prev_rgb_valid = true;
+            /* Only snapshot prev_rgb_scratch when the next large frame will actually probe
+             * for scrolling (skip memcpy on 25/30 frames while backed off). */
+            const bool need_snapshot =
+                (wdata->scroll_miss_streak < 4) ||
+                ((wdata->scroll_miss_streak % 30) == 29);
+            if (need_snapshot) {
+                SDL_memcpy(wdata->prev_rgb_scratch, wdata->rgb_scratch,
+                           (size_t)surface->w * (size_t)surface->h * (size_t)bpp);
+                wdata->prev_rgb_valid = true;
+            } else {
+                wdata->prev_rgb_valid = false;
+            }
         }
         if (ok && wire_mode != KITTY_WIRE_UPLOAD_SKIP) {
             if (vdata->hud) {
